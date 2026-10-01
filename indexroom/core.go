@@ -1,22 +1,31 @@
-// Package indexroom implements chain ingestion with reorg handling and
-// consistent paginated transaction queries over the main chain.
+// Package indexroom implements chain ingestion with optional block
+// timestamps, reorg handling, consistent paginated transaction queries, and
+// time-bucketed transaction statistics over the main chain.
 package indexroom
 
 import "sync"
 
 // Block is one ingested block with its transactions.
+//
+// Time is the optional block timestamp as non-negative Unix seconds. A nil
+// pointer means the block carries no timestamp and is distinct from a
+// timestamp of zero. Append and Reorg reject negative values; stored blocks
+// keep their own copy, so mutating the pointer or its target after a call
+// never affects the index. Block timestamps need not be monotonic: equal
+// values and values that decrease with height are both accepted.
 type Block struct {
 	Height int64
 	Hash   string
 	Parent string
 	Txs    []string
+	Time   *int64
 }
 
 // Index is the durable chain view.
 //
-// Append, Reorg, QueryTxs, Export, and Restore are safe for concurrent use;
-// the exported fields are meant for read-only inspection after all calls
-// have finished.
+// Append, Reorg, QueryTxs, QueryTimeStats, Export, and Restore are safe for
+// concurrent use; the exported fields are meant for read-only inspection
+// after all calls have finished.
 type Index struct {
 	Blocks map[int64]Block
 	ByHash map[string]int64
@@ -43,6 +52,9 @@ func (index *Index) Append(block Block) error {
 func (index *Index) appendLocked(block Block) error {
 	if block.Hash == "" {
 		return errInvalid("block needs a hash")
+	}
+	if block.Time != nil && *block.Time < 0 {
+		return errInvalid("block time must not be negative")
 	}
 	if index.Tip == 0 {
 		// Empty index: only the first block at height 1 is accepted; its
@@ -96,6 +108,9 @@ func (index *Index) Reorg(blocks []Block) ([]int64, error) {
 		if block.Hash == "" {
 			return nil, errInvalid("block needs a hash")
 		}
+		if block.Time != nil && *block.Time < 0 {
+			return nil, errInvalid("block time must not be negative")
+		}
 		if seen[block.Hash] {
 			return nil, errInvalid("duplicate hash inside branch")
 		}
@@ -137,13 +152,17 @@ func (index *Index) Reorg(blocks []Block) ([]int64, error) {
 	return dropped, nil
 }
 
-// storeLocked records a validated block, copying its transactions so later
-// caller-side mutation of the slice cannot alter the stored block.
+// storeLocked records a validated block, copying its transactions and
+// timestamp so later caller-side mutation cannot alter the stored block.
 func (index *Index) storeLocked(block Block) {
 	if block.Txs != nil {
 		txs := make([]string, len(block.Txs))
 		copy(txs, block.Txs)
 		block.Txs = txs
+	}
+	if block.Time != nil {
+		t := *block.Time
+		block.Time = &t
 	}
 	index.Blocks[block.Height] = block
 	index.ByHash[block.Hash] = block.Height
@@ -151,7 +170,8 @@ func (index *Index) storeLocked(block Block) {
 }
 
 // sameBlock reports whether two blocks are identical: same height, hash,
-// parent, and transactions in order. An empty tx list equals a missing one.
+// parent, transactions in order, and timestamp presence and value. An empty
+// tx list equals a missing one, but a missing timestamp never equals zero.
 func sameBlock(a, b Block) bool {
 	if a.Height != b.Height || a.Hash != b.Hash || a.Parent != b.Parent {
 		return false
@@ -164,7 +184,10 @@ func sameBlock(a, b Block) bool {
 			return false
 		}
 	}
-	return true
+	if (a.Time == nil) != (b.Time == nil) {
+		return false
+	}
+	return a.Time == nil || *a.Time == *b.Time
 }
 
 type errInvalid string

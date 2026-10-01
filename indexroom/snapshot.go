@@ -1,6 +1,7 @@
 package indexroom
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,26 +12,50 @@ import (
 // truncated JSON, trailing data after the object, an unknown version,
 // missing, mistyped, unknown, or duplicated fields, heights that do not
 // ascend consecutively from 1, an empty or duplicated hash, a broken parent
-// link, or a tip that disagrees with the block list. A rejected restore
-// never changes the index.
+// link, a version-2 timestamp that is missing or neither null nor a
+// non-negative integer, or a tip that disagrees with the block list. A
+// rejected restore never changes the index.
 var ErrInvalidSnapshot = errors.New("indexroom: invalid snapshot")
 
-// snapshotVersion is the only snapshot layout this package reads and writes.
-const snapshotVersion = 1
+const (
+	// snapshotVersion1 is the timestamp-less layout. It stays readable
+	// indefinitely; its blocks restore with missing timestamps.
+	snapshotVersion1 = 1
+	// snapshotVersion2 adds a required timestamp field to every block:
+	// either a non-negative Unix-seconds integer or null for missing time.
+	snapshotVersion2 = 2
+)
 
-// snapshotDoc is the wire form of an exported main chain.
+// snapshotDoc is the version-1 wire form of an exported main chain.
 type snapshotDoc struct {
 	Version int64           `json:"version"`
 	Tip     int64           `json:"tip"`
 	Blocks  []snapshotBlock `json:"blocks"`
 }
 
-// snapshotBlock is the wire form of one block inside a snapshot.
+// snapshotBlock is the version-1 wire form of one block.
 type snapshotBlock struct {
 	Height int64    `json:"height"`
 	Hash   string   `json:"hash"`
 	Parent string   `json:"parent"`
 	Txs    []string `json:"txs"`
+}
+
+// snapshotDocV2 is the timestamp-bearing wire form.
+type snapshotDocV2 struct {
+	Version int64             `json:"version"`
+	Tip     int64             `json:"tip"`
+	Blocks  []snapshotBlockV2 `json:"blocks"`
+}
+
+// snapshotBlockV2 is the version-2 wire form of one block. A nil Timestamp
+// serializes as null.
+type snapshotBlockV2 struct {
+	Height    int64    `json:"height"`
+	Hash      string   `json:"hash"`
+	Parent    string   `json:"parent"`
+	Txs       []string `json:"txs"`
+	Timestamp *int64   `json:"timestamp"`
 }
 
 // Export writes the current main chain to w as a JSON snapshot: a single
@@ -40,33 +65,72 @@ type snapshotBlock struct {
 // led to it. Only blocks in effect at export time appear; nothing the index
 // once held and later dropped is included.
 //
+// A chain whose blocks all lack timestamps keeps the original version-1
+// layout, byte for byte. As soon as any block carries a timestamp the
+// document is version 2 and every block includes a timestamp field: a
+// non-negative integer or null for a missing timestamp.
+//
 // Export observes one complete chain state and never modifies the index.
 // The chain is copied under the lock and serialized afterwards, so queries
 // and appends proceed while the stream is still being written. A write
 // failure is reported and leaves the index untouched.
 func (index *Index) Export(w io.Writer) error {
 	index.mu.Lock()
-	doc := snapshotDoc{
-		Version: snapshotVersion,
-		Tip:     index.Tip,
-		Blocks:  make([]snapshotBlock, 0, int(index.Tip)),
-	}
+	version := int64(snapshotVersion1)
 	for height := int64(1); height <= index.Tip; height++ {
-		block := index.Blocks[height]
-		txs := make([]string, len(block.Txs))
-		copy(txs, block.Txs)
-		doc.Blocks = append(doc.Blocks, snapshotBlock{
-			Height: block.Height,
-			Hash:   block.Hash,
-			Parent: block.Parent,
-			Txs:    txs,
-		})
+		if index.Blocks[height].Time != nil {
+			version = snapshotVersion2
+			break
+		}
 	}
-	index.mu.Unlock()
-
-	raw, err := json.Marshal(doc)
+	var raw []byte
+	var err error
+	if version == snapshotVersion1 {
+		doc := snapshotDoc{
+			Version: snapshotVersion1,
+			Tip:     index.Tip,
+			Blocks:  make([]snapshotBlock, 0, int(index.Tip)),
+		}
+		for height := int64(1); height <= index.Tip; height++ {
+			block := index.Blocks[height]
+			txs := make([]string, len(block.Txs))
+			copy(txs, block.Txs)
+			doc.Blocks = append(doc.Blocks, snapshotBlock{
+				Height: block.Height,
+				Hash:   block.Hash,
+				Parent: block.Parent,
+				Txs:    txs,
+			})
+		}
+		index.mu.Unlock()
+		raw, err = json.Marshal(doc)
+	} else {
+		doc := snapshotDocV2{
+			Version: snapshotVersion2,
+			Tip:     index.Tip,
+			Blocks:  make([]snapshotBlockV2, 0, int(index.Tip)),
+		}
+		for height := int64(1); height <= index.Tip; height++ {
+			block := index.Blocks[height]
+			txs := make([]string, len(block.Txs))
+			copy(txs, block.Txs)
+			entry := snapshotBlockV2{
+				Height: block.Height,
+				Hash:   block.Hash,
+				Parent: block.Parent,
+				Txs:    txs,
+			}
+			if block.Time != nil {
+				t := *block.Time
+				entry.Timestamp = &t
+			}
+			doc.Blocks = append(doc.Blocks, entry)
+		}
+		index.mu.Unlock()
+		raw, err = json.Marshal(doc)
+	}
 	if err != nil {
-		panic(err) // snapshotDoc only contains marshalable fields
+		panic(err) // snapshot docs only contain marshalable fields
 	}
 	n, err := w.Write(raw)
 	if err != nil {
@@ -126,9 +190,11 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		return 0, nil, invalidSnapshot("snapshot must be a single JSON object")
 	}
 
+	// Top-level fields are captured raw so blocks can be parsed with the
+	// strict schema matching the declared version, whatever the field order.
 	var (
 		version, tip         int64
-		blocks               []Block
+		rawBlocks            json.RawMessage
 		haveVersion, haveTip bool
 		haveBlocks           bool
 		seen                 = map[string]bool{}
@@ -154,9 +220,8 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 			}
 			haveTip = true
 		case "blocks":
-			blocks, err = parseSnapshotBlocks(dec)
-			if err != nil {
-				return 0, nil, err
+			if err := dec.Decode(&rawBlocks); err != nil {
+				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
 			}
 			haveBlocks = true
 		default:
@@ -183,9 +248,22 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 	if !haveBlocks {
 		return 0, nil, invalidSnapshot("missing field %q", "blocks")
 	}
-	if version != snapshotVersion {
+	if version != snapshotVersion1 && version != snapshotVersion2 {
 		return 0, nil, invalidSnapshot("unsupported version %d", version)
 	}
+
+	blockDec := json.NewDecoder(bytes.NewReader(rawBlocks))
+	blocks, err := parseSnapshotBlocks(blockDec, version)
+	if err != nil {
+		return 0, nil, err
+	}
+	if _, err := blockDec.Token(); err != io.EOF {
+		if err == nil {
+			return 0, nil, invalidSnapshot("trailing data after the blocks array")
+		}
+		return 0, nil, classifySnapshotErr(err)
+	}
+
 	lastHeight := int64(0)
 	if len(blocks) > 0 {
 		lastHeight = blocks[len(blocks)-1].Height
@@ -197,8 +275,8 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 }
 
 // parseSnapshotBlocks reads the blocks array value, validating heights,
-// hashes, and parent links as it goes.
-func parseSnapshotBlocks(dec *json.Decoder) ([]Block, error) {
+// hashes, parent links, and (for version 2) timestamps as it goes.
+func parseSnapshotBlocks(dec *json.Decoder, version int64) ([]Block, error) {
 	tok, err := dec.Token()
 	if err != nil {
 		return nil, classifySnapshotErr(err)
@@ -209,7 +287,12 @@ func parseSnapshotBlocks(dec *json.Decoder) ([]Block, error) {
 	blocks := []Block{}
 	seenHash := map[string]bool{}
 	for dec.More() {
-		block, err := parseSnapshotBlock(dec)
+		var block Block
+		if version == snapshotVersion2 {
+			block, err = parseSnapshotBlockV2(dec)
+		} else {
+			block, err = parseSnapshotBlock(dec)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -237,8 +320,8 @@ func parseSnapshotBlocks(dec *json.Decoder) ([]Block, error) {
 	return blocks, nil
 }
 
-// parseSnapshotBlock reads one block object, requiring exactly the fields
-// height, hash, parent, and txs.
+// parseSnapshotBlock reads one version-1 block object, requiring exactly the
+// fields height, hash, parent, and txs.
 func parseSnapshotBlock(dec *json.Decoder) (Block, error) {
 	var block Block
 	tok, err := dec.Token()
@@ -300,6 +383,94 @@ func parseSnapshotBlock(dec *json.Decoder) (Block, error) {
 		}
 	}
 	return block, nil
+}
+
+// parseSnapshotBlockV2 reads one version-2 block object, requiring exactly
+// the fields height, hash, parent, txs, and timestamp. Timestamp must be
+// null or a non-negative integer; the block returns a nil time for null.
+func parseSnapshotBlockV2(dec *json.Decoder) (Block, error) {
+	var block Block
+	tok, err := dec.Token()
+	if err != nil {
+		return block, classifySnapshotErr(err)
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return block, invalidSnapshot("block must be a JSON object")
+	}
+	var haveHeight, haveHash, haveParent, haveTxs, haveTimestamp bool
+	seen := map[string]bool{}
+	for dec.More() {
+		key, err := snapshotKey(dec)
+		if err != nil {
+			return block, err
+		}
+		if seen[key] {
+			return block, invalidSnapshot("duplicate block field %q", key)
+		}
+		seen[key] = true
+		switch key {
+		case "height":
+			if err := dec.Decode(&block.Height); err != nil {
+				return block, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			}
+			haveHeight = true
+		case "hash":
+			if err := dec.Decode(&block.Hash); err != nil {
+				return block, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			}
+			haveHash = true
+		case "parent":
+			if err := dec.Decode(&block.Parent); err != nil {
+				return block, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			}
+			haveParent = true
+		case "txs":
+			txs, err := parseSnapshotTxs(dec)
+			if err != nil {
+				return block, err
+			}
+			block.Txs = txs
+			haveTxs = true
+		case "timestamp":
+			t, err := parseSnapshotTimestamp(dec)
+			if err != nil {
+				return block, err
+			}
+			block.Time = t
+			haveTimestamp = true
+		default:
+			return block, invalidSnapshot("unknown block field %q", key)
+		}
+	}
+	if _, err := dec.Token(); err != nil { // closing '}'
+		return block, classifySnapshotErr(err)
+	}
+	for field, present := range map[string]bool{
+		"height":    haveHeight,
+		"hash":      haveHash,
+		"parent":    haveParent,
+		"txs":       haveTxs,
+		"timestamp": haveTimestamp,
+	} {
+		if !present {
+			return block, invalidSnapshot("block is missing field %q", field)
+		}
+	}
+	return block, nil
+}
+
+// parseSnapshotTimestamp reads one timestamp value: null for a missing
+// timestamp, or a non-negative integer. Zero is stored as a real timestamp,
+// distinct from null.
+func parseSnapshotTimestamp(dec *json.Decoder) (*int64, error) {
+	var t *int64
+	if err := dec.Decode(&t); err != nil {
+		return nil, classifySnapshotErr(fmt.Errorf("field %q: %w", "timestamp", err))
+	}
+	if t != nil && *t < 0 {
+		return nil, invalidSnapshot("timestamp must not be negative")
+	}
+	return t, nil
 }
 
 // parseSnapshotTxs reads one txs array, preserving duplicates and empty

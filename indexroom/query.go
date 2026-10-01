@@ -23,8 +23,9 @@ var ErrInvalidArgument = errors.New("indexroom: invalid query argument")
 
 // ErrQueryChanged marks a continuation whose pinned range no longer matches
 // the first page: a block in the range was replaced (even under the same
-// hash) or the chain was shortened below the pinned upper bound. No results
-// are returned; the caller must restart from a first-page query.
+// hash, and even if only its timestamp changed) or the chain was shortened
+// below the pinned upper bound. No results are returned; the caller must
+// restart from a first-page query.
 var ErrQueryChanged = errors.New("indexroom: query data changed")
 
 const (
@@ -248,8 +249,9 @@ func (index *Index) collectLocked(from, to int64, txIDs []string) (hits []TxHit,
 }
 
 // fingerprintLocked hashes the exact content of every block in [from, to]:
-// height, hash, parent, and the ordered transaction list. The caller must
-// hold index.mu.
+// height, hash, parent, the ordered transaction list, and the timestamp
+// (distinguishing a missing timestamp from zero). The caller must hold
+// index.mu.
 func (index *Index) fingerprintLocked(from, to int64) []byte {
 	h := sha256.New()
 	var lenBuf [8]byte
@@ -268,6 +270,13 @@ func (index *Index) fingerprintLocked(from, to int64) []byte {
 		h.Write(lenBuf[:])
 		for _, tx := range block.Txs {
 			writeString(tx)
+		}
+		if block.Time == nil {
+			h.Write([]byte{0})
+		} else {
+			h.Write([]byte{1})
+			binary.BigEndian.PutUint64(lenBuf[:], uint64(*block.Time))
+			h.Write(lenBuf[:])
 		}
 	}
 	return h.Sum(nil)

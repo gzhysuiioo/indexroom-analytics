@@ -313,7 +313,7 @@ func TestRestoreRejectsInvalidSnapshots(t *testing.T) {
 		"not an object":        `[1,2]`,
 		"trailing second doc":  valid + ` {"version":1,"tip":0,"blocks":[]}`,
 		"trailing garbage":     valid + ` x`,
-		"unknown version":      `{"version":2,"tip":0,"blocks":[]}`,
+		"unknown version":      `{"version":3,"tip":0,"blocks":[]}`,
 		"missing version":      `{"tip":0,"blocks":[]}`,
 		"missing tip":          `{"version":1,"blocks":[]}`,
 		"missing blocks":       `{"version":1,"tip":0}`,
