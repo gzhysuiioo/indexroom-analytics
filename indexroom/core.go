@@ -1,4 +1,5 @@
-// Package indexroom implements chain ingestion with reorg handling.
+// Package indexroom implements chain ingestion with reorg handling and
+// consistent paginated transaction queries over the main chain.
 package indexroom
 
 import "sync"
@@ -13,18 +14,21 @@ type Block struct {
 
 // Index is the durable chain view.
 //
-// Append and Reorg are safe for concurrent use; the exported fields are
-// meant for read-only inspection after all calls have finished.
+// Append, Reorg, and QueryTxs are safe for concurrent use; the exported
+// fields are meant for read-only inspection after all calls have finished.
 type Index struct {
 	Blocks map[int64]Block
 	ByHash map[string]int64
 	Tip    int64
 
-	mu sync.Mutex
+	mu  sync.Mutex
+	key [32]byte
 }
 
 // New returns an empty index.
-func New() *Index { return &Index{Blocks: map[int64]Block{}, ByHash: map[string]int64{}} }
+func New() *Index {
+	return &Index{Blocks: map[int64]Block{}, ByHash: map[string]int64{}, key: newKey()}
+}
 
 // Append accepts a block only when it extends the current tip, keeping the
 // chain linear. Re-submitting a block identical to one already on the main
