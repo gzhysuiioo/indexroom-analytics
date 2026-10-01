@@ -248,8 +248,8 @@ func (index *Index) collectLocked(from, to int64, txIDs []string) (hits []TxHit,
 }
 
 // fingerprintLocked hashes the exact content of every block in [from, to]:
-// height, hash, parent, and the ordered transaction list. The caller must
-// hold index.mu.
+// height, hash, parent, timestamp, and the ordered transaction list. The
+// caller must hold index.mu.
 func (index *Index) fingerprintLocked(from, to int64) []byte {
 	h := sha256.New()
 	var lenBuf [8]byte
@@ -264,6 +264,14 @@ func (index *Index) fingerprintLocked(from, to int64) []byte {
 		h.Write(lenBuf[:])
 		writeString(block.Hash)
 		writeString(block.Parent)
+		// The tag keeps a missing timestamp distinct from a present zero.
+		if block.Timestamp == nil {
+			h.Write([]byte{0})
+		} else {
+			h.Write([]byte{1})
+			binary.BigEndian.PutUint64(lenBuf[:], uint64(*block.Timestamp))
+			h.Write(lenBuf[:])
+		}
 		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(block.Txs)))
 		h.Write(lenBuf[:])
 		for _, tx := range block.Txs {

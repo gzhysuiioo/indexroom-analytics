@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -553,6 +554,89 @@ func TestQueryTxsDoesNotMutateIndex(t *testing.T) {
 		_ = page
 	}
 	requireUnchanged(t, index, blocks, byHash, tip)
+}
+
+func TestQueryTxsTimestampChangeKillsCursor(t *testing.T) {
+	build := func(t *testing.T) (*Index, string) {
+		t.Helper()
+		index := tsChain(t,
+			tb{tsp(100), []string{"a"}},
+			tb{tsp(200), []string{"b"}},
+			tb{tsp(300), []string{"c"}},
+		)
+		first, err := index.QueryTxs(TxQuery{PageSize: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return index, first.NextCursor
+	}
+
+	t.Run("timestamp changed in range", func(t *testing.T) {
+		index, cursor := build(t)
+		// Same hash, same txs, different timestamp: the block content changed.
+		if _, err := index.Reorg([]Block{
+			{Height: 2, Hash: "h2", Parent: "h1", Txs: []string{"b"}, Timestamp: tsp(250)},
+			{Height: 3, Hash: "h3", Parent: "h2", Txs: []string{"c"}, Timestamp: tsp(300)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := index.QueryTxs(TxQuery{Cursor: cursor}); !errors.Is(err, ErrQueryChanged) {
+			t.Fatalf("err=%v, want ErrQueryChanged", err)
+		}
+	})
+
+	t.Run("timestamp added to a missing one", func(t *testing.T) {
+		index := tsChain(t,
+			tb{tsp(100), []string{"a"}},
+			tb{tsp(200), []string{"b"}},
+			tb{nil, []string{"c"}},
+		)
+		first, err := index.QueryTxs(TxQuery{PageSize: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := index.Reorg([]Block{
+			{Height: 3, Hash: "h3", Parent: "h2", Txs: []string{"c"}, Timestamp: tsp(300)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := index.QueryTxs(TxQuery{Cursor: first.NextCursor}); !errors.Is(err, ErrQueryChanged) {
+			t.Fatalf("err=%v, want ErrQueryChanged", err)
+		}
+	})
+
+	t.Run("timestamp change outside range keeps cursor", func(t *testing.T) {
+		index, cursor := build(t)
+		// The cursor covers the whole chain here; pin it to heights 1..2.
+		first, err := index.QueryTxs(TxQuery{From: 1, To: 2, PageSize: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cursor = first.NextCursor
+		if _, err := index.Reorg([]Block{
+			{Height: 3, Hash: "h3", Parent: "h2", Txs: []string{"c"}, Timestamp: tsp(999)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := index.QueryTxs(TxQuery{From: 1, To: 2, PageSize: 1, Cursor: cursor}); err != nil {
+			t.Fatalf("continuation after out-of-range timestamp change failed: %v", err)
+		}
+	})
+
+	t.Run("restore with changed timestamp kills cursor", func(t *testing.T) {
+		index, cursor := build(t)
+		snap := `{"version":2,"tip":3,"blocks":[` +
+			`{"height":1,"hash":"h1","parent":"genesis","txs":["a"],"timestamp":100},` +
+			`{"height":2,"hash":"h2","parent":"h1","txs":["b"],"timestamp":999},` +
+			`{"height":3,"hash":"h3","parent":"h2","txs":["c"],"timestamp":300}` +
+			`]}`
+		if err := index.Restore(strings.NewReader(snap)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := index.QueryTxs(TxQuery{PageSize: 1, Cursor: cursor}); !errors.Is(err, ErrQueryChanged) {
+			t.Fatalf("err=%v, want ErrQueryChanged", err)
+		}
+	})
 }
 
 func TestQueryTxsConcurrentWithAppends(t *testing.T) {

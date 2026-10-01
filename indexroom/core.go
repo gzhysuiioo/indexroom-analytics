@@ -5,11 +5,18 @@ package indexroom
 import "sync"
 
 // Block is one ingested block with its transactions.
+//
+// Timestamp is the block's Unix time in seconds. nil means the block carries
+// no timestamp; a non-nil pointer to zero is a real timestamp of 0, and the
+// two must never be conflated. Timestamps are part of the block content:
+// they may be equal to or lower than the previous block's timestamp, but a
+// negative value is rejected.
 type Block struct {
-	Height int64
-	Hash   string
-	Parent string
-	Txs    []string
+	Height    int64
+	Hash      string
+	Parent    string
+	Txs       []string
+	Timestamp *int64
 }
 
 // Index is the durable chain view.
@@ -43,6 +50,9 @@ func (index *Index) Append(block Block) error {
 func (index *Index) appendLocked(block Block) error {
 	if block.Hash == "" {
 		return errInvalid("block needs a hash")
+	}
+	if block.Timestamp != nil && *block.Timestamp < 0 {
+		return errInvalid("block timestamp must be non-negative")
 	}
 	if index.Tip == 0 {
 		// Empty index: only the first block at height 1 is accepted; its
@@ -96,6 +106,9 @@ func (index *Index) Reorg(blocks []Block) ([]int64, error) {
 		if block.Hash == "" {
 			return nil, errInvalid("block needs a hash")
 		}
+		if block.Timestamp != nil && *block.Timestamp < 0 {
+			return nil, errInvalid("block timestamp must be non-negative")
+		}
 		if seen[block.Hash] {
 			return nil, errInvalid("duplicate hash inside branch")
 		}
@@ -137,13 +150,18 @@ func (index *Index) Reorg(blocks []Block) ([]int64, error) {
 	return dropped, nil
 }
 
-// storeLocked records a validated block, copying its transactions so later
-// caller-side mutation of the slice cannot alter the stored block.
+// storeLocked records a validated block, copying its transactions and
+// timestamp so later caller-side mutation of the slice or pointed-to value
+// cannot alter the stored block.
 func (index *Index) storeLocked(block Block) {
 	if block.Txs != nil {
 		txs := make([]string, len(block.Txs))
 		copy(txs, block.Txs)
 		block.Txs = txs
+	}
+	if block.Timestamp != nil {
+		ts := *block.Timestamp
+		block.Timestamp = &ts
 	}
 	index.Blocks[block.Height] = block
 	index.ByHash[block.Hash] = block.Height
@@ -151,9 +169,17 @@ func (index *Index) storeLocked(block Block) {
 }
 
 // sameBlock reports whether two blocks are identical: same height, hash,
-// parent, and transactions in order. An empty tx list equals a missing one.
+// parent, transactions in order, and timestamp. A nil timestamp differs from
+// a non-nil one, even when the latter points at zero; an empty tx list equals
+// a missing one.
 func sameBlock(a, b Block) bool {
 	if a.Height != b.Height || a.Hash != b.Hash || a.Parent != b.Parent {
+		return false
+	}
+	if (a.Timestamp == nil) != (b.Timestamp == nil) {
+		return false
+	}
+	if a.Timestamp != nil && *a.Timestamp != *b.Timestamp {
 		return false
 	}
 	if len(a.Txs) != len(b.Txs) {

@@ -15,17 +15,23 @@ import (
 // never changes the index.
 var ErrInvalidSnapshot = errors.New("indexroom: invalid snapshot")
 
-// snapshotVersion is the only snapshot layout this package reads and writes.
-const snapshotVersion = 1
+// snapshotVersion1 is the original snapshot layout: blocks carry no
+// timestamp field.
+const snapshotVersion1 = 1
 
-// snapshotDoc is the wire form of an exported main chain.
+// snapshotVersion2 adds the required per-block timestamp: a non-negative
+// Unix seconds integer, or null for a block without one.
+const snapshotVersion2 = 2
+
+// snapshotDoc is the wire form of an exported main chain. Blocks is either a
+// []snapshotBlock (version 1) or a []snapshotBlockV2 (version 2).
 type snapshotDoc struct {
-	Version int64           `json:"version"`
-	Tip     int64           `json:"tip"`
-	Blocks  []snapshotBlock `json:"blocks"`
+	Version int64 `json:"version"`
+	Tip     int64 `json:"tip"`
+	Blocks  any   `json:"blocks"`
 }
 
-// snapshotBlock is the wire form of one block inside a snapshot.
+// snapshotBlock is the wire form of one block inside a version 1 snapshot.
 type snapshotBlock struct {
 	Height int64    `json:"height"`
 	Hash   string   `json:"hash"`
@@ -33,12 +39,24 @@ type snapshotBlock struct {
 	Txs    []string `json:"txs"`
 }
 
+// snapshotBlockV2 is the wire form of one block inside a version 2 snapshot,
+// adding the required timestamp field.
+type snapshotBlockV2 struct {
+	snapshotBlock
+	// Timestamp is the block's Unix seconds; null means the block has none.
+	Timestamp *int64 `json:"timestamp"`
+}
+
 // Export writes the current main chain to w as a JSON snapshot: a single
 // object with version, tip, and the blocks ordered by ascending height, each
-// carrying its transactions in order. The same main chain always produces
-// the same bytes, regardless of the reorg, restore, or query history that
-// led to it. Only blocks in effect at export time appear; nothing the index
-// once held and later dropped is included.
+// carrying its transactions in order. A chain in which every block lacks a
+// timestamp is written as version 1 with the original byte format; as soon
+// as one block carries a known timestamp the chain is written as version 2,
+// where every block has a required timestamp field holding a non-negative
+// Unix seconds integer or null. The same main chain always produces the same
+// bytes, regardless of the reorg, restore, or query history that led to it.
+// Only blocks in effect at export time appear; nothing the index once held
+// and later dropped is included.
 //
 // Export observes one complete chain state and never modifies the index.
 // The chain is copied under the lock and serialized afterwards, so queries
@@ -46,21 +64,48 @@ type snapshotBlock struct {
 // failure is reported and leaves the index untouched.
 func (index *Index) Export(w io.Writer) error {
 	index.mu.Lock()
-	doc := snapshotDoc{
-		Version: snapshotVersion,
-		Tip:     index.Tip,
-		Blocks:  make([]snapshotBlock, 0, int(index.Tip)),
-	}
+	version := int64(snapshotVersion1)
 	for height := int64(1); height <= index.Tip; height++ {
-		block := index.Blocks[height]
-		txs := make([]string, len(block.Txs))
-		copy(txs, block.Txs)
-		doc.Blocks = append(doc.Blocks, snapshotBlock{
-			Height: block.Height,
-			Hash:   block.Hash,
-			Parent: block.Parent,
-			Txs:    txs,
-		})
+		if index.Blocks[height].Timestamp != nil {
+			version = snapshotVersion2
+			break
+		}
+	}
+	doc := snapshotDoc{
+		Version: version,
+		Tip:     index.Tip,
+	}
+	if version == snapshotVersion2 {
+		blocks := make([]snapshotBlockV2, 0, int(index.Tip))
+		for height := int64(1); height <= index.Tip; height++ {
+			block := index.Blocks[height]
+			txs := make([]string, len(block.Txs))
+			copy(txs, block.Txs)
+			blocks = append(blocks, snapshotBlockV2{
+				snapshotBlock: snapshotBlock{
+					Height: block.Height,
+					Hash:   block.Hash,
+					Parent: block.Parent,
+					Txs:    txs,
+				},
+				Timestamp: block.Timestamp,
+			})
+		}
+		doc.Blocks = blocks
+	} else {
+		blocks := make([]snapshotBlock, 0, int(index.Tip))
+		for height := int64(1); height <= index.Tip; height++ {
+			block := index.Blocks[height]
+			txs := make([]string, len(block.Txs))
+			copy(txs, block.Txs)
+			blocks = append(blocks, snapshotBlock{
+				Height: block.Height,
+				Hash:   block.Hash,
+				Parent: block.Parent,
+				Txs:    txs,
+			})
+		}
+		doc.Blocks = blocks
 	}
 	index.mu.Unlock()
 
@@ -154,7 +199,7 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 			}
 			haveTip = true
 		case "blocks":
-			blocks, err = parseSnapshotBlocks(dec)
+			blocks, err = parseSnapshotBlocks(dec, version)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -183,7 +228,7 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 	if !haveBlocks {
 		return 0, nil, invalidSnapshot("missing field %q", "blocks")
 	}
-	if version != snapshotVersion {
+	if version != snapshotVersion1 && version != snapshotVersion2 {
 		return 0, nil, invalidSnapshot("unsupported version %d", version)
 	}
 	lastHeight := int64(0)
@@ -197,8 +242,9 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 }
 
 // parseSnapshotBlocks reads the blocks array value, validating heights,
-// hashes, and parent links as it goes.
-func parseSnapshotBlocks(dec *json.Decoder) ([]Block, error) {
+// hashes, and parent links as it goes. Version 2 blocks must also carry a
+// valid timestamp field.
+func parseSnapshotBlocks(dec *json.Decoder, version int64) ([]Block, error) {
 	tok, err := dec.Token()
 	if err != nil {
 		return nil, classifySnapshotErr(err)
@@ -209,7 +255,7 @@ func parseSnapshotBlocks(dec *json.Decoder) ([]Block, error) {
 	blocks := []Block{}
 	seenHash := map[string]bool{}
 	for dec.More() {
-		block, err := parseSnapshotBlock(dec)
+		block, err := parseSnapshotBlock(dec, version)
 		if err != nil {
 			return nil, err
 		}
@@ -238,8 +284,8 @@ func parseSnapshotBlocks(dec *json.Decoder) ([]Block, error) {
 }
 
 // parseSnapshotBlock reads one block object, requiring exactly the fields
-// height, hash, parent, and txs.
-func parseSnapshotBlock(dec *json.Decoder) (Block, error) {
+// height, hash, parent, and txs; version 2 additionally requires timestamp.
+func parseSnapshotBlock(dec *json.Decoder, version int64) (Block, error) {
 	var block Block
 	tok, err := dec.Token()
 	if err != nil {
@@ -248,7 +294,7 @@ func parseSnapshotBlock(dec *json.Decoder) (Block, error) {
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
 		return block, invalidSnapshot("block must be a JSON object")
 	}
-	var haveHeight, haveHash, haveParent, haveTxs bool
+	var haveHeight, haveHash, haveParent, haveTxs, haveTimestamp bool
 	seen := map[string]bool{}
 	for dec.More() {
 		key, err := snapshotKey(dec)
@@ -282,6 +328,19 @@ func parseSnapshotBlock(dec *json.Decoder) (Block, error) {
 			}
 			block.Txs = txs
 			haveTxs = true
+		case "timestamp":
+			if version != snapshotVersion2 {
+				return block, invalidSnapshot("field %q is only valid in version 2", "timestamp")
+			}
+			var ts *int64
+			if err := dec.Decode(&ts); err != nil {
+				return block, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			}
+			if ts != nil && *ts < 0 {
+				return block, invalidSnapshot("block timestamp must be a non-negative integer or null")
+			}
+			block.Timestamp = ts
+			haveTimestamp = true
 		default:
 			return block, invalidSnapshot("unknown block field %q", key)
 		}
@@ -298,6 +357,9 @@ func parseSnapshotBlock(dec *json.Decoder) (Block, error) {
 		if !present {
 			return block, invalidSnapshot("block is missing field %q", field)
 		}
+	}
+	if version == snapshotVersion2 && !haveTimestamp {
+		return block, invalidSnapshot("block is missing field %q", "timestamp")
 	}
 	return block, nil
 }

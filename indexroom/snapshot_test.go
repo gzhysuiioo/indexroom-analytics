@@ -313,7 +313,7 @@ func TestRestoreRejectsInvalidSnapshots(t *testing.T) {
 		"not an object":        `[1,2]`,
 		"trailing second doc":  valid + ` {"version":1,"tip":0,"blocks":[]}`,
 		"trailing garbage":     valid + ` x`,
-		"unknown version":      `{"version":2,"tip":0,"blocks":[]}`,
+		"unknown version":      `{"version":3,"tip":0,"blocks":[]}`,
 		"missing version":      `{"tip":0,"blocks":[]}`,
 		"missing tip":          `{"version":1,"blocks":[]}`,
 		"missing blocks":       `{"version":1,"tip":0}`,
@@ -547,6 +547,174 @@ func TestRestoreWhileStreamOpenIndexStaysUsable(t *testing.T) {
 	// Only the append changed the chain; the failed restore left no trace.
 	if index.Tip != 3 || len(index.Blocks) != 3 || index.Blocks[3].Hash != "h3" {
 		t.Fatalf("unexpected state: tip=%d blocks=%v", index.Tip, index.Blocks)
+	}
+}
+
+func TestSnapshotV2ExportExactBytes(t *testing.T) {
+	index := tsChain(t,
+		tb{tsp(100), []string{"t1", "t2"}},
+		tb{nil, nil},
+		tb{tsp(0), []string{"t3"}},
+	)
+	want := `{"version":2,"tip":3,"blocks":[` +
+		`{"height":1,"hash":"h1","parent":"genesis","txs":["t1","t2"],"timestamp":100},` +
+		`{"height":2,"hash":"h2","parent":"h1","txs":[],"timestamp":null},` +
+		`{"height":3,"hash":"h3","parent":"h2","txs":["t3"],"timestamp":0}` +
+		`]}`
+	if raw := exportString(t, index); raw != want {
+		t.Fatalf("export=%s\nwant=%s", raw, want)
+	}
+}
+
+func TestSnapshotV1BytesUnchangedWithoutTimestamps(t *testing.T) {
+	index := chain(t,
+		Block{Height: 1, Hash: "h1", Parent: "genesis", Txs: []string{"t1"}},
+		Block{Height: 2, Hash: "h2", Parent: "h1"},
+	)
+	want := `{"version":1,"tip":2,"blocks":[` +
+		`{"height":1,"hash":"h1","parent":"genesis","txs":["t1"]},` +
+		`{"height":2,"hash":"h2","parent":"h1","txs":[]}` +
+		`]}`
+	if raw := exportString(t, index); raw != want {
+		t.Fatalf("export=%s\nwant=%s", raw, want)
+	}
+}
+
+func TestSnapshotV2RoundTripStatsConsistent(t *testing.T) {
+	index := tsChain(t,
+		tb{tsp(100), []string{"a", "b"}},
+		tb{nil, []string{"a"}},
+		tb{tsp(0), []string{"c"}},
+	)
+	raw := exportString(t, index)
+
+	restored := New()
+	if err := restored.Restore(strings.NewReader(raw)); err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	// Timestamps survive the round trip, including the distinction between
+	// missing and zero.
+	if restored.Blocks[1].Timestamp == nil || *restored.Blocks[1].Timestamp != 100 {
+		t.Fatalf("block 1 timestamp not restored: %+v", restored.Blocks[1])
+	}
+	if restored.Blocks[2].Timestamp != nil {
+		t.Fatalf("block 2 should have no timestamp: %+v", restored.Blocks[2])
+	}
+	if restored.Blocks[3].Timestamp == nil || *restored.Blocks[3].Timestamp != 0 {
+		t.Fatalf("block 3 timestamp not restored: %+v", restored.Blocks[3])
+	}
+
+	query := TimeStatsQuery{Start: 0, End: 400, Segment: 100}
+	want, err := index.QueryTimeStats(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := restored.QueryTimeStats(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stats after restore differ:\ngot  %+v\nwant %+v", got, want)
+	}
+	if got.Untimestamped != 1 {
+		t.Fatalf("untimestamped=%d, want 1", got.Untimestamped)
+	}
+
+	// Re-exporting the restored chain yields identical bytes.
+	if again := exportString(t, restored); again != raw {
+		t.Fatalf("re-export differs:\n%s\n%s", again, raw)
+	}
+}
+
+func TestSnapshotV1RestoreTreatsTimestampsAsMissing(t *testing.T) {
+	index := txChain(t, []string{"a"}, []string{"b"})
+	raw := exportString(t, index)
+	if !strings.Contains(raw, `"version":1`) {
+		t.Fatalf("precondition: expected version 1 export, got %s", raw)
+	}
+	restored := New()
+	if err := restored.Restore(strings.NewReader(raw)); err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	for height := int64(1); height <= restored.Tip; height++ {
+		if restored.Blocks[height].Timestamp != nil {
+			t.Fatalf("block %d has a timestamp after v1 restore: %+v", height, restored.Blocks[height])
+		}
+	}
+	stats, err := restored.QueryTimeStats(TimeStatsQuery{Start: 0, End: 100, Segment: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Untimestamped != 2 {
+		t.Fatalf("untimestamped=%d, want 2", stats.Untimestamped)
+	}
+}
+
+func TestSnapshotV2RejectsInvalidDocuments(t *testing.T) {
+	valid := `{"version":2,"tip":1,"blocks":[` +
+		`{"height":1,"hash":"h1","parent":"genesis","txs":["a"],"timestamp":100}` +
+		`]}`
+	cases := map[string]string{
+		"missing timestamp": `{"version":2,"tip":1,"blocks":[` +
+			`{"height":1,"hash":"h1","parent":"genesis","txs":[]}` +
+			`]}`,
+		"negative timestamp": `{"version":2,"tip":1,"blocks":[` +
+			`{"height":1,"hash":"h1","parent":"genesis","txs":[],"timestamp":-1}` +
+			`]}`,
+		"timestamp wrong type": `{"version":2,"tip":1,"blocks":[` +
+			`{"height":1,"hash":"h1","parent":"genesis","txs":[],"timestamp":"100"}` +
+			`]}`,
+		"timestamp float": `{"version":2,"tip":1,"blocks":[` +
+			`{"height":1,"hash":"h1","parent":"genesis","txs":[],"timestamp":1.5}` +
+			`]}`,
+		"v1 with timestamp field": `{"version":1,"tip":1,"blocks":[` +
+			`{"height":1,"hash":"h1","parent":"genesis","txs":[],"timestamp":100}` +
+			`]}`,
+		"duplicate timestamp": `{"version":2,"tip":1,"blocks":[` +
+			`{"height":1,"hash":"h1","parent":"genesis","txs":[],"timestamp":1,"timestamp":2}` +
+			`]}`,
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			index := tsChain(t, tb{tsp(100), []string{"seed"}})
+			blocks, byHash, tip := snapshot(index)
+			err := index.Restore(strings.NewReader(input))
+			if !errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("err=%v, want ErrInvalidSnapshot", err)
+			}
+			requireUnchanged(t, index, blocks, byHash, tip)
+		})
+	}
+	// The valid document restores fine and lands on version 2 bytes.
+	restored := New()
+	if err := restored.Restore(strings.NewReader(valid)); err != nil {
+		t.Fatalf("valid v2 restore failed: %v", err)
+	}
+	if raw := exportString(t, restored); !strings.Contains(raw, `"version":2`) {
+		t.Fatalf("re-export=%s, want version 2", raw)
+	}
+}
+
+func TestSnapshotV2NullTimestampRoundTrips(t *testing.T) {
+	// A known timestamp somewhere in the chain forces version 2; the block
+	// without one must round-trip as an explicit null.
+	index := tsChain(t,
+		tb{tsp(100), []string{"a"}},
+		tb{nil, []string{"b"}},
+	)
+	raw := exportString(t, index)
+	if !strings.Contains(raw, `"version":2`) {
+		t.Fatalf("export=%s, want version 2", raw)
+	}
+	if !strings.Contains(raw, `"timestamp":null`) {
+		t.Fatalf("export=%s, want a null timestamp", raw)
+	}
+	restored := New()
+	if err := restored.Restore(strings.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Blocks[2].Timestamp != nil {
+		t.Fatalf("timestamp not null after restore: %+v", restored.Blocks[2])
 	}
 }
 
