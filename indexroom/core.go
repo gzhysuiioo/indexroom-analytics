@@ -14,8 +14,9 @@ type Block struct {
 
 // Index is the durable chain view.
 //
-// Append, Reorg, and QueryTxs are safe for concurrent use; the exported
-// fields are meant for read-only inspection after all calls have finished.
+// Append, Reorg, QueryTxs, Export, and Restore are safe for concurrent use;
+// the exported fields are meant for read-only inspection after all calls
+// have finished.
 type Index struct {
 	Blocks map[int64]Block
 	ByHash map[string]int64
