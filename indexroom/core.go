@@ -20,7 +20,8 @@ type Index struct {
 	ByHash map[string]int64
 	Tip    int64
 
-	mu sync.Mutex
+	mu      sync.Mutex
+	hmacKey []byte
 }
 
 // New returns an empty index.
