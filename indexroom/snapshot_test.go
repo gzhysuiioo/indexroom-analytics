@@ -393,6 +393,156 @@ func TestRestoreRejectsInvalidSnapshots(t *testing.T) {
 	}
 }
 
+// TestRestoreRejectsNullFields verifies that explicit null in any required
+// field is rejected as ErrInvalidSnapshot rather than silently becoming a
+// zero value. The error must name the offending field; tx element errors
+// must also name the block height and 0-based position.
+func TestRestoreRejectsNullFields(t *testing.T) {
+	cases := map[string]string{
+		// Top-level nulls.
+		"v1 tip null":     `{"version":1,"tip":null,"blocks":[]}`,
+		"v1 version null": `{"version":null,"tip":0,"blocks":[]}`,
+		"v2 tip null":     `{"version":2,"tip":null,"blocks":[]}`,
+		"v2 version null": `{"version":null,"tip":0,"blocks":[]}`,
+		// Block field nulls (v1).
+		"v1 height null": `{"version":1,"tip":1,"blocks":[{"height":null,"hash":"h1","parent":"g","txs":[]}]}`,
+		"v1 hash null":   `{"version":1,"tip":1,"blocks":[{"height":1,"hash":null,"parent":"g","txs":[]}]}`,
+		"v1 parent null": `{"version":1,"tip":1,"blocks":[{"height":1,"hash":"h1","parent":null,"txs":[]}]}`,
+		// Block field nulls (v2).
+		"v2 height null": `{"version":2,"tip":1,"blocks":[{"height":null,"hash":"h1","parent":"g","txs":[],"timestamp":1}]}`,
+		"v2 hash null":   `{"version":2,"tip":1,"blocks":[{"height":1,"hash":null,"parent":"g","txs":[],"timestamp":1}]}`,
+		"v2 parent null": `{"version":2,"tip":1,"blocks":[{"height":1,"hash":"h1","parent":null,"txs":[],"timestamp":1}]}`,
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			index := txChain(t, []string{"a"}, []string{"b"})
+			blocks, byHash, tip := snapshot(index)
+			err := index.Restore(strings.NewReader(input))
+			if !errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("err=%v, want ErrInvalidSnapshot", err)
+			}
+			requireUnchanged(t, index, blocks, byHash, tip)
+		})
+	}
+}
+
+// TestRestoreRejectsNullTxElements verifies that null inside a txs array is
+// rejected with the block height and 0-based position, and that the rejection
+// is atomic — the whole snapshot fails even when the null is in the very
+// last transaction of the very last block.
+func TestRestoreRejectsNullTxElements(t *testing.T) {
+	cases := map[string]struct {
+		snap     string
+		wantPos  int
+		wantHeight int64
+	}{
+		"v1 null at position 0": {
+			snap:       `{"version":1,"tip":1,"blocks":[{"height":1,"hash":"h1","parent":"g","txs":[null,"a"]}]}`,
+			wantPos:    0,
+			wantHeight: 1,
+		},
+		"v1 null at position 1": {
+			snap:       `{"version":1,"tip":1,"blocks":[{"height":1,"hash":"h1","parent":"g","txs":["a",null,"b"]}]}`,
+			wantPos:    1,
+			wantHeight: 1,
+		},
+		"v1 null at last position of last block": {
+			snap: `{"version":1,"tip":2,"blocks":[` +
+				`{"height":1,"hash":"h1","parent":"g","txs":["a"]},` +
+				`{"height":2,"hash":"h2","parent":"h1","txs":["b","c",null]}` +
+				`]}`,
+			wantPos:    2,
+			wantHeight: 2,
+		},
+		"v2 null at position 0": {
+			snap:       `{"version":2,"tip":1,"blocks":[{"height":1,"hash":"h1","parent":"g","txs":[null],"timestamp":1}]}`,
+			wantPos:    0,
+			wantHeight: 1,
+		},
+		"v2 null at position 1": {
+			snap:       `{"version":2,"tip":1,"blocks":[{"height":1,"hash":"h1","parent":"g","txs":["a",null],"timestamp":1}]}`,
+			wantPos:    1,
+			wantHeight: 1,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			index := txChain(t, []string{"a"}, []string{"b"})
+			blocks, byHash, tip := snapshot(index)
+			err := index.Restore(strings.NewReader(tc.snap))
+			if !errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("err=%v, want ErrInvalidSnapshot", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "txs element") {
+				t.Fatalf("error %q does not mention txs element", msg)
+			}
+			if !strings.Contains(msg, fmt.Sprintf("block height %d", tc.wantHeight)) {
+				t.Fatalf("error %q does not mention block height %d", msg, tc.wantHeight)
+			}
+			if !strings.Contains(msg, fmt.Sprintf("position %d", tc.wantPos)) {
+				t.Fatalf("error %q does not mention position %d", msg, tc.wantPos)
+			}
+			requireUnchanged(t, index, blocks, byHash, tip)
+		})
+	}
+}
+
+// TestRestoreNullTxDoesNotBecomeEmptyTx verifies that a null tx element is
+// not silently converted to an empty string identifier: the snapshot is
+// rejected outright, so the index never holds a phantom empty transaction.
+func TestRestoreNullTxDoesNotBecomeEmptyTx(t *testing.T) {
+	index := New()
+	snap := `{"version":1,"tip":1,"blocks":[{"height":1,"hash":"h1","parent":"g","txs":["a",null,"b"]}]}`
+	if err := index.Restore(strings.NewReader(snap)); !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("err=%v, want ErrInvalidSnapshot", err)
+	}
+	// The index must be completely empty — no phantom empty txs.
+	if index.Tip != 0 || len(index.Blocks) != 0 {
+		t.Fatalf("index changed after rejected restore: tip=%d blocks=%v", index.Tip, index.Blocks)
+	}
+}
+
+// TestRestoreNullTxKeepsCursorsAlive verifies that a rejected restore due to
+// a null tx element leaves previously issued pagination cursors usable.
+func TestRestoreNullTxKeepsCursorsAlive(t *testing.T) {
+	index := txChain(t,
+		[]string{"a"},
+		[]string{"b"},
+		[]string{"c"},
+	)
+	first, err := index.QueryTxs(TxQuery{PageSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor := first.NextCursor
+	if cursor == "" {
+		t.Fatal("expected a continuation cursor")
+	}
+	// The null sits at the very end of the snapshot.
+	bad := `{"version":1,"tip":3,"blocks":[` +
+		`{"height":1,"hash":"h1","parent":"g","txs":["a"]},` +
+		`{"height":2,"hash":"h2","parent":"h1","txs":["b"]},` +
+		`{"height":3,"hash":"h3","parent":"h2","txs":["c",null]}` +
+		`]}`
+	if err := index.Restore(strings.NewReader(bad)); !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("err=%v, want ErrInvalidSnapshot", err)
+	}
+	// The cursor issued before the failed restore still pages to the end.
+	pages := collectPages(t, index, TxQuery{PageSize: 1, Cursor: cursor})
+	var all []TxHit
+	for _, page := range pages {
+		all = append(all, page.Hits...)
+	}
+	want := []TxHit{
+		{Height: 2, BlockHash: "h2", TxID: "b", Position: 0},
+		{Height: 3, BlockHash: "h3", TxID: "c", Position: 0},
+	}
+	if !reflect.DeepEqual(all, want) {
+		t.Fatalf("hits=%v, want %v", all, want)
+	}
+}
+
 // errReader fails after delivering a valid snapshot prefix.
 type errReader struct {
 	data []byte

@@ -10,11 +10,12 @@ import (
 
 // ErrInvalidSnapshot marks a rejected snapshot document: malformed or
 // truncated JSON, trailing data after the object, an unknown version,
-// missing, mistyped, unknown, or duplicated fields, heights that do not
-// ascend consecutively from 1, an empty or duplicated hash, a broken parent
-// link, a version-2 timestamp that is missing or neither null nor a
-// non-negative integer, or a tip that disagrees with the block list. A
-// rejected restore never changes the index.
+// missing, mistyped, unknown, or duplicated fields, a null in any field
+// that must carry a value (version, tip, height, hash, parent, or a txs
+// element), heights that do not ascend consecutively from 1, an empty or
+// duplicated hash, a broken parent link, a version-2 timestamp that is
+// missing or neither null nor a non-negative integer, or a tip that
+// disagrees with the block list. A rejected restore never changes the index.
 var ErrInvalidSnapshot = errors.New("indexroom: invalid snapshot")
 
 const (
@@ -25,6 +26,9 @@ const (
 	// either a non-negative Unix-seconds integer or null for missing time.
 	snapshotVersion2 = 2
 )
+
+// nullJSON is the literal JSON null token.
+const nullJSON = "null"
 
 // snapshotDoc is the version-1 wire form of an exported main chain.
 type snapshotDoc struct {
@@ -210,14 +214,18 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		seen[key] = true
 		switch key {
 		case "version":
-			if err := dec.Decode(&version); err != nil {
-				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			v, err := decodeSnapshotIntField(dec, key)
+			if err != nil {
+				return 0, nil, err
 			}
+			version = v
 			haveVersion = true
 		case "tip":
-			if err := dec.Decode(&tip); err != nil {
-				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			v, err := decodeSnapshotIntField(dec, key)
+			if err != nil {
+				return 0, nil, err
 			}
+			tip = v
 			haveTip = true
 		case "blocks":
 			if err := dec.Decode(&rawBlocks); err != nil {
@@ -332,6 +340,7 @@ func parseSnapshotBlock(dec *json.Decoder) (Block, error) {
 		return block, invalidSnapshot("block must be a JSON object")
 	}
 	var haveHeight, haveHash, haveParent, haveTxs bool
+	var txNulls []int
 	seen := map[string]bool{}
 	for dec.More() {
 		key, err := snapshotKey(dec)
@@ -344,26 +353,33 @@ func parseSnapshotBlock(dec *json.Decoder) (Block, error) {
 		seen[key] = true
 		switch key {
 		case "height":
-			if err := dec.Decode(&block.Height); err != nil {
-				return block, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			v, err := decodeSnapshotIntField(dec, key)
+			if err != nil {
+				return block, err
 			}
+			block.Height = v
 			haveHeight = true
 		case "hash":
-			if err := dec.Decode(&block.Hash); err != nil {
-				return block, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			v, err := decodeSnapshotStringField(dec, key)
+			if err != nil {
+				return block, err
 			}
+			block.Hash = v
 			haveHash = true
 		case "parent":
-			if err := dec.Decode(&block.Parent); err != nil {
-				return block, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			v, err := decodeSnapshotStringField(dec, key)
+			if err != nil {
+				return block, err
 			}
+			block.Parent = v
 			haveParent = true
 		case "txs":
-			txs, err := parseSnapshotTxs(dec)
+			txs, nulls, err := parseSnapshotTxs(dec)
 			if err != nil {
 				return block, err
 			}
 			block.Txs = txs
+			txNulls = nulls
 			haveTxs = true
 		default:
 			return block, invalidSnapshot("unknown block field %q", key)
@@ -382,6 +398,11 @@ func parseSnapshotBlock(dec *json.Decoder) (Block, error) {
 			return block, invalidSnapshot("block is missing field %q", field)
 		}
 	}
+	// Reject null tx elements now that the block height is known, so the
+	// error can pinpoint both the block and the 0-based position.
+	if len(txNulls) > 0 {
+		return block, invalidSnapshot("txs element at block height %d, position %d must not be null", block.Height, txNulls[0])
+	}
 	return block, nil
 }
 
@@ -398,6 +419,7 @@ func parseSnapshotBlockV2(dec *json.Decoder) (Block, error) {
 		return block, invalidSnapshot("block must be a JSON object")
 	}
 	var haveHeight, haveHash, haveParent, haveTxs, haveTimestamp bool
+	var txNulls []int
 	seen := map[string]bool{}
 	for dec.More() {
 		key, err := snapshotKey(dec)
@@ -410,26 +432,33 @@ func parseSnapshotBlockV2(dec *json.Decoder) (Block, error) {
 		seen[key] = true
 		switch key {
 		case "height":
-			if err := dec.Decode(&block.Height); err != nil {
-				return block, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			v, err := decodeSnapshotIntField(dec, key)
+			if err != nil {
+				return block, err
 			}
+			block.Height = v
 			haveHeight = true
 		case "hash":
-			if err := dec.Decode(&block.Hash); err != nil {
-				return block, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			v, err := decodeSnapshotStringField(dec, key)
+			if err != nil {
+				return block, err
 			}
+			block.Hash = v
 			haveHash = true
 		case "parent":
-			if err := dec.Decode(&block.Parent); err != nil {
-				return block, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			v, err := decodeSnapshotStringField(dec, key)
+			if err != nil {
+				return block, err
 			}
+			block.Parent = v
 			haveParent = true
 		case "txs":
-			txs, err := parseSnapshotTxs(dec)
+			txs, nulls, err := parseSnapshotTxs(dec)
 			if err != nil {
 				return block, err
 			}
 			block.Txs = txs
+			txNulls = nulls
 			haveTxs = true
 		case "timestamp":
 			t, err := parseSnapshotTimestamp(dec)
@@ -456,6 +485,11 @@ func parseSnapshotBlockV2(dec *json.Decoder) (Block, error) {
 			return block, invalidSnapshot("block is missing field %q", field)
 		}
 	}
+	// Reject null tx elements now that the block height is known, so the
+	// error can pinpoint both the block and the 0-based position.
+	if len(txNulls) > 0 {
+		return block, invalidSnapshot("txs element at block height %d, position %d must not be null", block.Height, txNulls[0])
+	}
 	return block, nil
 }
 
@@ -474,27 +508,37 @@ func parseSnapshotTimestamp(dec *json.Decoder) (*int64, error) {
 }
 
 // parseSnapshotTxs reads one txs array, preserving duplicates and empty
-// identifiers exactly as written.
-func parseSnapshotTxs(dec *json.Decoder) ([]string, error) {
+// identifiers exactly as written. Explicit null elements are recorded by
+// 0-based position so callers can reject them once the block height is known.
+func parseSnapshotTxs(dec *json.Decoder) (txs []string, nulls []int, err error) {
 	tok, err := dec.Token()
 	if err != nil {
-		return nil, classifySnapshotErr(err)
+		return nil, nil, classifySnapshotErr(err)
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '[' {
-		return nil, invalidSnapshot("field %q must be an array of strings", "txs")
+		return nil, nil, invalidSnapshot("field %q must be an array of strings", "txs")
 	}
-	txs := []string{}
+	txs = []string{}
 	for dec.More() {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return nil, nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err))
+		}
+		if string(raw) == nullJSON {
+			nulls = append(nulls, len(txs))
+			txs = append(txs, "")
+			continue
+		}
 		var tx string
-		if err := dec.Decode(&tx); err != nil {
-			return nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err))
+		if err := json.Unmarshal(raw, &tx); err != nil {
+			return nil, nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err))
 		}
 		txs = append(txs, tx)
 	}
 	if _, err := dec.Token(); err != nil { // closing ']'
-		return nil, classifySnapshotErr(err)
+		return nil, nil, classifySnapshotErr(err)
 	}
-	return txs, nil
+	return txs, nulls, nil
 }
 
 // snapshotKey reads the next object key.
@@ -508,6 +552,40 @@ func snapshotKey(dec *json.Decoder) (string, error) {
 		return "", invalidSnapshot("object key must be a string")
 	}
 	return key, nil
+}
+
+// decodeSnapshotIntField decodes an integer field, rejecting an explicit null
+// that would otherwise silently become zero and look like a valid value.
+func decodeSnapshotIntField(dec *json.Decoder, field string) (int64, error) {
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return 0, classifySnapshotErr(fmt.Errorf("field %q: %w", field, err))
+	}
+	if string(raw) == nullJSON {
+		return 0, invalidSnapshot("field %q must not be null", field)
+	}
+	var v int64
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return 0, classifySnapshotErr(fmt.Errorf("field %q: %w", field, err))
+	}
+	return v, nil
+}
+
+// decodeSnapshotStringField decodes a string field, rejecting an explicit null
+// that would otherwise silently become the empty string.
+func decodeSnapshotStringField(dec *json.Decoder, field string) (string, error) {
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return "", classifySnapshotErr(fmt.Errorf("field %q: %w", field, err))
+	}
+	if string(raw) == nullJSON {
+		return "", invalidSnapshot("field %q must not be null", field)
+	}
+	var v string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", classifySnapshotErr(fmt.Errorf("field %q: %w", field, err))
+	}
+	return v, nil
 }
 
 // invalidSnapshot builds an ErrInvalidSnapshot error with a specific reason.
