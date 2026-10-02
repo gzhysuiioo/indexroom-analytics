@@ -26,6 +26,33 @@ Each request fully replaces that service's instance list. New services require
 JSON with per-item results and the final sorted service list; exit status is 0
 only when every registration succeeds.
 
+Requests are processed in input order and come in three types:
+
+- `register` — replace the service's instance list (the default when `type` is
+  omitted).
+- `health` — record an offline healthy/unhealthy observation for one instance;
+  it never probes and never bumps the registration revision.
+- `select` — pick one healthy instance for the service. Only `healthy`
+  instances are eligible; `unknown` and `unhealthy` are not. Each service
+  rotates through instance ids in ascending order: the first pick is the
+  smallest id, and each later pick continues strictly after the previous pick,
+  wrapping to the smallest after the end. A single healthy instance is picked
+  repeatedly. The rotation continues from the last successful pick's id even
+  when that instance has been removed or become unhealthy; failed requests,
+  duplicate registrations and duplicate health reports never advance it. A
+  successful select returns `instanceId`, `address` and the instance's current
+  health `sequence`; it never changes the registry. Failures are `invalid`
+  (bad fields), `conflict` (revision mismatch), `not_found` (service missing)
+  or `no_healthy` (no healthy target available), each with the current revision.
+
+```bash
+echo '{"requests":[
+  {"service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"host:8080"}]},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"select","service":"svc","expectedRevision":1}
+]}' | go run ./cmd/indexroom register
+```
+
 ## 技术方向
 
 blockchain-indexer, tx-indexer, onchain-analytics, tx-decoder, data-indexer, metrics, block-explorer

@@ -437,3 +437,219 @@ func TestHealthContinuesAfterFailure(t *testing.T) {
 		t.Fatalf("result 2 should still succeed: %+v", r)
 	}
 }
+
+func TestSelectSuccess(t *testing.T) {
+	input := `{"requests":[
+		{"service":"svc","expectedRevision":0,"instances":[{"id":"b","address":"h:2"},{"id":"a","address":"h:1"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":7,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 6 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	want := []registerResult{
+		{Service: "svc", OK: true, Changed: true, Revision: 1},
+		{Service: "svc", OK: true, Changed: true, Revision: 1, Sequence: 1},
+		{Service: "svc", OK: true, Changed: true, Revision: 1, Sequence: 7},
+		{Service: "svc", OK: true, Revision: 1, InstanceID: "a", Address: "h:1", Sequence: 1},
+		{Service: "svc", OK: true, Revision: 1, InstanceID: "b", Address: "h:2", Sequence: 7},
+		{Service: "svc", OK: true, Revision: 1, InstanceID: "a", Address: "h:1", Sequence: 1},
+	}
+	for i := range want {
+		if got.Results[i] != want[i] {
+			t.Fatalf("result %d: got %+v want %+v", i, got.Results[i], want[i])
+		}
+	}
+}
+
+func TestSelectOnlyHealthy(t *testing.T) {
+	input := `{"requests":[
+		{"service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h:1"},{"id":"b","address":"h:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":1,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	for i, r := range got.Results[3:] {
+		if !r.OK || r.InstanceID != "a" {
+			t.Fatalf("select %d: %+v", i, r)
+		}
+	}
+}
+
+func TestSelectNoHealthy(t *testing.T) {
+	input := `{"requests":[
+		{"service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h:1"}]},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d", code)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	r := got.Results[1]
+	if r.OK || r.Error != "no_healthy" || r.Revision != 1 || r.Reason == "" {
+		t.Fatalf("result: %+v", r)
+	}
+	if r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("no address may be fabricated: %+v", r)
+	}
+}
+
+func TestSelectNotFound(t *testing.T) {
+	input := `{"requests":[{"type":"select","service":"svc","expectedRevision":0}]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d", code)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	r := got.Results[0]
+	if r.OK || r.Error != "not_found" || r.Revision != 0 || r.Reason == "" {
+		t.Fatalf("result: %+v", r)
+	}
+}
+
+func TestSelectConflict(t *testing.T) {
+	input := `{"requests":[
+		{"service":"svc","expectedRevision":0,"instances":[]},
+		{"type":"select","service":"svc","expectedRevision":5}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d", code)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	r := got.Results[1]
+	if r.OK || r.Error != "conflict" || r.ExpectedRevision != 5 || r.ActualRevision != 1 || r.Revision != 1 {
+		t.Fatalf("result: %+v", r)
+	}
+}
+
+func TestSelectValidationErrors(t *testing.T) {
+	cases := map[string]string{
+		"empty service":    `{"requests":[{"type":"select","service":"  ","expectedRevision":0}]}`,
+		"negative revision": `{"requests":[{"type":"select","service":"s","expectedRevision":-1}]}`,
+		"missing revision":  `{"requests":[{"type":"select","service":"s"}]}`,
+		"revision string":   `{"requests":[{"type":"select","service":"s","expectedRevision":"0"}]}`,
+		"request not object": `{"requests":[5]}`,
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			out, code := runRegisterWith(t, input)
+			if code != 1 {
+				t.Fatalf("exit code: %d", code)
+			}
+			var got registerOutput
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("output is not JSON: %v\n%s", err, out)
+			}
+			if len(got.Results) != 1 || got.Results[0].OK || got.Results[0].Error != "invalid" {
+				t.Fatalf("expected one invalid result, got %+v", got.Results)
+			}
+			if len(got.Services) != 0 {
+				t.Fatalf("no service should be created: %+v", got.Services)
+			}
+		})
+	}
+}
+
+func TestSelectFailuresDoNotBlockBatch(t *testing.T) {
+	// A failed select must not prevent later requests from running, and the
+	// batch still fails overall.
+	input := `{"requests":[
+		{"service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h:1"}]},
+		{"type":"select","service":"svc","expectedRevision":99},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d", code)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	if len(got.Results) != 4 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	if r := got.Results[1]; r.OK || r.Error != "conflict" {
+		t.Fatalf("result 1: %+v", r)
+	}
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" || r.Address != "h:1" || r.Sequence != 1 {
+		t.Fatalf("result 3 should still succeed: %+v", r)
+	}
+}
+
+func TestSelectContinuesAfterInstanceRemoved(t *testing.T) {
+	input := `{"requests":[
+		{"service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h:1"},{"id":"b","address":"h:2"},{"id":"c","address":"h:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"service":"svc","expectedRevision":1,"instances":[{"id":"a","address":"h:1"},{"id":"c","address":"h:3"}]},
+		{"type":"select","service":"svc","expectedRevision":2},
+		{"type":"select","service":"svc","expectedRevision":2}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	want := []string{"a", "b", "c", "a"}
+	selectResults := []int{4, 5, 7, 8}
+	for i, id := range want {
+		r := got.Results[selectResults[i]]
+		if !r.OK || r.InstanceID != id {
+			t.Fatalf("select %d: got %+v want %s", i, r, id)
+		}
+	}
+}
+
+func TestSelectDeterministic(t *testing.T) {
+	input := `{"requests":[
+		{"service":"svc","expectedRevision":0,"instances":[{"id":"b","address":"h:2"},{"id":"a","address":"h:1"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out1, _ := runRegisterWith(t, input)
+	out2, _ := runRegisterWith(t, input)
+	if out1 != out2 {
+		t.Fatalf("non-deterministic output:\n%s\nvs\n%s", out1, out2)
+	}
+}
