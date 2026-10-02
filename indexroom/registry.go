@@ -16,6 +16,26 @@ type Instance struct {
 	Address string
 }
 
+// HealthState is the offline health observation of one instance.
+// Health is driven entirely by submitted observations; no probing occurs.
+type HealthState string
+
+// Health states.
+const (
+	HealthUnknown   HealthState = "unknown"
+	HealthHealthy   HealthState = "healthy"
+	HealthUnhealthy HealthState = "unhealthy"
+)
+
+// InstanceView is a snapshot of one instance together with its health observation.
+type InstanceView struct {
+	ID       string
+	Address  string
+	Health   HealthState
+	Sequence int64
+	Reason   string
+}
+
 // Registration is a validated request that replaces a service's instance list.
 type Registration struct {
 	Service   string
@@ -23,20 +43,32 @@ type Registration struct {
 	Instances []Instance
 }
 
+// HealthUpdate is a validated health observation request.
+type HealthUpdate struct {
+	Service    string
+	InstanceID string
+	Revision   int
+	Sequence   int64
+	Healthy    bool
+	Reason     string
+}
+
 // ServiceView is an immutable snapshot of one registered service.
 type ServiceView struct {
 	Service   string
 	Revision  int
-	Instances []Instance
+	Instances []InstanceView
 }
 
-// OutcomeKind classifies a failed registration.
+// OutcomeKind classifies a failed request.
 type OutcomeKind string
 
 // Outcome kinds.
 const (
 	OutcomeInvalid  OutcomeKind = "invalid"
 	OutcomeConflict OutcomeKind = "conflict"
+	OutcomeNotFound OutcomeKind = "not_found"
+	OutcomeStale    OutcomeKind = "stale"
 )
 
 // Outcome is the result of applying one registration against the registry.
@@ -51,6 +83,20 @@ type Outcome struct {
 	Actual   int
 }
 
+// HealthOutcome is the result of applying one health update against the registry.
+type HealthOutcome struct {
+	Service    string
+	InstanceID string
+	OK         bool
+	Changed    bool
+	Kind       OutcomeKind
+	Reason     string
+	Revision   int
+	Expected   int
+	Actual     int
+	Sequence   int64
+}
+
 // Registry is an in-memory service instance registry.
 type Registry struct {
 	services map[string]*serviceState
@@ -58,7 +104,19 @@ type Registry struct {
 
 type serviceState struct {
 	revision  int
-	instances map[string]string // instance id -> address
+	instances map[string]*instanceState // instance id -> state
+}
+
+type instanceState struct {
+	address  string
+	health   HealthState
+	sequence int64
+	reason   string
+}
+
+// newInstanceState returns a fresh observation: unknown with sequence 0.
+func newInstanceState(address string) *instanceState {
+	return &instanceState{address: address, health: HealthUnknown}
 }
 
 // NewRegistry returns an empty registry.
@@ -121,10 +179,10 @@ func (r *Registry) Apply(reg Registration) Outcome {
 				Revision: 0,
 			}
 		}
-		st = &serviceState{revision: 1, instances: make(map[string]string, len(reg.Instances))}
+		st = &serviceState{revision: 1, instances: make(map[string]*instanceState, len(reg.Instances))}
 		r.services[reg.Service] = st
 		for _, inst := range reg.Instances {
-			st.instances[inst.ID] = inst.Address
+			st.instances[inst.ID] = newInstanceState(inst.Address)
 		}
 		return Outcome{Service: reg.Service, OK: true, Changed: true, Revision: 1}
 	}
@@ -141,13 +199,158 @@ func (r *Registry) Apply(reg Registration) Outcome {
 	}
 	changed := !sameInstances(st.instances, reg.Instances)
 	if changed {
-		st.instances = make(map[string]string, len(reg.Instances))
+		// A replacement fully rebuilds the list, but an instance that keeps both
+		// its id and its address retains its health observation. Anything new,
+		// address-changed, or removed-then-readded starts from unknown at sequence 0.
+		next := make(map[string]*instanceState, len(reg.Instances))
 		for _, inst := range reg.Instances {
-			st.instances[inst.ID] = inst.Address
+			if old, ok := st.instances[inst.ID]; ok && old.address == inst.Address {
+				next[inst.ID] = old
+			} else {
+				next[inst.ID] = newInstanceState(inst.Address)
+			}
 		}
+		st.instances = next
 		st.revision++
 	}
 	return Outcome{Service: reg.Service, OK: true, Changed: changed, Revision: st.revision}
+}
+
+// ValidateHealth trims and validates one health observation without mutating
+// the registry. Content validity is established before any revision check.
+func (r *Registry) ValidateHealth(service, instanceID string, revision int, sequence int64, healthy bool, reason string) (HealthUpdate, error) {
+	name := strings.TrimSpace(service)
+	if name == "" {
+		return HealthUpdate{}, errInvalid("service name must not be empty")
+	}
+	id := strings.TrimSpace(instanceID)
+	if id == "" {
+		return HealthUpdate{}, errInvalid("instance id must not be empty")
+	}
+	if revision < 0 {
+		return HealthUpdate{}, errInvalid("expectedRevision must be a non-negative integer")
+	}
+	if sequence <= 0 {
+		return HealthUpdate{}, errInvalid("sequence must be a positive integer")
+	}
+	normalizedReason := strings.TrimSpace(reason)
+	if healthy {
+		// A healthy observation carries no reason.
+		normalizedReason = ""
+	} else if normalizedReason == "" {
+		return HealthUpdate{}, errInvalid("reason must not be empty when unhealthy")
+	}
+	return HealthUpdate{
+		Service:    name,
+		InstanceID: id,
+		Revision:   revision,
+		Sequence:   sequence,
+		Healthy:    healthy,
+		Reason:     normalizedReason,
+	}, nil
+}
+
+// ApplyHealth checks the revision and records an offline observation.
+//
+// The revision is checked first: a mismatch is a conflict carrying the request
+// and current revisions, even when the instance exists. With a matching
+// revision, a missing service or instance is not_found. Sequence handling:
+//   - a sequence below the accepted one is stale and reports the current sequence;
+//   - the same sequence with identical normalized status and reason succeeds
+//     without changing state;
+//   - the same sequence with different content is a conflict;
+//   - a newer sequence writes the status and reason.
+func (r *Registry) ApplyHealth(upd HealthUpdate) HealthOutcome {
+	st, exists := r.services[upd.Service]
+	actual := 0
+	if exists {
+		actual = st.revision
+	}
+	if upd.Revision != actual {
+		return HealthOutcome{
+			Service:  upd.Service,
+			OK:       false,
+			Kind:     OutcomeConflict,
+			Reason:   fmt.Sprintf("service %q is at revision %d, not %d", upd.Service, actual, upd.Revision),
+			Expected: upd.Revision,
+			Actual:   actual,
+			Revision: actual,
+		}
+	}
+	if !exists {
+		return HealthOutcome{
+			Service:  upd.Service,
+			OK:       false,
+			Kind:     OutcomeNotFound,
+			Reason:   fmt.Sprintf("service %q does not exist", upd.Service),
+			Revision: 0,
+		}
+	}
+	cur, ok := st.instances[upd.InstanceID]
+	if !ok {
+		return HealthOutcome{
+			Service:    upd.Service,
+			InstanceID: upd.InstanceID,
+			OK:         false,
+			Kind:       OutcomeNotFound,
+			Reason:     fmt.Sprintf("instance %q does not exist in service %q", upd.InstanceID, upd.Service),
+			Revision:   st.revision,
+		}
+	}
+	if upd.Sequence < cur.sequence {
+		return HealthOutcome{
+			Service:    upd.Service,
+			InstanceID: upd.InstanceID,
+			OK:         false,
+			Kind:       OutcomeStale,
+			Reason:     fmt.Sprintf("sequence %d is older than the current sequence %d", upd.Sequence, cur.sequence),
+			Revision:   st.revision,
+			Sequence:   cur.sequence,
+		}
+	}
+	if upd.Sequence == cur.sequence {
+		want := HealthUnhealthy
+		if upd.Healthy {
+			want = HealthHealthy
+		}
+		if cur.health == want && cur.reason == upd.Reason {
+			return HealthOutcome{
+				Service:    upd.Service,
+				InstanceID: upd.InstanceID,
+				OK:         true,
+				Changed:    false,
+				Revision:   st.revision,
+				Sequence:   cur.sequence,
+			}
+		}
+		return HealthOutcome{
+			Service:    upd.Service,
+			InstanceID: upd.InstanceID,
+			OK:         false,
+			Kind:       OutcomeConflict,
+			Reason:     fmt.Sprintf("sequence %d already used with different health content", upd.Sequence),
+			Revision:   st.revision,
+			Sequence:   cur.sequence,
+		}
+	}
+	// Newer sequence: record the observation. Health updates never bump the
+	// registration revision.
+	if upd.Healthy {
+		cur.health = HealthHealthy
+		cur.reason = ""
+	} else {
+		cur.health = HealthUnhealthy
+		cur.reason = upd.Reason
+	}
+	cur.sequence = upd.Sequence
+	return HealthOutcome{
+		Service:    upd.Service,
+		InstanceID: upd.InstanceID,
+		OK:         true,
+		Changed:    true,
+		Revision:   st.revision,
+		Sequence:   cur.sequence,
+	}
 }
 
 // Snapshot returns all services sorted by name, with instances sorted by id.
@@ -165,21 +368,28 @@ func (r *Registry) Snapshot() []ServiceView {
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
-		instances := make([]Instance, 0, len(ids))
+		instances := make([]InstanceView, 0, len(ids))
 		for _, id := range ids {
-			instances = append(instances, Instance{ID: id, Address: st.instances[id]})
+			cur := st.instances[id]
+			instances = append(instances, InstanceView{
+				ID:       id,
+				Address:  cur.address,
+				Health:   cur.health,
+				Sequence: cur.sequence,
+				Reason:   cur.reason,
+			})
 		}
 		views = append(views, ServiceView{Service: name, Revision: st.revision, Instances: instances})
 	}
 	return views
 }
 
-func sameInstances(current map[string]string, incoming []Instance) bool {
+func sameInstances(current map[string]*instanceState, incoming []Instance) bool {
 	if len(current) != len(incoming) {
 		return false
 	}
 	for _, inst := range incoming {
-		if addr, ok := current[inst.ID]; !ok || addr != inst.Address {
+		if old, ok := current[inst.ID]; !ok || old.address != inst.Address {
 			return false
 		}
 	}
