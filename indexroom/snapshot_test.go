@@ -393,6 +393,117 @@ func TestRestoreRejectsInvalidSnapshots(t *testing.T) {
 	}
 }
 
+func TestRestoreRejectsNullFields(t *testing.T) {
+	v1Block := func(field string) string {
+		fields := map[string]string{
+			"height": "1", "hash": `"h1"`, "parent": `"g"`, "txs": `[]`,
+		}
+		fields[field] = "null"
+		return `{"version":1,"tip":1,"blocks":[{"height":` + fields["height"] +
+			`,"hash":` + fields["hash"] + `,"parent":` + fields["parent"] +
+			`,"txs":` + fields["txs"] + `}]}`
+	}
+	cases := map[string]struct {
+		input string
+		field string // must appear in the error message
+	}{
+		"version null v1": {`{"version":null,"tip":0,"blocks":[]}`, `"version"`},
+		"version null v2": {`{"version":null,"tip":0,"blocks":[]}`, `"version"`},
+		"tip null v1":     {`{"version":1,"tip":null,"blocks":[]}`, `"tip"`},
+		"tip null v2":     {`{"version":2,"tip":null,"blocks":[]}`, `"tip"`},
+		"height null":     {v1Block("height"), `"height"`},
+		"hash null":       {v1Block("hash"), `"hash"`},
+		"parent null":     {v1Block("parent"), `"parent"`},
+		"height null v2": {`{"version":2,"tip":1,"blocks":[` +
+			`{"height":null,"hash":"h1","parent":"g","txs":[],"timestamp":5}` +
+			`]}`, `"height"`},
+		"hash null v2": {`{"version":2,"tip":1,"blocks":[` +
+			`{"height":1,"hash":null,"parent":"g","txs":[],"timestamp":5}` +
+			`]}`, `"hash"`},
+		"parent null v2": {`{"version":2,"tip":1,"blocks":[` +
+			`{"height":1,"hash":"h1","parent":null,"txs":[],"timestamp":5}` +
+			`]}`, `"parent"`},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			index := txChain(t, []string{"a"}, []string{"b"})
+			blocks, byHash, tip := snapshot(index)
+			err := index.Restore(strings.NewReader(tc.input))
+			if !errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("err=%v, want ErrInvalidSnapshot", err)
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("err=%v, want it to name field %s", err, tc.field)
+			}
+			if !strings.Contains(err.Error(), "null") {
+				t.Fatalf("err=%v, want it to mention null", err)
+			}
+			requireUnchanged(t, index, blocks, byHash, tip)
+		})
+	}
+}
+
+func TestRestoreRejectsNullTxElement(t *testing.T) {
+	// The null sits in the last transaction of the last block: everything
+	// before it is valid, yet the whole restore must be refused.
+	input := `{"version":1,"tip":2,"blocks":[` +
+		`{"height":1,"hash":"h1","parent":"g","txs":["t1"]},` +
+		`{"height":2,"hash":"h2","parent":"h1","txs":["a",null,"b"]}` +
+		`]}`
+	index := txChain(t, []string{"x"}, []string{"y"}, []string{"z"})
+	blocks, byHash, tip := snapshot(index)
+	before := exportString(t, index)
+	err := index.Restore(strings.NewReader(input))
+	if !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("err=%v, want ErrInvalidSnapshot", err)
+	}
+	for _, want := range []string{"height 2", "element 1", "null"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err=%v, want it to mention %q", err, want)
+		}
+	}
+	requireUnchanged(t, index, blocks, byHash, tip)
+	if after := exportString(t, index); after != before {
+		t.Fatalf("export changed after rejected restore:\n%s\n%s", before, after)
+	}
+	page, err := index.QueryTxs(TxQuery{})
+	if err != nil || page.TotalMatches != 3 {
+		t.Fatalf("query after rejected restore: page=%+v err=%v", page, err)
+	}
+
+	// The height is named even when txs precedes height in the object.
+	shuffled := `{"version":1,"tip":1,"blocks":[` +
+		`{"txs":[null],"hash":"h1","parent":"g","height":1}` +
+		`]}`
+	err = index.Restore(strings.NewReader(shuffled))
+	if !errors.Is(err, ErrInvalidSnapshot) || !strings.Contains(err.Error(), "height 1") {
+		t.Fatalf("err=%v, want ErrInvalidSnapshot naming height 1", err)
+	}
+	requireUnchanged(t, index, blocks, byHash, tip)
+}
+
+func TestRestorePreservesTxIdentifiersVerbatim(t *testing.T) {
+	// Empty and duplicated identifiers and their order survive a restore,
+	// and a first-block parent of "" is a valid chain-start marker.
+	input := `{"version":1,"tip":2,"blocks":[` +
+		`{"height":1,"hash":"h1","parent":"","txs":["","a",""]},` +
+		`{"height":2,"hash":"h2","parent":"h1","txs":["a","a"]}` +
+		`]}`
+	index := New()
+	if err := index.Restore(strings.NewReader(input)); err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	if got := index.Blocks[1].Txs; !reflect.DeepEqual(got, []string{"", "a", ""}) {
+		t.Fatalf("height 1 txs=%q", got)
+	}
+	if got := index.Blocks[2].Txs; !reflect.DeepEqual(got, []string{"a", "a"}) {
+		t.Fatalf("height 2 txs=%q", got)
+	}
+	if raw := exportString(t, index); raw != input {
+		t.Fatalf("re-export differs:\n%s\n%s", raw, input)
+	}
+}
+
 // errReader fails after delivering a valid snapshot prefix.
 type errReader struct {
 	data []byte
