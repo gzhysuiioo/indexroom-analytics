@@ -9,8 +9,22 @@
 ```bash
 go run ./cmd/indexroom demo
 go run ./cmd/indexroom version
+go run ./cmd/indexroom help
 go test ./...
 ```
+
+`register` reads service registrations as JSON from standard input and maintains
+an in-memory service instance registry (each invocation starts empty):
+
+```bash
+echo '{"requests":[{"service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"host:8080"}]}]}' \
+  | go run ./cmd/indexroom register
+```
+
+Each request fully replaces that service's instance list. New services require
+`expectedRevision` 0; existing services require the current revision. Output is
+JSON with per-item results and the final sorted service list; exit status is 0
+only when every registration succeeds.
 
 ## 技术方向
 
