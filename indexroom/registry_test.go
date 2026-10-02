@@ -522,3 +522,247 @@ func TestRegistryHealthFailedRegistrationKeepsObservations(t *testing.T) {
 		t.Fatalf("observation cleared after failed registration: %+v", inst)
 	}
 }
+
+// markHealth records one observation, failing the test on error.
+func markHealth(t *testing.T, r *Registry, service, id string, revision int, sequence int64, healthy bool, reason string) {
+	t.Helper()
+	upd, err := r.ValidateHealth(service, id, revision, sequence, healthy, reason)
+	if err != nil {
+		t.Fatalf("validate health %s/%s: %v", service, id, err)
+	}
+	if out := r.ApplyHealth(upd); !out.OK {
+		t.Fatalf("apply health %s/%s: %+v", service, id, out)
+	}
+}
+
+func selected(t *testing.T, r *Registry, service string, revision int) SelectOutcome {
+	t.Helper()
+	sel, err := r.ValidateSelection(service, revision)
+	if err != nil {
+		t.Fatalf("validate select %s: %v", service, err)
+	}
+	out := r.Select(sel)
+	if !out.OK {
+		t.Fatalf("select %s: %+v", service, out)
+	}
+	return out
+}
+
+func TestRegistrySelectRotatesByAscendingID(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "i3", Address: "h3:3"}, {ID: "i1", Address: "h1:1"}, {ID: "i2", Address: "h2:2"},
+	})
+	markHealth(t, r, "svc", "i1", 1, 10, true, "")
+	markHealth(t, r, "svc", "i2", 1, 20, true, "")
+	markHealth(t, r, "svc", "i3", 1, 30, true, "")
+
+	want := []struct {
+		id  string
+		seq int64
+	}{
+		{"i1", 10}, {"i2", 20}, {"i3", 30}, {"i1", 10}, {"i2", 20},
+	}
+	addr := map[string]string{"i1": "h1:1", "i2": "h2:2", "i3": "h3:3"}
+	for i, w := range want {
+		out := selected(t, r, "svc", 1)
+		if out.InstanceID != w.id || out.Sequence != w.seq || out.Address != addr[w.id] {
+			t.Fatalf("select %d: got id=%s seq=%d addr=%s, want %+v", i, out.InstanceID, out.Sequence, out.Address, w)
+		}
+		if out.Revision != 1 {
+			t.Fatalf("select %d revision: %d", i, out.Revision)
+		}
+	}
+}
+
+func TestRegistrySelectOnlyHealthyEligible(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "a", Address: "h:1"}, {ID: "b", Address: "h:2"}, {ID: "c", Address: "h:3"},
+	})
+	// a and c healthy; b unhealthy; a fresh unknown instance is added later.
+	markHealth(t, r, "svc", "a", 1, 1, true, "")
+	markHealth(t, r, "svc", "b", 1, 1, false, "down")
+	markHealth(t, r, "svc", "c", 1, 1, true, "")
+
+	got := []string{
+		selected(t, r, "svc", 1).InstanceID,
+		selected(t, r, "svc", 1).InstanceID,
+		selected(t, r, "svc", 1).InstanceID,
+	}
+	want := []string{"a", "c", "a"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("selects: got %v want %v", got, want)
+		}
+	}
+}
+
+func TestRegistrySelectSingleHealthyRepeats(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h:1"}, {ID: "b", Address: "h:2"}})
+	markHealth(t, r, "svc", "a", 1, 7, true, "")
+	markHealth(t, r, "svc", "b", 1, 1, false, "down")
+	for i := 0; i < 3; i++ {
+		out := selected(t, r, "svc", 1)
+		if out.InstanceID != "a" || out.Address != "h:1" || out.Sequence != 7 {
+			t.Fatalf("select %d: %+v", i, out)
+		}
+	}
+}
+
+func TestRegistrySelectFailuresDoNotAdvanceCursor(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h:1"}, {ID: "b", Address: "h:2"}})
+	markHealth(t, r, "svc", "a", 1, 1, true, "")
+	markHealth(t, r, "svc", "b", 1, 1, true, "")
+
+	// First success lands on a.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" {
+		t.Fatalf("first select: %+v", out)
+	}
+
+	selectFail := func(rev int, want OutcomeKind) {
+		t.Helper()
+		sel, _ := r.ValidateSelection("svc", rev)
+		out := r.Select(sel)
+		if out.OK || out.Kind != want {
+			t.Fatalf("want %s, got %+v", want, out)
+		}
+	}
+
+	// Conflict (wrong revision) and no_healthy must not move the cursor.
+	selectFail(99, OutcomeConflict)
+	markHealth(t, r, "svc", "a", 1, 2, false, "down")
+	markHealth(t, r, "svc", "b", 1, 3, false, "down")
+	selectFail(1, OutcomeNoHealthy)
+	selectFail(99, OutcomeConflict)
+	selectFail(1, OutcomeNoHealthy)
+
+	// Restore: the cursor is still just after a, so b (the next healthy id)
+	// is chosen rather than restarting at the smallest id.
+	markHealth(t, r, "svc", "a", 1, 4, true, "")
+	markHealth(t, r, "svc", "b", 1, 5, true, "")
+	if out := selected(t, r, "svc", 1); out.InstanceID != "b" {
+		t.Fatalf("cursor should resume after a, got %+v", out)
+	}
+}
+
+func TestRegistrySelectCursorSurvivesReplacementAndRemoval(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h:1"}, {ID: "b", Address: "h:2"}, {ID: "c", Address: "h:3"}})
+	markHealth(t, r, "svc", "a", 1, 1, true, "")
+	markHealth(t, r, "svc", "b", 1, 1, true, "")
+	markHealth(t, r, "svc", "c", 1, 1, true, "")
+	// Two successes: a then b; cursor is b.
+	selected(t, r, "svc", 1)
+	selected(t, r, "svc", 1)
+
+	// Replace: drop b (the last-chosen id), keep a and c, add d. Health for
+	// kept ids survives; d starts unknown then becomes healthy.
+	registerService(t, r, "svc", 1, []Instance{{ID: "a", Address: "h:1"}, {ID: "c", Address: "h:3"}, {ID: "d", Address: "h:4"}})
+	if rev := r.RevisionOf("svc"); rev != 2 {
+		t.Fatalf("revision after replace: %d", rev)
+	}
+	markHealth(t, r, "svc", "d", 2, 2, true, "")
+
+	// Healthy set is a, c, d. Rotation continues just after the (now removed)
+	// b, so c is chosen, not a.
+	if out := selected(t, r, "svc", 2); out.InstanceID != "c" {
+		t.Fatalf("continue after removed cursor: %+v", out)
+	}
+	// d is next after c.
+	if out := selected(t, r, "svc", 2); out.InstanceID != "d" {
+		t.Fatalf("new instance in position: %+v", out)
+	}
+	// Wrap to smallest.
+	if out := selected(t, r, "svc", 2); out.InstanceID != "a" {
+		t.Fatalf("wrap: %+v", out)
+	}
+}
+
+func TestRegistrySelectRevisionAndPresence(t *testing.T) {
+	r := NewRegistry()
+
+	// Unknown service, expectedRevision 0 -> not_found (actual 0).
+	sel, _ := r.ValidateSelection("ghost", 0)
+	out := r.Select(sel)
+	if out.OK || out.Kind != OutcomeNotFound || out.Revision != 0 {
+		t.Fatalf("missing service rev 0: %+v", out)
+	}
+
+	// Unknown service, non-zero revision -> conflict with actual 0.
+	sel, _ = r.ValidateSelection("ghost", 3)
+	out = r.Select(sel)
+	if out.OK || out.Kind != OutcomeConflict || out.Expected != 3 || out.Actual != 0 || out.Revision != 0 {
+		t.Fatalf("missing service rev 3: %+v", out)
+	}
+
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h:1"}})
+
+	// Existing service, wrong revision -> conflict carrying actual revision.
+	sel, _ = r.ValidateSelection("svc", 5)
+	out = r.Select(sel)
+	if out.OK || out.Kind != OutcomeConflict || out.Expected != 5 || out.Actual != 1 || out.Revision != 1 {
+		t.Fatalf("existing conflict: %+v", out)
+	}
+
+	// Matching revision but only unknown instances -> no_healthy, current revision.
+	sel, _ = r.ValidateSelection("svc", 1)
+	out = r.Select(sel)
+	if out.OK || out.Kind != OutcomeNoHealthy || out.Revision != 1 || out.Address != "" || out.InstanceID != "" {
+		t.Fatalf("no healthy: %+v", out)
+	}
+}
+
+func TestRegistrySelectDoesNotMutateState(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h:1"}})
+	markHealth(t, r, "svc", "a", 1, 4, true, "")
+	before := r.Snapshot()
+	for i := 0; i < 3; i++ {
+		selected(t, r, "svc", 1)
+	}
+	after := r.Snapshot()
+	if len(after) != 1 || after[0].Revision != 1 {
+		t.Fatalf("service list changed: %+v", after)
+	}
+	inst := after[0].Instances[0]
+	b := before[0].Instances[0]
+	if inst != b {
+		t.Fatalf("instance changed: before %+v after %+v", b, inst)
+	}
+}
+
+func TestRegistrySelectIndependentPerService(t *testing.T) {
+	r := NewRegistry()
+	for _, svc := range []string{"x", "y"} {
+		registerService(t, r, svc, 0, []Instance{{ID: "a", Address: "h:1"}, {ID: "b", Address: "h:2"}})
+		markHealth(t, r, svc, "a", 1, 1, true, "")
+		markHealth(t, r, svc, "b", 1, 1, true, "")
+	}
+	// Advance x once (a) but not y; each service rotates independently.
+	if out := selected(t, r, "x", 1); out.InstanceID != "a" {
+		t.Fatalf("x first: %+v", out)
+	}
+	if out := selected(t, r, "y", 1); out.InstanceID != "a" {
+		t.Fatalf("y first should be independent: %+v", out)
+	}
+	if out := selected(t, r, "x", 1); out.InstanceID != "b" {
+		t.Fatalf("x second: %+v", out)
+	}
+}
+
+func TestRegistrySelectValidation(t *testing.T) {
+	r := NewRegistry()
+	if _, err := r.ValidateSelection("   ", 0); err == nil {
+		t.Fatalf("empty service should be invalid")
+	}
+	if _, err := r.ValidateSelection("svc", -1); err == nil {
+		t.Fatalf("negative revision should be invalid")
+	}
+	sel, err := r.ValidateSelection("  svc  ", 0)
+	if err != nil || sel.Service != "svc" || sel.Revision != 0 {
+		t.Fatalf("trim/valid: %+v err=%v", sel, err)
+	}
+}

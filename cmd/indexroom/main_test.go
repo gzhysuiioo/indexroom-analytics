@@ -151,12 +151,12 @@ func TestRegisterEmptyRequests(t *testing.T) {
 
 func TestRegisterTopLevelErrors(t *testing.T) {
 	cases := map[string]string{
-		"not json":        `{not json`,
-		"not object":      `[1,2]`,
+		"not json":         `{not json`,
+		"not object":       `[1,2]`,
 		"missing requests": `{"other":[]}`,
-		"requests string": `{"requests":"x"}`,
-		"requests null":   `{"requests":null}`,
-		"trailing data":   `{"requests":[]} garbage`,
+		"requests string":  `{"requests":"x"}`,
+		"requests null":    `{"requests":null}`,
+		"trailing data":    `{"requests":[]} garbage`,
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -179,14 +179,14 @@ func TestRegisterTopLevelErrors(t *testing.T) {
 
 func TestRegisterRequestShapeErrors(t *testing.T) {
 	cases := map[string]string{
-		"request not object":   `{"requests":[5]}`,
-		"missing revision":     `{"requests":[{"service":"a","instances":[]}]}`,
-		"revision float":       `{"requests":[{"service":"a","expectedRevision":1.5,"instances":[]}]}`,
-		"revision string":      `{"requests":[{"service":"a","expectedRevision":"1","instances":[]}]}`,
-		"missing instances":    `{"requests":[{"service":"a","expectedRevision":0}]}`,
-		"instances object":     `{"requests":[{"service":"a","expectedRevision":0,"instances":{}}]}`,
-		"instance not object":  `{"requests":[{"service":"a","expectedRevision":0,"instances":["x"]}]}`,
-		"instance id number":   `{"requests":[{"service":"a","expectedRevision":0,"instances":[{"id":1,"address":"h:1"}]}]}`,
+		"request not object":  `{"requests":[5]}`,
+		"missing revision":    `{"requests":[{"service":"a","instances":[]}]}`,
+		"revision float":      `{"requests":[{"service":"a","expectedRevision":1.5,"instances":[]}]}`,
+		"revision string":     `{"requests":[{"service":"a","expectedRevision":"1","instances":[]}]}`,
+		"missing instances":   `{"requests":[{"service":"a","expectedRevision":0}]}`,
+		"instances object":    `{"requests":[{"service":"a","expectedRevision":0,"instances":{}}]}`,
+		"instance not object": `{"requests":[{"service":"a","expectedRevision":0,"instances":["x"]}]}`,
+		"instance id number":  `{"requests":[{"service":"a","expectedRevision":0,"instances":[{"id":1,"address":"h:1"}]}]}`,
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -338,23 +338,23 @@ func TestHealthFailures(t *testing.T) {
 
 func TestHealthValidationErrors(t *testing.T) {
 	cases := map[string]string{
-		"empty service":        `{"requests":[{"type":"health","service":"  ","instanceId":"a","expectedRevision":0,"sequence":1,"healthy":true}]}`,
-		"empty instance id":    `{"requests":[{"type":"health","service":"s","instanceId":" ","expectedRevision":0,"sequence":1,"healthy":true}]}`,
-		"negative revision":    `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":-1,"sequence":1,"healthy":true}]}`,
-		"zero sequence":        `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":0,"healthy":true}]}`,
-		"negative sequence":    `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":-2,"healthy":true}]}`,
-		"unhealthy no reason":  `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1,"healthy":false}]}`,
+		"empty service":          `{"requests":[{"type":"health","service":"  ","instanceId":"a","expectedRevision":0,"sequence":1,"healthy":true}]}`,
+		"empty instance id":      `{"requests":[{"type":"health","service":"s","instanceId":" ","expectedRevision":0,"sequence":1,"healthy":true}]}`,
+		"negative revision":      `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":-1,"sequence":1,"healthy":true}]}`,
+		"zero sequence":          `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":0,"healthy":true}]}`,
+		"negative sequence":      `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":-2,"healthy":true}]}`,
+		"unhealthy no reason":    `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1,"healthy":false}]}`,
 		"unhealthy empty reason": `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1,"healthy":false,"reason":"  "}]}`,
-		"missing revision":     `{"requests":[{"type":"health","service":"s","instanceId":"a","sequence":1,"healthy":true}]}`,
-		"missing sequence":     `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"healthy":true}]}`,
-		"missing healthy":      `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1}]}`,
-		"healthy string":       `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1,"healthy":"true"}]}`,
-		"healthy number":       `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1,"healthy":1}]}`,
-		"sequence float":       `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1.5,"healthy":true}]}`,
-		"revision string":      `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":"0","sequence":1,"healthy":true}]}`,
-		"reason number":        `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1,"healthy":false,"reason":5}]}`,
-		"unknown type":         `{"requests":[{"type":"probe","service":"s"}]}`,
-		"type number":          `{"requests":[{"type":5,"service":"s"}]}`,
+		"missing revision":       `{"requests":[{"type":"health","service":"s","instanceId":"a","sequence":1,"healthy":true}]}`,
+		"missing sequence":       `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"healthy":true}]}`,
+		"missing healthy":        `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1}]}`,
+		"healthy string":         `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1,"healthy":"true"}]}`,
+		"healthy number":         `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1,"healthy":1}]}`,
+		"sequence float":         `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1.5,"healthy":true}]}`,
+		"revision string":        `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":"0","sequence":1,"healthy":true}]}`,
+		"reason number":          `{"requests":[{"type":"health","service":"s","instanceId":"a","expectedRevision":0,"sequence":1,"healthy":false,"reason":5}]}`,
+		"unknown type":           `{"requests":[{"type":"probe","service":"s"}]}`,
+		"type number":            `{"requests":[{"type":5,"service":"s"}]}`,
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -435,5 +435,185 @@ func TestHealthContinuesAfterFailure(t *testing.T) {
 	}
 	if r := got.Results[2]; !r.OK || r.Sequence != 1 {
 		t.Fatalf("result 2 should still succeed: %+v", r)
+	}
+}
+
+func TestSelectSuccess(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"b","address":"h2:2"},{"id":"a","address":"h1:1"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":22,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 6 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	want := []registerResult{
+		{Service: "svc", OK: true, Changed: true, Revision: 1},
+		{Service: "svc", OK: true, Changed: true, Revision: 1, Sequence: 11},
+		{Service: "svc", OK: true, Changed: true, Revision: 1, Sequence: 22},
+		{Service: "svc", OK: true, Revision: 1, InstanceID: "a", Address: "h1:1", Sequence: 11},
+		{Service: "svc", OK: true, Revision: 1, InstanceID: "b", Address: "h2:2", Sequence: 22},
+		{Service: "svc", OK: true, Revision: 1, InstanceID: "a", Address: "h1:1", Sequence: 11},
+	}
+	for i := range want {
+		if got.Results[i] != want[i] {
+			t.Fatalf("result %d:\n got %+v\nwant %+v", i, got.Results[i], want[i])
+		}
+	}
+}
+
+func TestSelectOnlySeesPriorCommittedState(t *testing.T) {
+	// Selection is processed in input order and uses only state committed by
+	// earlier items; an instance made healthy AFTER a select is not selectable
+	// by it. Here the first select runs while everything is unknown.
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h:1"}]},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d", code)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if r := got.Results[1]; r.OK || r.Error != "no_healthy" || r.Revision != 1 || r.Address != "" || r.InstanceID != "" {
+		t.Fatalf("select before health should be no_healthy: %+v", r)
+	}
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" || r.Address != "h:1" || r.Sequence != 1 {
+		t.Fatalf("select after health should succeed: %+v", r)
+	}
+}
+
+func TestSelectFailures(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h:1"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":9},
+		{"type":"select","service":"missing","expectedRevision":0},
+		{"type":"select","service":"missing","expectedRevision":2},
+		{"type":"register","service":"empty","expectedRevision":0,"instances":[]},
+		{"type":"select","service":"empty","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d", code)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 7 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 2: wrong revision on existing service -> conflict expected 9 actual 1.
+	if r := got.Results[2]; r.OK || r.Error != "conflict" || r.ExpectedRevision != 9 || r.ActualRevision != 1 || r.Revision != 1 {
+		t.Fatalf("result 2: %+v", r)
+	}
+	// 3: unknown service expected 0 -> not_found, revision 0.
+	if r := got.Results[3]; r.OK || r.Error != "not_found" || r.Revision != 0 || r.InstanceID != "" {
+		t.Fatalf("result 3: %+v", r)
+	}
+	// 4: unknown service expected 2 -> conflict actual 0.
+	if r := got.Results[4]; r.OK || r.Error != "conflict" || r.ExpectedRevision != 2 || r.ActualRevision != 0 || r.Revision != 0 {
+		t.Fatalf("result 4: %+v", r)
+	}
+	// 6: service exists with zero instances -> no_healthy, revision 1.
+	if r := got.Results[6]; r.OK || r.Error != "no_healthy" || r.Revision != 1 || r.Address != "" {
+		t.Fatalf("result 6: %+v", r)
+	}
+}
+
+func TestSelectValidationErrors(t *testing.T) {
+	cases := map[string]string{
+		"empty service":     `{"requests":[{"type":"select","service":"  ","expectedRevision":0}]}`,
+		"missing revision":  `{"requests":[{"type":"select","service":"s"}]}`,
+		"negative revision": `{"requests":[{"type":"select","service":"s","expectedRevision":-1}]}`,
+		"revision float":    `{"requests":[{"type":"select","service":"s","expectedRevision":1.5}]}`,
+		"revision string":   `{"requests":[{"type":"select","service":"s","expectedRevision":"1"}]}`,
+		"request as array":  `{"requests":[["select"]]}`,
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			out, code := runRegisterWith(t, input)
+			if code != 1 {
+				t.Fatalf("exit code: %d", code)
+			}
+			var got registerOutput
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("output is not JSON: %v\n%s", err, out)
+			}
+			if len(got.Results) != 1 || got.Results[0].OK || got.Results[0].Error != "invalid" {
+				t.Fatalf("expected one invalid result, got %+v", got.Results)
+			}
+			if len(got.Services) != 0 {
+				t.Fatalf("no service should be created: %+v", got.Services)
+			}
+		})
+	}
+}
+
+func TestSelectCursorNotAdvancedByDuplicatesOrFailures(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h:1"},{"id":"b","address":"h:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":9},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[{"id":"a","address":"h:1"},{"id":"b","address":"h:2"}]},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d", code)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	// First success: a. Then a failed select, a duplicate registration and a
+	// duplicate health report, none of which advance the rotation.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" {
+		t.Fatalf("first select: %+v", r)
+	}
+	if r := got.Results[5]; !r.OK || r.Changed {
+		t.Fatalf("duplicate registration should be unchanged: %+v", r)
+	}
+	if r := got.Results[6]; !r.OK || r.Changed {
+		t.Fatalf("duplicate health should be unchanged: %+v", r)
+	}
+	if r := got.Results[7]; !r.OK || r.InstanceID != "b" {
+		t.Fatalf("rotation should resume at b, got %+v", r)
+	}
+}
+
+func TestSelectDeterministic(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"c","address":"h3:3"},{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":3,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out1, _ := runRegisterWith(t, input)
+	out2, _ := runRegisterWith(t, input)
+	if out1 != out2 {
+		t.Fatalf("non-deterministic output:\n%s\nvs\n%s", out1, out2)
 	}
 }

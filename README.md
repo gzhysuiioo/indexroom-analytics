@@ -26,6 +26,43 @@ Each request fully replaces that service's instance list. New services require
 JSON with per-item results and the final sorted service list; exit status is 0
 only when every registration succeeds.
 
+The same `requests` array also accepts health observations and target
+selection, processed strictly in input order (a selection sees only state
+committed by earlier items and performs no network I/O):
+
+```bash
+echo '{"requests":[
+  {"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"h1:8080"},{"id":"i2","address":"h2:8080"}]},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"select","service":"svc","expectedRevision":1}
+]}' | go run ./cmd/indexroom register
+```
+
+A `health` request records an offline healthy/unhealthy observation and never
+bumps the registration revision. A `select` request chooses one healthy target
+instance; on success its result adds `instanceId`, `address` and the instance's
+current health `sequence` alongside `service`, `ok` and `revision`.
+
+Only `healthy` instances are eligible (`unknown` and `unhealthy` are never
+chosen). Each service rotates independently through its healthy instances by
+ascending instance id: the first success takes the smallest id, later
+selections continue just after the previously chosen id and wrap to the
+smallest past the end; a single healthy instance may be chosen repeatedly.
+Registration replacements and health changes alter the eligible set
+immediately without resetting the rotation — even a removed last-chosen
+instance simply leaves its position, and recovered or newly joined instances
+participate in id order. Failed selections (`invalid`, `conflict`,
+`not_found`, `no_healthy`) and duplicate registrations or health reports never
+advance the cursor; a selection never changes a revision or a health record.
+
+Field validation precedes the revision check: a blank `service` or a
+missing/negative `expectedRevision` is `invalid`. Then a revision mismatch is
+`conflict` (an unknown service is at revision 0), an unknown service with a
+matching revision is `not_found`, and a service with no healthy instance is
+`no_healthy`. Every failure states the reason and current revision and leaves
+the rotation position intact.
+
 ## 技术方向
 
 blockchain-indexer, tx-indexer, onchain-analytics, tx-decoder, data-indexer, metrics, block-explorer

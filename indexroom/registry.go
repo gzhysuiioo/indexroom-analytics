@@ -65,10 +65,11 @@ type OutcomeKind string
 
 // Outcome kinds.
 const (
-	OutcomeInvalid  OutcomeKind = "invalid"
-	OutcomeConflict OutcomeKind = "conflict"
-	OutcomeNotFound OutcomeKind = "not_found"
-	OutcomeStale    OutcomeKind = "stale"
+	OutcomeInvalid   OutcomeKind = "invalid"
+	OutcomeConflict  OutcomeKind = "conflict"
+	OutcomeNotFound  OutcomeKind = "not_found"
+	OutcomeStale     OutcomeKind = "stale"
+	OutcomeNoHealthy OutcomeKind = "no_healthy"
 )
 
 // Outcome is the result of applying one registration against the registry.
@@ -97,6 +98,31 @@ type HealthOutcome struct {
 	Sequence   int64
 }
 
+// Selection is a validated request that chooses one healthy target instance.
+type Selection struct {
+	Service  string
+	Revision int
+}
+
+// SelectOutcome is the result of choosing one healthy instance.
+//
+// On success the chosen instance carries its id, address and current health
+// sequence. A selection never mutates registrations, health records or the
+// per-service rotation cursor on failure; on success it only advances that
+// cursor to the chosen instance's id.
+type SelectOutcome struct {
+	Service    string
+	OK         bool
+	Kind       OutcomeKind
+	Reason     string
+	Revision   int
+	Expected   int
+	Actual     int
+	InstanceID string
+	Address    string
+	Sequence   int64
+}
+
 // Registry is an in-memory service instance registry.
 type Registry struct {
 	services map[string]*serviceState
@@ -105,6 +131,15 @@ type Registry struct {
 type serviceState struct {
 	revision  int
 	instances map[string]*instanceState // instance id -> state
+
+	// cursor is the id returned by the last successful selection. Selection
+	// starts at the smallest healthy id before any success (cursorSet == false)
+	// and otherwise continues just after cursor. The cursor intentionally
+	// survives registration replacements and health changes: removed instances
+	// and recovered or newly joined instances are located by id in the current
+	// healthy set without restarting the rotation.
+	cursor    string
+	cursorSet bool
 }
 
 type instanceState struct {
@@ -349,6 +384,99 @@ func (r *Registry) ApplyHealth(upd HealthUpdate) HealthOutcome {
 		OK:         true,
 		Changed:    true,
 		Revision:   st.revision,
+		Sequence:   cur.sequence,
+	}
+}
+
+// ValidateSelection trims and validates one select request without touching
+// the registry. Content validity is established before any revision check.
+func (r *Registry) ValidateSelection(service string, revision int) (Selection, error) {
+	name := strings.TrimSpace(service)
+	if name == "" {
+		return Selection{}, errInvalid("service name must not be empty")
+	}
+	if revision < 0 {
+		return Selection{}, errInvalid("expectedRevision must be a non-negative integer")
+	}
+	return Selection{Service: name, Revision: revision}, nil
+}
+
+// Select checks the revision and chooses one healthy instance for the service.
+//
+// The revision is checked first: a mismatch is a conflict carrying the request
+// and current revisions (an unknown service is at revision 0). With a matching
+// revision, a missing service is not_found. When the service exists but has no
+// healthy instance the outcome is no_healthy and no address is fabricated.
+//
+// Healthy instances rotate per service by ascending instance id: the first
+// success takes the smallest id and each later success continues just after
+// the previously chosen id, wrapping to the smallest id past the end. With a
+// single healthy instance it may be chosen repeatedly. Registrations and
+// health changes alter the candidate set immediately but never reset the
+// rotation; failed selections leave the cursor where it was.
+func (r *Registry) Select(sel Selection) SelectOutcome {
+	st, exists := r.services[sel.Service]
+	actual := 0
+	if exists {
+		actual = st.revision
+	}
+	if sel.Revision != actual {
+		return SelectOutcome{
+			Service:  sel.Service,
+			OK:       false,
+			Kind:     OutcomeConflict,
+			Reason:   fmt.Sprintf("service %q is at revision %d, not %d", sel.Service, actual, sel.Revision),
+			Expected: sel.Revision,
+			Actual:   actual,
+			Revision: actual,
+		}
+	}
+	if !exists {
+		return SelectOutcome{
+			Service:  sel.Service,
+			OK:       false,
+			Kind:     OutcomeNotFound,
+			Reason:   fmt.Sprintf("service %q does not exist", sel.Service),
+			Revision: 0,
+		}
+	}
+
+	healthy := make([]string, 0, len(st.instances))
+	for id, cur := range st.instances {
+		if cur.health == HealthHealthy {
+			healthy = append(healthy, id)
+		}
+	}
+	sort.Strings(healthy)
+	if len(healthy) == 0 {
+		return SelectOutcome{
+			Service:  sel.Service,
+			OK:       false,
+			Kind:     OutcomeNoHealthy,
+			Reason:   fmt.Sprintf("service %q has no healthy instance available", sel.Service),
+			Revision: st.revision,
+		}
+	}
+
+	chosen := healthy[0]
+	if st.cursorSet {
+		chosen = healthy[0]
+		for _, id := range healthy {
+			if id > st.cursor {
+				chosen = id
+				break
+			}
+		}
+	}
+	cur := st.instances[chosen]
+	st.cursor = chosen
+	st.cursorSet = true
+	return SelectOutcome{
+		Service:    sel.Service,
+		OK:         true,
+		Revision:   st.revision,
+		InstanceID: chosen,
+		Address:    cur.address,
 		Sequence:   cur.sequence,
 	}
 }

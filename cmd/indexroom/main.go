@@ -38,11 +38,15 @@ func usage() {
 	fmt.Println("register reads requests as JSON from standard input and maintains an")
 	fmt.Println("in-memory service instance registry with offline health observations:")
 	fmt.Println(`  {"requests":[{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"host:8080"}]},`)
-	fmt.Println(`              {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true}]}`)
+	fmt.Println(`              {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true},`)
+	fmt.Println(`              {"type":"select","service":"svc","expectedRevision":1}]}`)
 	fmt.Println("A register request fully replaces the service's instance list; new services")
 	fmt.Println("require expectedRevision 0, existing services the current revision. A health")
 	fmt.Println("request records an offline observation (healthy/unhealthy) for one instance;")
-	fmt.Println("it never probes. Health updates never bump the registration revision.")
+	fmt.Println("it never probes. Health updates never bump the registration revision. A")
+	fmt.Println("select request chooses one healthy instance, rotating per service by ascending")
+	fmt.Println("instance id; it performs no network access and never changes revisions or")
+	fmt.Println("health records, and reports invalid/conflict/not_found/no_healthy on failure.")
 	fmt.Println("Exit status is 0 only when every request succeeds.")
 }
 
@@ -73,6 +77,8 @@ type registerResult struct {
 	ExpectedRevision int    `json:"expectedRevision,omitempty"`
 	ActualRevision   int    `json:"actualRevision,omitempty"`
 	Sequence         int64  `json:"sequence,omitempty"`
+	InstanceID       string `json:"instanceId,omitempty"`
+	Address          string `json:"address,omitempty"`
 }
 
 // registerOutput is the full register output.
@@ -137,6 +143,8 @@ func runRegister() int {
 			runRegisterRequest(raw, service, registry, &results, &anyFailed)
 		case "health":
 			runHealthRequest(raw, service, registry, &results, &anyFailed)
+		case "select":
+			runSelectRequest(raw, service, registry, &results, &anyFailed)
 		default:
 			anyFailed = true
 			results = append(results, registerResult{
@@ -360,6 +368,76 @@ func runHealthRequest(raw json.RawMessage, service string, registry *indexroom.R
 		Changed:  outcome.Changed,
 		Revision: outcome.Revision,
 		Sequence: outcome.Sequence,
+	})
+}
+
+// runSelectRequest processes one select request, appending its outcome.
+// A selection performs no network access and never alters registrations or
+// health records; it only advances the service's healthy-instance rotation.
+func runSelectRequest(raw json.RawMessage, service string, registry *indexroom.Registry, results *[]registerResult, anyFailed *bool) {
+	var req struct {
+		Service  string `json:"service"`
+		Revision *int64 `json:"expectedRevision"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		*anyFailed = true
+		*results = append(*results, registerResult{
+			Service:  service,
+			OK:       false,
+			Error:    "invalid",
+			Reason:   fmt.Sprintf("select request must be an object with service and expectedRevision: %v", err),
+			Revision: registry.RevisionOf(service),
+		})
+		return
+	}
+	service = strings.TrimSpace(req.Service)
+
+	if req.Revision == nil {
+		*anyFailed = true
+		*results = append(*results, registerResult{
+			Service:  service,
+			OK:       false,
+			Error:    "invalid",
+			Reason:   "expectedRevision is required and must be a non-negative integer",
+			Revision: registry.RevisionOf(service),
+		})
+		return
+	}
+
+	selection, err := registry.ValidateSelection(service, int(*req.Revision))
+	if err != nil {
+		*anyFailed = true
+		*results = append(*results, registerResult{
+			Service:  service,
+			OK:       false,
+			Error:    "invalid",
+			Reason:   err.Error(),
+			Revision: registry.RevisionOf(service),
+		})
+		return
+	}
+
+	outcome := registry.Select(selection)
+	if !outcome.OK {
+		*anyFailed = true
+		*results = append(*results, registerResult{
+			Service:          outcome.Service,
+			OK:               false,
+			Error:            string(outcome.Kind),
+			Reason:           outcome.Reason,
+			ExpectedRevision: outcome.Expected,
+			ActualRevision:   outcome.Actual,
+			Revision:         outcome.Revision,
+		})
+		return
+	}
+	*results = append(*results, registerResult{
+		Service:    outcome.Service,
+		OK:         true,
+		Revision:   outcome.Revision,
+		InstanceID: outcome.InstanceID,
+		Address:    outcome.Address,
+		Sequence:   outcome.Sequence,
 	})
 }
 
