@@ -1536,6 +1536,289 @@ func TestSelectSessionKeyInvalidPrecedesRevision(t *testing.T) {
 	}
 }
 
+// TestSelectSessionKeyAddressReplacementRecoveryBeforeReuse is the regression
+// guard for a session whose bound instance keeps its id but moves to a new
+// address, where the new address is observed healthy BEFORE the session's next
+// request: the reuse must return the new address and the new health record,
+// never the stale ones, and must not drag the rotation back to a. The batch
+// also locks in that the replacement resets only a's health record — a fresh
+// observation at the new revision may restart its sequence at 1, below the 11
+// accepted for the old address. Every request succeeds, so the exit status is 0.
+func TestSelectSessionKeyAddressReplacementRecoveryBeforeReuse(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":12,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":13,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[{"id":"a","address":"h9:9"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":2,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":2,"sessionKey":"s"},
+		{"type":"select","service":"svc","expectedRevision":2}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("all requests succeed, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 10 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 4: the key's first success rotates to the smallest id and binds s -> a.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 11 || r.Revision != 1 {
+		t.Fatalf("session bind: %+v", r)
+	}
+	// 5: a plain select rotates to b; the cursor rests on b.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 12 {
+		t.Fatalf("plain select: %+v", r)
+	}
+	// 6: the replacement changes only a's address and bumps the revision once.
+	if r := got.Results[6]; !r.OK || !r.Changed || r.Revision != 2 {
+		t.Fatalf("address replacement: %+v", r)
+	}
+	// 7: the new address accepts an observation at the new revision; its
+	// sequence restarts at 1 and is not bounded by the 11 the old address had.
+	if r := got.Results[7]; !r.OK || !r.Changed || r.Revision != 2 || r.Sequence != 1 {
+		t.Fatalf("fresh observation at new address: %+v", r)
+	}
+	// 8: a recovered before this request, so the binding still holds — but the
+	// reuse must report the CURRENT address and sequence, not the stale h1:1/11
+	// recorded before the replacement reset the health record.
+	if r := got.Results[8]; !r.OK || r.InstanceID != "a" || r.Address != "h9:9" || r.Sequence != 1 || r.Revision != 2 {
+		t.Fatalf("session reuse must reflect the new address and sequence: %+v", r)
+	}
+	// 9: the reuse did not move the rotation back to a: the plain select
+	// continues just after b and lands on c.
+	if r := got.Results[9]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 13 || r.Revision != 2 {
+		t.Fatalf("plain select should continue after b at c: %+v", r)
+	}
+	// The final list shows a healthy at its new address with the restarted
+	// sequence; b and c kept their observations through the replacement.
+	if len(got.Services) != 1 || got.Services[0].Revision != 2 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 3 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	wantInsts := []registerInstance{
+		{ID: "a", Address: "h9:9", Health: "healthy", Sequence: 1},
+		{ID: "b", Address: "h2:2", Health: "healthy", Sequence: 12},
+		{ID: "c", Address: "h3:3", Health: "healthy", Sequence: 13},
+	}
+	for i, want := range wantInsts {
+		if insts[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, insts[i], want)
+		}
+	}
+}
+
+// TestSelectSessionKeyAddressReplacementSelectBeforeRecovery covers the other
+// ordering: the session's next request arrives while the rebound instance is
+// still unknown at its new address. The request falls back to the normal
+// rotation — continuing after the last rotated id, not restarting — and
+// rebinds to the rotated instance. The old instance recovering afterwards does
+// not steal the binding back. Every request succeeds, so the exit status is 0.
+func TestSelectSessionKeyAddressReplacementSelectBeforeRecovery(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":12,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":13,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[{"id":"a","address":"h9:9"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"select","service":"svc","expectedRevision":2,"sessionKey":"s"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":2,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":2,"sessionKey":"s"},
+		{"type":"select","service":"svc","expectedRevision":2}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("all requests succeed, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 11 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 4-5: bind s -> a, then a plain select rotates to b; the cursor rests on b.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 11 {
+		t.Fatalf("session bind: %+v", r)
+	}
+	if r := got.Results[5]; !r.OK || r.InstanceID != "b" || r.Sequence != 12 {
+		t.Fatalf("plain select: %+v", r)
+	}
+	// 6: the replacement resets a to unknown at its new address.
+	if r := got.Results[6]; !r.OK || !r.Changed || r.Revision != 2 {
+		t.Fatalf("address replacement: %+v", r)
+	}
+	// 7: a is unknown at selection time, so the session falls back to the
+	// rotation, which continues just after b and lands on c; the success
+	// rebinds s -> c.
+	if r := got.Results[7]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 13 || r.Revision != 2 {
+		t.Fatalf("fallback should rotate after b to c: %+v", r)
+	}
+	// 8: a recovers at its new address under the new revision.
+	if r := got.Results[8]; !r.OK || !r.Changed || r.Revision != 2 || r.Sequence != 1 {
+		t.Fatalf("a recovery: %+v", r)
+	}
+	// 9: the binding moved to c with the fallback; a's recovery does not pull
+	// the session back.
+	if r := got.Results[9]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 13 {
+		t.Fatalf("binding should stay on c after a recovers: %+v", r)
+	}
+	// 10: the fallback rotation left the cursor on c, so the plain select wraps
+	// to a — now eligible again at its new address with its new sequence.
+	if r := got.Results[10]; !r.OK || r.InstanceID != "a" || r.Address != "h9:9" || r.Sequence != 1 || r.Revision != 2 {
+		t.Fatalf("plain select should wrap to a at its new address: %+v", r)
+	}
+	if len(got.Services) != 1 || got.Services[0].Revision != 2 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 3 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	wantInsts := []registerInstance{
+		{ID: "a", Address: "h9:9", Health: "healthy", Sequence: 1},
+		{ID: "b", Address: "h2:2", Health: "healthy", Sequence: 12},
+		{ID: "c", Address: "h3:3", Health: "healthy", Sequence: 13},
+	}
+	for i, want := range wantInsts {
+		if insts[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, insts[i], want)
+		}
+	}
+}
+
+// TestSelectSessionKeyAddressReplacementNoHealthyKeepsBinding is the regression
+// guard for the all-unavailable gap after an address replacement: the session
+// request fails with no_healthy — current revision, a readable reason, no
+// fabricated target — and the failure neither rewrites the binding nor
+// advances the rotation, so once a recovers at its new address the same
+// session reuses it, and once the other instances recover the plain rotation
+// resumes from its pre-failure position. The batch also rejects a health
+// report sent under the OLD registration revision: even with a sequence far
+// above anything accepted before, it conflicts and cannot heal the new
+// address. The batch contains failures, so the exit status is 1, and the
+// failed items keep their result slots while later valid requests still apply.
+func TestSelectSessionKeyAddressReplacementNoHealthyKeepsBinding(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":12,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":13,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[{"id":"a","address":"h9:9"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":2,"sequence":14,"healthy":false,"reason":"连接拒绝"},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":2,"sequence":15,"healthy":false,"reason":"连接拒绝"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":99,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":2,"sessionKey":"s"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":2,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":2,"sessionKey":"s"},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":2,"sequence":16,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":2,"sequence":17,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":2}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains failures, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	// One result per request, in input order; failed items keep their slots.
+	if len(got.Results) != 16 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 4-5: bind s -> a, then a plain select rotates to b; the cursor rests on b.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 11 {
+		t.Fatalf("session bind: %+v", r)
+	}
+	if r := got.Results[5]; !r.OK || r.InstanceID != "b" || r.Sequence != 12 {
+		t.Fatalf("plain select: %+v", r)
+	}
+	// 6: the replacement resets a to unknown at its new address, revision 2.
+	if r := got.Results[6]; !r.OK || !r.Changed || r.Revision != 2 {
+		t.Fatalf("address replacement: %+v", r)
+	}
+	// 7-8: b and c turn unhealthy at the current revision.
+	if r := got.Results[7]; !r.OK || !r.Changed || r.Revision != 2 || r.Sequence != 14 {
+		t.Fatalf("b unhealthy: %+v", r)
+	}
+	if r := got.Results[8]; !r.OK || !r.Changed || r.Revision != 2 || r.Sequence != 15 {
+		t.Fatalf("c unhealthy: %+v", r)
+	}
+	// 9: a health report under the OLD revision conflicts even though its
+	// sequence 99 exceeds anything accepted before; it names both revisions and
+	// must not heal the new address.
+	if r := got.Results[9]; r.OK || r.Error != "conflict" || r.Reason == "" ||
+		r.ExpectedRevision != 1 || r.ActualRevision != 2 || r.Revision != 2 {
+		t.Fatalf("old-revision health report: %+v", r)
+	}
+	// 10: with a unknown (the conflicting report healed nothing) and b, c
+	// unhealthy, the session request is no_healthy: it states the reason and
+	// the current revision and fabricates neither an instance id nor an
+	// address. The failure must not rewrite the s -> a binding or move the
+	// cursor off b.
+	if r := got.Results[10]; r.OK || r.Error != "no_healthy" || r.Reason == "" ||
+		r.Revision != 2 || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("no_healthy with everything unavailable: %+v", r)
+	}
+	// 11: a fresh observation at the current revision heals the new address;
+	// the sequence restarts at 1, below the 11 accepted for the old address.
+	if r := got.Results[11]; !r.OK || !r.Changed || r.Revision != 2 || r.Sequence != 1 {
+		t.Fatalf("fresh observation at new address: %+v", r)
+	}
+	// 12: the binding survived the no_healthy failure, so the session reuses a
+	// again — with its CURRENT address and sequence, and without rotating.
+	if r := got.Results[12]; !r.OK || r.InstanceID != "a" || r.Address != "h9:9" || r.Sequence != 1 || r.Revision != 2 {
+		t.Fatalf("session should reuse a after its recovery: %+v", r)
+	}
+	// 13-14: b and c recover at the current revision.
+	if r := got.Results[13]; !r.OK || !r.Changed || r.Revision != 2 || r.Sequence != 16 {
+		t.Fatalf("b recovery: %+v", r)
+	}
+	if r := got.Results[14]; !r.OK || !r.Changed || r.Revision != 2 || r.Sequence != 17 {
+		t.Fatalf("c recovery: %+v", r)
+	}
+	// 15: the no_healthy failure never moved the cursor off b and the session
+	// reuse did not rotate either, so the plain select continues just after b
+	// and lands on c.
+	if r := got.Results[15]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 17 || r.Revision != 2 {
+		t.Fatalf("plain select should resume after b at c: %+v", r)
+	}
+	// The final list reflects the new address and only the accepted health
+	// records: a healthy at h9:9 with the restarted sequence 1, b and c
+	// healthy again with their recovery sequences and no leftover reason.
+	if len(got.Services) != 1 || got.Services[0].Revision != 2 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 3 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	wantInsts := []registerInstance{
+		{ID: "a", Address: "h9:9", Health: "healthy", Sequence: 1},
+		{ID: "b", Address: "h2:2", Health: "healthy", Sequence: 16},
+		{ID: "c", Address: "h3:3", Health: "healthy", Sequence: 17},
+	}
+	for i, want := range wantInsts {
+		if insts[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, insts[i], want)
+		}
+	}
+}
+
 // TestSelectSessionKeyPerService checks at the batch level that the same key
 // in two services binds independently.
 func TestSelectSessionKeyPerService(t *testing.T) {
