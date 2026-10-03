@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"unicode/utf8"
 )
 
@@ -31,36 +32,25 @@ const (
 	snapshotVersion2 = 2
 )
 
-// snapshotDoc is the version-1 wire form of an exported main chain.
+// snapshotDoc is the wire form of an exported main chain, in either
+// version; the version field alone distinguishes the two layouts.
 type snapshotDoc struct {
 	Version int64           `json:"version"`
 	Tip     int64           `json:"tip"`
 	Blocks  []snapshotBlock `json:"blocks"`
 }
 
-// snapshotBlock is the version-1 wire form of one block.
+// snapshotBlock is the wire form of one block in either version. Timestamp
+// is the only version-dependent field: a version-1 document leaves it empty
+// so the field is omitted entirely, while a version-2 document always
+// carries it — the integer literal for a present timestamp, null for a
+// missing one.
 type snapshotBlock struct {
-	Height int64    `json:"height"`
-	Hash   string   `json:"hash"`
-	Parent string   `json:"parent"`
-	Txs    []string `json:"txs"`
-}
-
-// snapshotDocV2 is the timestamp-bearing wire form.
-type snapshotDocV2 struct {
-	Version int64             `json:"version"`
-	Tip     int64             `json:"tip"`
-	Blocks  []snapshotBlockV2 `json:"blocks"`
-}
-
-// snapshotBlockV2 is the version-2 wire form of one block. A nil Timestamp
-// serializes as null.
-type snapshotBlockV2 struct {
-	Height    int64    `json:"height"`
-	Hash      string   `json:"hash"`
-	Parent    string   `json:"parent"`
-	Txs       []string `json:"txs"`
-	Timestamp *int64   `json:"timestamp"`
+	Height    int64           `json:"height"`
+	Hash      string          `json:"hash"`
+	Parent    string          `json:"parent"`
+	Txs       []string        `json:"txs"`
+	Timestamp json.RawMessage `json:"timestamp,omitempty"`
 }
 
 // Export writes the current main chain to w as a JSON snapshot: a single
@@ -81,6 +71,9 @@ type snapshotBlockV2 struct {
 // failure is reported and leaves the index untouched.
 func (index *Index) Export(w io.Writer) error {
 	index.mu.Lock()
+	// One timestamped block — even a timestamp of zero — makes the whole
+	// document version 2, and every block then carries a timestamp field,
+	// null where the time is missing.
 	version := int64(snapshotVersion1)
 	for height := int64(1); height <= index.Tip; height++ {
 		if index.Blocks[height].Time != nil {
@@ -88,52 +81,28 @@ func (index *Index) Export(w io.Writer) error {
 			break
 		}
 	}
-	var raw []byte
-	var err error
-	if version == snapshotVersion1 {
-		doc := snapshotDoc{
-			Version: snapshotVersion1,
-			Tip:     index.Tip,
-			Blocks:  make([]snapshotBlock, 0, int(index.Tip)),
-		}
-		for height := int64(1); height <= index.Tip; height++ {
-			block := index.Blocks[height]
-			txs := make([]string, len(block.Txs))
-			copy(txs, block.Txs)
-			doc.Blocks = append(doc.Blocks, snapshotBlock{
-				Height: block.Height,
-				Hash:   block.Hash,
-				Parent: block.Parent,
-				Txs:    txs,
-			})
-		}
-		index.mu.Unlock()
-		raw, err = json.Marshal(doc)
-	} else {
-		doc := snapshotDocV2{
-			Version: snapshotVersion2,
-			Tip:     index.Tip,
-			Blocks:  make([]snapshotBlockV2, 0, int(index.Tip)),
-		}
-		for height := int64(1); height <= index.Tip; height++ {
-			block := index.Blocks[height]
-			txs := make([]string, len(block.Txs))
-			copy(txs, block.Txs)
-			entry := snapshotBlockV2{
-				Height: block.Height,
-				Hash:   block.Hash,
-				Parent: block.Parent,
-				Txs:    txs,
-			}
-			if block.Time != nil {
-				t := *block.Time
-				entry.Timestamp = &t
-			}
-			doc.Blocks = append(doc.Blocks, entry)
-		}
-		index.mu.Unlock()
-		raw, err = json.Marshal(doc)
+	doc := snapshotDoc{
+		Version: version,
+		Tip:     index.Tip,
+		Blocks:  make([]snapshotBlock, 0, int(index.Tip)),
 	}
+	for height := int64(1); height <= index.Tip; height++ {
+		block := index.Blocks[height]
+		txs := make([]string, len(block.Txs))
+		copy(txs, block.Txs)
+		entry := snapshotBlock{
+			Height: block.Height,
+			Hash:   block.Hash,
+			Parent: block.Parent,
+			Txs:    txs,
+		}
+		if version == snapshotVersion2 {
+			entry.Timestamp = snapshotTimestampRaw(block.Time)
+		}
+		doc.Blocks = append(doc.Blocks, entry)
+	}
+	index.mu.Unlock()
+	raw, err := json.Marshal(doc)
 	if err != nil {
 		panic(err) // snapshot docs only contain marshalable fields
 	}
@@ -145,6 +114,16 @@ func (index *Index) Export(w io.Writer) error {
 		return fmt.Errorf("indexroom: export snapshot: %w", io.ErrShortWrite)
 	}
 	return nil
+}
+
+// snapshotTimestampRaw renders the version-2 timestamp field value: the
+// integer literal for a present timestamp — zero included — or null for a
+// missing one.
+func snapshotTimestampRaw(t *int64) json.RawMessage {
+	if t == nil {
+		return json.RawMessage("null")
+	}
+	return strconv.AppendInt(nil, *t, 10)
 }
 
 // Restore replaces the whole main chain with the snapshot read from r. The
