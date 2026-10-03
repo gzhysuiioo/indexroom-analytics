@@ -99,9 +99,15 @@ type HealthOutcome struct {
 }
 
 // Selection is a validated request that chooses one healthy target instance.
+//
+// When HasSession is set, SessionKey names a per-service session whose
+// requests stick to the instance the session first selected, for as long as
+// that instance remains registered and healthy.
 type Selection struct {
-	Service  string
-	Revision int
+	Service    string
+	Revision   int
+	HasSession bool
+	SessionKey string
 }
 
 // SelectOutcome is the result of choosing one healthy instance.
@@ -109,7 +115,8 @@ type Selection struct {
 // On success the chosen instance carries its id, address and current health
 // sequence. A selection never mutates registrations, health records or the
 // per-service rotation cursor on failure; on success it only advances that
-// cursor to the chosen instance's id.
+// cursor to the chosen instance's id and, for a session request, records the
+// session's binding. Reusing an existing session binding moves nothing.
 type SelectOutcome struct {
 	Service    string
 	OK         bool
@@ -140,6 +147,14 @@ type serviceState struct {
 	// healthy set without restarting the rotation.
 	cursor    string
 	cursorSet bool
+
+	// sessions binds a session key to the instance id it last selected
+	// successfully. Bindings live per service, so the same key in two services
+	// sticks independently. A binding is only consulted at selection time: it
+	// is reused while the bound instance is still registered and healthy, and
+	// replaced by the next successful rotation pick otherwise. Reusing a
+	// binding never moves the rotation cursor.
+	sessions map[string]string
 }
 
 type instanceState struct {
@@ -480,6 +495,24 @@ func (r *Registry) ValidateSelection(service string, revision int) (Selection, e
 	return Selection{Service: name, Revision: revision}, nil
 }
 
+// ValidateSelectionWithSession is ValidateSelection for a request carrying a
+// session key. The key is trimmed and must not be blank; keys that normalize
+// to the same string name the same session. Content validity is established
+// before any revision check.
+func (r *Registry) ValidateSelectionWithSession(service string, revision int, sessionKey string) (Selection, error) {
+	sel, err := r.ValidateSelection(service, revision)
+	if err != nil {
+		return Selection{}, err
+	}
+	key := strings.TrimSpace(sessionKey)
+	if key == "" {
+		return Selection{}, errInvalid("sessionKey must not be blank")
+	}
+	sel.HasSession = true
+	sel.SessionKey = key
+	return sel, nil
+}
+
 // Select chooses one healthy instance for the service once the shared revision
 // gate has passed.
 //
@@ -497,10 +530,36 @@ func (r *Registry) ValidateSelection(service string, revision int) (Selection, e
 // single healthy instance it may be chosen repeatedly. Registrations and
 // health changes alter the candidate set immediately but never reset the
 // rotation; failed selections leave the cursor where it was.
+//
+// A selection carrying a session key sticks to one instance per service:
+// while the bound instance is still registered and healthy at selection time
+// it is returned with its current address and health sequence, without moving
+// the rotation cursor. When the binding is missing or no longer usable — the
+// instance was removed, or its current health is unknown or unhealthy — the
+// request falls back to the normal rotation and, only on success, replaces
+// the binding. An instance id re-registered under a new address restarts from
+// unknown like any fresh observation, so the binding only becomes reusable
+// once a new healthy observation is accepted for the new address. Session
+// bindings never alter revisions or health records.
 func (r *Registry) Select(sel Selection) SelectOutcome {
 	st, fail := r.checkServiceRevision(sel.Service, sel.Revision)
 	if fail != nil {
 		return fail.asSelect(sel.Service)
+	}
+
+	if sel.HasSession {
+		if bound, ok := st.sessions[sel.SessionKey]; ok {
+			if cur, exists := st.instances[bound]; exists && cur.health == HealthHealthy {
+				return SelectOutcome{
+					Service:    sel.Service,
+					OK:         true,
+					Revision:   st.revision,
+					InstanceID: bound,
+					Address:    cur.address,
+					Sequence:   cur.sequence,
+				}
+			}
+		}
 	}
 
 	healthy := make([]string, 0, len(st.instances))
@@ -533,6 +592,12 @@ func (r *Registry) Select(sel Selection) SelectOutcome {
 	cur := st.instances[chosen]
 	st.cursor = chosen
 	st.cursorSet = true
+	if sel.HasSession {
+		if st.sessions == nil {
+			st.sessions = make(map[string]string)
+		}
+		st.sessions[sel.SessionKey] = chosen
+	}
 	return SelectOutcome{
 		Service:    sel.Service,
 		OK:         true,

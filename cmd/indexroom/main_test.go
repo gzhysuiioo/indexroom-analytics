@@ -1354,3 +1354,111 @@ func TestRejectedInvalidReplacementKeepsRotationPosition(t *testing.T) {
 		t.Fatalf("final list must keep only accepted state: %+v", insts)
 	}
 }
+
+func TestRegisterSelectSessionSticky(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":" s "},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":3,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 9 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// First request for the key rotates to a and binds; the trimmed-equal key
+	// reuses a without moving the rotation.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 1 {
+		t.Fatalf("first session select: %+v", r)
+	}
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 1 {
+		t.Fatalf("session reuse: %+v", r)
+	}
+	// The plain select continues just after the last rotated pick (a), at b.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("plain select after reuse: %+v", r)
+	}
+	// a is unhealthy now: the session reselects by rotation and rebinds to b.
+	if r := got.Results[7]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("reselect after bound unhealthy: %+v", r)
+	}
+	if r := got.Results[8]; !r.OK || r.InstanceID != "b" {
+		t.Fatalf("rebound session reuse: %+v", r)
+	}
+}
+
+func TestRegisterSelectSessionKeyInvalid(t *testing.T) {
+	cases := map[string]struct {
+		field string
+		want  string
+	}{
+		"explicit null": {`"sessionKey":null`, "sessionKey"},
+		"numeric key":   {`"sessionKey":7`, "sessionKey"},
+		"boolean key":   {`"sessionKey":true`, "sessionKey"},
+		"object key":    {`"sessionKey":{}`, "sessionKey"},
+		"blank key":     {`"sessionKey":"   "`, "sessionKey"},
+		"empty key":     {`"sessionKey":""`, "sessionKey"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			input := `{"requests":[
+				{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"}]},
+				{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+				{"type":"select","service":"svc","expectedRevision":1,` + tc.field + `},
+				{"type":"select","service":"svc","expectedRevision":1}
+			]}`
+			out, code := runRegisterWith(t, input)
+			if code != 1 {
+				t.Fatalf("batch contains a failure, exit code: %d, output: %s", code, out)
+			}
+			var got registerOutput
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("output is not JSON: %v\n%s", err, out)
+			}
+			if len(got.Results) != 4 {
+				t.Fatalf("results: %+v", got.Results)
+			}
+			if r := got.Results[2]; r.OK || r.Error != "invalid" || !strings.Contains(r.Reason, tc.want) {
+				t.Fatalf("session key failure should be invalid naming sessionKey: %+v", r)
+			}
+			// The failed item created no binding and moved no cursor: the next
+			// plain select still rotates from the start.
+			if r := got.Results[3]; !r.OK || r.InstanceID != "a" {
+				t.Fatalf("select after invalid key: %+v", r)
+			}
+		})
+	}
+}
+
+func TestRegisterSelectSessionKeyInvalidBeatsRevisionConflict(t *testing.T) {
+	// A blank sessionKey with a wrong revision reports invalid, not conflict:
+	// field checks run before the revision comparison.
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"}]},
+		{"type":"select","service":"svc","expectedRevision":9,"sessionKey":"  "}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains a failure, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if r := got.Results[1]; r.OK || r.Error != "invalid" || !strings.Contains(r.Reason, "sessionKey") ||
+		r.ExpectedRevision != 0 || r.ActualRevision != 0 {
+		t.Fatalf("invalid session key should win over revision conflict: %+v", r)
+	}
+}
