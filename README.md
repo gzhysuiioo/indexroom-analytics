@@ -63,6 +63,67 @@ matching revision is `not_found`, and a service with no healthy instance is
 `no_healthy`. Every failure states the reason and current revision and leaves
 the rotation position intact.
 
+## 离线健康上报（`health` 请求）中文说明
+
+`health` 请求在 `register` 命令的同一批 `requests` 中记录一条离线健康观察，不做任何网络探测。规则如下：
+
+- `expectedRevision` 必须等于该服务当前的注册修订号；健康上报**不增加**修订号，上报前后修订号不变。
+- `sequence` 是**单个实例**的正整数序号，每个实例独立计数，不是整批请求共用的计数。
+- 序号大于当前记录时更新健康状态；小于当前记录时返回 `stale`；等于当前记录时，只有健康状态和整理后的原因都相同才成功且不产生变更，否则返回 `conflict`。
+- 实例刚注册时健康状态为 `unknown`、序号为 0、无原因。
+- 不健康观察（`"healthy":false`）必须提供 `reason`，且去除两端空白后仍非空；健康观察（`"healthy":true`）会清空原因。原因先去除两端空白再存储，整理后的结果参与相同序号的重复判断。
+- 成功结果中 `changed` 未出现表示没有变更（例如重复上报），不能把 `"ok":true` 等同于记录已更新。
+- 失败的请求不会覆盖先前记录；批次中后续请求仍按输入顺序继续执行。
+- 每次调用都从空注册表开始，示例所需的注册和观察必须放在同一批请求中。
+- 注册替换与观察的关系：替换实例列表时，实例标识和地址都没变的实例保留健康记录；地址改变或删除后重新加入的实例回到 `unknown`、序号 0、无原因，新地址只有在当前修订号下上报健康结果后才能被选择。旧修订号的观察即使序号更大也返回 `conflict`，不能把旧地址的健康结果带到新修订号。
+- 错误分类：字段无效（如 `service` 为空、`sequence` 非正整数、不健康但原因为空白）返回 `invalid`；修订号不符返回 `conflict`；修订号匹配但服务或实例不存在返回 `not_found`。字段检查先于修订号判断。
+
+### 完整示例
+
+下面用同一个实例 `i1` 依次展示：不健康观察被接受、带两端空白的相同原因重复上报、旧序号被拒绝、更大序号恢复健康，最后基于已接受的恢复结果选择目标：
+
+```bash
+echo '{"requests":[
+  {"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"h1:8080"}]},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":10,"healthy":false,"reason":"心跳超时"},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":10,"healthy":false,"reason":"  心跳超时  "},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":5,"healthy":false,"reason":"误报重发"},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":11,"healthy":true},
+  {"type":"select","service":"svc","expectedRevision":1}
+]}' | go run ./cmd/indexroom register
+```
+
+输出（逐项说明见后）：
+
+```json
+{
+  "results": [
+    {"service":"svc","ok":true,"changed":true,"revision":1},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":10},
+    {"service":"svc","ok":true,"revision":1,"sequence":10},
+    {"service":"svc","ok":false,"revision":1,"error":"stale","reason":"sequence 5 is older than the current sequence 10","sequence":10},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":11},
+    {"service":"svc","ok":true,"revision":1,"sequence":11,"instanceId":"i1","address":"h1:8080"}
+  ],
+  "services": [
+    {"service":"svc","revision":1,"instances":[
+      {"id":"i1","address":"h1:8080","health":"healthy","sequence":11}
+    ]}
+  ]
+}
+```
+
+逐项说明：
+
+1. 注册成功，服务修订号变为 1；实例 `i1` 初始为 `unknown`、序号 0。
+2. 序号 10 的不健康观察被接受（`changed:true`），原因记录为 `心跳超时`；修订号仍为 1，健康上报不增加修订号。
+3. 相同序号 10、相同健康状态，原因去除两端空白后也是 `心跳超时`，属于重复上报：成功但**没有** `changed` 字段，表示记录未变。
+4. 序号 5 小于当前序号 10，返回 `stale`，`sequence` 报告当前序号 10；先前记录未被覆盖。
+5. 更大序号 11 恢复健康被接受，原因被清空；尽管第 4 项失败，本项仍按输入顺序正常生效。
+6. 目标选择使用已接受的恢复结果，选中 `i1`，返回其地址和最新健康序号 11。
+
+末尾的 `services` 列表显示每个实例的最终健康状态和最新序号（`i1` 为 `healthy`、序号 11、无原因）。本批次含有失败项（第 4 项），进程退出状态为 1，但后续成功项仍然生效；只有全部请求成功时退出状态才为 0。
+
 ## 技术方向
 
 blockchain-indexer, tx-indexer, onchain-analytics, tx-decoder, data-indexer, metrics, block-explorer
