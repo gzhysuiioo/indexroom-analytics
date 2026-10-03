@@ -761,6 +761,200 @@ func TestSelectAddressReplacementNoHealthyThenRecovery(t *testing.T) {
 	}
 }
 
+func TestRejectedHealthKeepsHealthyInstanceEligible(t *testing.T) {
+	// A healthy instance that receives a stale or same-sequence conflicting
+	// "unhealthy" report keeps its accepted observation: the rejections state
+	// the reason and the accepted sequence, and the instance stays in the
+	// candidate set. The rejected reports target b, the instance the rotation
+	// would choose next; the cursor must neither skip it nor restart.
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":5,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":7,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":3,"healthy":false,"reason":"flapping"},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":7,"healthy":false,"reason":"flapping"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	// One result per request, in input order.
+	if len(got.Results) != 8 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// First select takes the smallest healthy id.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 5 || r.Revision != 1 {
+		t.Fatalf("first select: %+v", r)
+	}
+	// Stale: sequence below the accepted 7. The failure states the reason and
+	// the currently accepted sequence, and keeps the service revision.
+	if r := got.Results[4]; r.OK || r.Error != "stale" ||
+		r.Reason != "sequence 3 is older than the current sequence 7" ||
+		r.Sequence != 7 || r.Revision != 1 {
+		t.Fatalf("stale report: %+v", r)
+	}
+	// Conflict: the accepted sequence 7 reused with the opposite health state.
+	if r := got.Results[5]; r.OK || r.Error != "conflict" ||
+		r.Reason != "sequence 7 already used with different health content" ||
+		r.Sequence != 7 || r.Revision != 1 {
+		t.Fatalf("conflicting report: %+v", r)
+	}
+	// The rejected "unhealthy" reports did not knock b out: the rotation
+	// continues just after a and lands on b with its accepted record.
+	if r := got.Results[6]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 7 || r.Revision != 1 {
+		t.Fatalf("select after rejections should still choose b: %+v", r)
+	}
+	// Past the end the rotation wraps to the smallest id.
+	if r := got.Results[7]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 5 {
+		t.Fatalf("select should wrap to a: %+v", r)
+	}
+	// The final list shows only the accepted observations; nothing from the
+	// rejected reports leaked in.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 2 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	if insts[0].ID != "a" || insts[0].Health != "healthy" || insts[0].Sequence != 5 || insts[0].Reason != "" {
+		t.Fatalf("a should keep its accepted record: %+v", insts[0])
+	}
+	if insts[1].ID != "b" || insts[1].Health != "healthy" || insts[1].Sequence != 7 || insts[1].Reason != "" {
+		t.Fatalf("b should keep its accepted record: %+v", insts[1])
+	}
+}
+
+func TestRejectedHealthDoesNotRestoreUnhealthyInstance(t *testing.T) {
+	// The opposite direction: an unhealthy instance that receives a stale or
+	// same-sequence conflicting "healthy" report stays unhealthy and never
+	// re-enters the candidate set; the rotation keeps repeating the only
+	// healthy instance.
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":4,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":6,"healthy":false,"reason":"connection refused"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":6,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 7 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" || r.Sequence != 4 {
+		t.Fatalf("first select: %+v", r)
+	}
+	// Stale "healthy" report: rejected, the accepted sequence 6 is reported.
+	if r := got.Results[4]; r.OK || r.Error != "stale" ||
+		r.Reason != "sequence 2 is older than the current sequence 6" ||
+		r.Sequence != 6 || r.Revision != 1 {
+		t.Fatalf("stale recovery attempt: %+v", r)
+	}
+	// Same sequence 6 flipping unhealthy to healthy: conflict.
+	if r := got.Results[5]; r.OK || r.Error != "conflict" ||
+		r.Reason != "sequence 6 already used with different health content" ||
+		r.Sequence != 6 || r.Revision != 1 {
+		t.Fatalf("conflicting recovery attempt: %+v", r)
+	}
+	// b was not restored: a is still the only healthy instance and is chosen
+	// again with its accepted record.
+	if r := got.Results[6]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 4 || r.Revision != 1 {
+		t.Fatalf("select should repeat the only healthy instance: %+v", r)
+	}
+	// The final list keeps the accepted unhealthy record with its reason.
+	insts := got.Services[0].Instances
+	if len(insts) != 2 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	if insts[0].ID != "a" || insts[0].Health != "healthy" || insts[0].Sequence != 4 || insts[0].Reason != "" {
+		t.Fatalf("a should keep its accepted record: %+v", insts[0])
+	}
+	if insts[1].ID != "b" || insts[1].Health != "unhealthy" || insts[1].Sequence != 6 || insts[1].Reason != "connection refused" {
+		t.Fatalf("b should keep its accepted unhealthy record: %+v", insts[1])
+	}
+}
+
+func TestRejectedRecoveryKeepsNoHealthyUntilNewerSequence(t *testing.T) {
+	// With no healthy instance, rejected recovery attempts change nothing:
+	// select keeps returning no_healthy without a target instance or address.
+	// Only a later report with a higher sequence is accepted, and the next
+	// selection uses that new record rather than the rejected content.
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":9,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":4,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":9,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":10,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 8 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// No healthy instance: no_healthy names neither an instance nor an address.
+	if r := got.Results[2]; r.OK || r.Error != "no_healthy" || r.Reason == "" || r.Revision != 1 || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("select with no healthy instance: %+v", r)
+	}
+	// Stale recovery attempt reports the accepted sequence 9.
+	if r := got.Results[3]; r.OK || r.Error != "stale" ||
+		r.Reason != "sequence 4 is older than the current sequence 9" ||
+		r.Sequence != 9 || r.Revision != 1 {
+		t.Fatalf("stale recovery attempt: %+v", r)
+	}
+	// Same sequence 9 flipping to healthy conflicts.
+	if r := got.Results[4]; r.OK || r.Error != "conflict" ||
+		r.Reason != "sequence 9 already used with different health content" ||
+		r.Sequence != 9 || r.Revision != 1 {
+		t.Fatalf("conflicting recovery attempt: %+v", r)
+	}
+	// The rejected recoveries did not restore eligibility: still no_healthy.
+	if r := got.Results[5]; r.OK || r.Error != "no_healthy" || r.Revision != 1 || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("rejected recoveries must not restore eligibility: %+v", r)
+	}
+	// A higher sequence is accepted and flips the instance to healthy.
+	if r := got.Results[6]; !r.OK || !r.Changed || r.Sequence != 10 || r.Revision != 1 {
+		t.Fatalf("newer recovery: %+v", r)
+	}
+	// The next selection uses the newly accepted record (sequence 10), not
+	// anything from the rejected reports.
+	if r := got.Results[7]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 10 || r.Revision != 1 {
+		t.Fatalf("select after accepted recovery: %+v", r)
+	}
+	// Final list: healthy at sequence 10 with the old reason cleared.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 1 || insts[0].ID != "a" || insts[0].Health != "healthy" || insts[0].Sequence != 10 || insts[0].Reason != "" {
+		t.Fatalf("a should be healthy at sequence 10: %+v", insts)
+	}
+}
+
 func TestSelectDeterministic(t *testing.T) {
 	input := `{"requests":[
 		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"c","address":"h3:3"},{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
