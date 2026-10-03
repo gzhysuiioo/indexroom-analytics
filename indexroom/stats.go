@@ -8,6 +8,15 @@ import (
 // may return.
 const MaxTimeBuckets = 10000
 
+// statsQueryHookLocked is a test-only rendezvous invoked once per
+// QueryTimeStats call while index.mu is held, with the resolved tip-bound
+// height (after clamping, before any block is scanned). It is nil in
+// production; reorg regression tests set it to park a query that has already
+// pinned its height range with the lock held, forcing a concurrent Reorg to
+// wait and making the "one complete main-chain state" observation
+// deterministic instead of relying on scheduling luck.
+var statsQueryHookLocked func(resolvedTo int64)
+
 // TimeStatsQuery asks for transaction statistics over a half-open time
 // window, segmented into fixed-length buckets.
 //
@@ -135,6 +144,10 @@ func (index *Index) QueryTimeStats(query TimeStatsQuery) (TimeStats, error) {
 		// Empty index or a start above the tip: zeroed buckets are still
 		// returned for the whole requested window.
 		return stats, nil
+	}
+
+	if statsQueryHookLocked != nil {
+		statsQueryHookLocked(to)
 	}
 
 	distinct := make([]map[string]struct{}, count)

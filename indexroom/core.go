@@ -49,6 +49,14 @@ func New() *Index {
 	return &Index{Blocks: map[int64]Block{}, ByHash: map[string]int64{}, key: newKey()}
 }
 
+// reorgAppliedHookLocked is a test-only rendezvous invoked from Reorg once
+// the alternate branch has fully replaced the old tip range, while index.mu
+// is still held and before the call returns. It is nil in production; reorg
+// regression tests park a successful reorg here with the new chain already in
+// effect, so a QueryTimeStats issued at that instant is forced to wait and,
+// once it runs, must observe the complete new chain.
+var reorgAppliedHookLocked func(newTip int64)
+
 // Append accepts a block only when it extends the current tip, keeping the
 // chain linear. Re-submitting a block identical to one already on the main
 // chain is a successful no-op. A block whose hash, parent, or any transaction
@@ -173,6 +181,9 @@ func (index *Index) Reorg(blocks []Block) ([]int64, error) {
 	index.Tip = ancestor
 	for _, block := range blocks {
 		index.storeLocked(block)
+	}
+	if reorgAppliedHookLocked != nil {
+		reorgAppliedHookLocked(index.Tip)
 	}
 	return dropped, nil
 }
