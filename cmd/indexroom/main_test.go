@@ -1083,6 +1083,163 @@ func TestRejectedReplacementKeepsAcceptedStateAndRotation(t *testing.T) {
 	}
 }
 
+// TestEmptyListReplacementKeepsRotationAndDropsHealth is the regression guard
+// for replacing a service's instance list with an empty one and later
+// re-adding the very same instances. The empty list must not delete the
+// service or its rotation position, and the deleted instances' accepted
+// health observations must not come back when the same ids and addresses
+// rejoin: they return as unknown at sequence 0 with no reason, observations
+// submitted under the pre-clear revision conflict even with larger sequences,
+// and the rotation resumes just after the last instance chosen before the
+// clear once fresh observations make the instances healthy again.
+func TestEmptyListReplacementKeepsRotationAndDropsHealth(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":7,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":8,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":9,"healthy":false,"reason":"心跳超时"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[]},
+		{"type":"select","service":"svc","expectedRevision":2},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":2,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"select","service":"svc","expectedRevision":3},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":99,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":2,"sequence":50,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":3},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":3,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":3,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":3,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":3},
+		{"type":"select","service":"svc","expectedRevision":3}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains failures, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	// One result per request, in input order; failed items keep their slots
+	// and later valid requests still take effect.
+	if len(got.Results) != 19 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 0: registration creates the service at revision 1.
+	if r := got.Results[0]; !r.OK || !r.Changed || r.Revision != 1 {
+		t.Fatalf("result 0: %+v", r)
+	}
+	// 1-3: observations accepted without bumping the registration revision.
+	if r := got.Results[1]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 7 {
+		t.Fatalf("result 1: %+v", r)
+	}
+	if r := got.Results[2]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 8 {
+		t.Fatalf("result 2: %+v", r)
+	}
+	if r := got.Results[3]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 9 {
+		t.Fatalf("result 3: %+v", r)
+	}
+	// 4-5: the first two selections rotate a then b; the cursor rests on b.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 7 || r.Revision != 1 {
+		t.Fatalf("result 4: %+v", r)
+	}
+	if r := got.Results[5]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 8 || r.Revision != 1 {
+		t.Fatalf("result 5: %+v", r)
+	}
+	// 6: replacing with the empty list succeeds, reports the change and bumps
+	// the revision to 2.
+	if r := got.Results[6]; !r.OK || !r.Changed || r.Revision != 2 {
+		t.Fatalf("result 6 empty replacement: %+v", r)
+	}
+	// 7: the empty list keeps the service registered: the selection at the
+	// current revision is no_healthy — not not_found — stating a readable
+	// reason and the current revision, and naming no old instance id, address
+	// or sequence.
+	if r := got.Results[7]; r.OK || r.Error != "no_healthy" || r.Reason == "" ||
+		r.Revision != 2 || r.InstanceID != "" || r.Address != "" || r.Sequence != 0 {
+		t.Fatalf("result 7 select on empty list: %+v", r)
+	}
+	// 8: a selection against the pre-clear revision conflicts, naming both
+	// revisions; the failed selection must not move the rotation.
+	if r := got.Results[8]; r.OK || r.Error != "conflict" ||
+		r.ExpectedRevision != 1 || r.ActualRevision != 2 || r.Revision != 2 ||
+		r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("result 8 stale-revision select: %+v", r)
+	}
+	// 9: re-registering the same ids at the same addresses under revision 2
+	// succeeds and bumps the revision to 3.
+	if r := got.Results[9]; !r.OK || !r.Changed || r.Revision != 3 {
+		t.Fatalf("result 9 re-registration: %+v", r)
+	}
+	// 10: even though ids and addresses match the pre-clear list, the re-added
+	// instances are unknown at sequence 0, so nothing is selectable yet.
+	if r := got.Results[10]; r.OK || r.Error != "no_healthy" || r.Reason == "" ||
+		r.Revision != 3 || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("result 10 select before re-reporting: %+v", r)
+	}
+	// 11-12: observations submitted under the pre-clear revisions conflict even
+	// with sequences far above the previously accepted ones; they name the
+	// request and current revisions and cannot restore any health eligibility.
+	if r := got.Results[11]; r.OK || r.Error != "conflict" || r.Reason == "" ||
+		r.ExpectedRevision != 1 || r.ActualRevision != 3 || r.Revision != 3 {
+		t.Fatalf("result 11 old-revision health report: %+v", r)
+	}
+	if r := got.Results[12]; r.OK || r.Error != "conflict" || r.Reason == "" ||
+		r.ExpectedRevision != 2 || r.ActualRevision != 3 || r.Revision != 3 {
+		t.Fatalf("result 12 old-revision health report: %+v", r)
+	}
+	// 13: the conflicting reports healed nothing: still no_healthy, and this
+	// failed selection must not move the rotation either.
+	if r := got.Results[13]; r.OK || r.Error != "no_healthy" ||
+		r.Revision != 3 || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("result 13 select after conflicting reports: %+v", r)
+	}
+	// 14-16: at the current revision a sequence just above the reset 0
+	// suffices for each instance; health reports never bump the revision.
+	for i, id := range []string{"a", "b", "c"} {
+		if r := got.Results[14+i]; !r.OK || !r.Changed || r.Revision != 3 || r.Sequence != 1 {
+			t.Fatalf("result %d recovery of %s: %+v", 14+i, id, r)
+		}
+	}
+	// 17: with all three healthy again the rotation continues just after b —
+	// the last instance chosen before the clear — and lands on c with its
+	// current address and the newly accepted sequence 1.
+	if r := got.Results[17]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 1 || r.Revision != 3 {
+		t.Fatalf("result 17 rotation should resume after b at c: %+v", r)
+	}
+	// 18: past the end the rotation wraps to the smallest healthy id.
+	if r := got.Results[18]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 1 || r.Revision != 3 {
+		t.Fatalf("result 18 rotation should wrap to a: %+v", r)
+	}
+
+	// The final list keeps the service at revision 3 with the instances sorted
+	// by id, all healthy at sequence 1 with no leftover reason — the pre-clear
+	// observations (including c's unhealthy record) did not come back, and the
+	// selections never rewrote any health record.
+	if len(got.Services) != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	svc := got.Services[0]
+	if svc.Service != "svc" || svc.Revision != 3 {
+		t.Fatalf("service view: %+v", svc)
+	}
+	wantInsts := []registerInstance{
+		{ID: "a", Address: "h1:1", Health: "healthy", Sequence: 1},
+		{ID: "b", Address: "h2:2", Health: "healthy", Sequence: 1},
+		{ID: "c", Address: "h3:3", Health: "healthy", Sequence: 1},
+	}
+	if len(svc.Instances) != len(wantInsts) {
+		t.Fatalf("instances: %+v", svc.Instances)
+	}
+	for i, want := range wantInsts {
+		if svc.Instances[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, svc.Instances[i], want)
+		}
+	}
+}
+
 // TestRejectedConflictReplacementKeepsRotationPosition isolates the rotation
 // guarantee at the batch level: the conflicting replacement is the very next
 // item after the first successful selection, so the following select must
