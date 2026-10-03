@@ -3,7 +3,11 @@
 // time-bucketed transaction statistics over the main chain.
 package indexroom
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+	"unicode/utf8"
+)
 
 // Block is one ingested block with its transactions.
 //
@@ -13,6 +17,13 @@ import "sync"
 // keep their own copy, so mutating the pointer or its target after a call
 // never affects the index. Block timestamps need not be monotonic: equal
 // values and values that decrease with height are both accepted.
+//
+// Hash, Parent, and every transaction identifier must be valid UTF-8:
+// Append and Reorg reject a block carrying invalid bytes (which JSON
+// snapshots could only store lossily, rewriting them to U+FFFD), naming the
+// block height and field and, for a transaction, its zero-based position.
+// Identifiers are otherwise stored verbatim: the empty string, duplicates,
+// surrounding whitespace, case, and a genuine U+FFFD are all kept as-is.
 type Block struct {
 	Height int64
 	Hash   string
@@ -42,7 +53,9 @@ func New() *Index {
 
 // Append accepts a block only when it extends the current tip, keeping the
 // chain linear. Re-submitting a block identical to one already on the main
-// chain is a successful no-op. A rejected append leaves the index untouched.
+// chain is a successful no-op. A rejected append — including a block whose
+// hash, parent, or any transaction identifier is not valid UTF-8 — leaves
+// the index untouched.
 func (index *Index) Append(block Block) error {
 	index.mu.Lock()
 	defer index.mu.Unlock()
@@ -55,6 +68,9 @@ func (index *Index) appendLocked(block Block) error {
 	}
 	if block.Time != nil && *block.Time < 0 {
 		return errInvalid("block time must not be negative")
+	}
+	if err := validateBlockStrings(block); err != nil {
+		return err
 	}
 	if index.Tip == 0 {
 		// Empty index: only the first block at height 1 is accepted; its
@@ -86,15 +102,27 @@ func (index *Index) appendLocked(block Block) error {
 
 // Reorg replaces the tip range with an alternate branch and reports the
 // dropped old heights in ascending order. The branch is validated in full
-// before anything is applied, so a rejected reorg leaves the index exactly
-// as it was. Heights whose old block is identical to the new one are not
-// reported; re-submitting the branch already in effect returns an empty list.
+// before anything is applied — including that every hash, parent, and
+// transaction identifier is valid UTF-8, even in the branch's last block —
+// so a rejected reorg reports no dropped heights and leaves the index
+// exactly as it was. Heights whose old block is identical to the new one
+// are not reported; re-submitting the branch already in effect returns an
+// empty list.
 func (index *Index) Reorg(blocks []Block) ([]int64, error) {
 	index.mu.Lock()
 	defer index.mu.Unlock()
 
 	if len(blocks) == 0 {
 		return nil, errInvalid("empty branch")
+	}
+	// Encoding is validated before anything else, including the ancestor
+	// lookup: the first block's parent need not be indexed, but it still must
+	// be valid UTF-8, and a bad identifier anywhere in the branch rejects the
+	// whole operation before the old branch is touched.
+	for _, block := range blocks {
+		if err := validateBlockStrings(block); err != nil {
+			return nil, err
+		}
 	}
 	ancestor, ok := index.ByHash[blocks[0].Parent]
 	if !ok {
@@ -188,6 +216,29 @@ func sameBlock(a, b Block) bool {
 		return false
 	}
 	return a.Time == nil || *a.Time == *b.Time
+}
+
+// validateBlockStrings checks every identifier carried by a submitted
+// block: hash, parent, and each transaction identifier. The JSON snapshot
+// export can only store valid UTF-8; invalid bytes would otherwise be
+// silently rewritten to U+FFFD, merging distinct identifiers and breaking
+// exact-match queries after a restore. Such a block is rejected at submit
+// time instead. The error names the block's height and the offending field;
+// a transaction identifier also names its zero-based position. A genuine
+// U+FFFD is valid UTF-8 and passes.
+func validateBlockStrings(block Block) error {
+	if !utf8.ValidString(block.Hash) {
+		return errInvalid(fmt.Sprintf("block at height %d: field %q has invalid UTF-8", block.Height, "hash"))
+	}
+	if !utf8.ValidString(block.Parent) {
+		return errInvalid(fmt.Sprintf("block at height %d: field %q has invalid UTF-8", block.Height, "parent"))
+	}
+	for i, tx := range block.Txs {
+		if !utf8.ValidString(tx) {
+			return errInvalid(fmt.Sprintf("block at height %d: field %q element %d has invalid UTF-8", block.Height, "txs", i))
+		}
+	}
+	return nil
 }
 
 type errInvalid string
