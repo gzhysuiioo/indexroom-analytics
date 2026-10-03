@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -968,5 +969,109 @@ func TestSelectDeterministic(t *testing.T) {
 	out2, _ := runRegisterWith(t, input)
 	if out1 != out2 {
 		t.Fatalf("non-deterministic output:\n%s\nvs\n%s", out1, out2)
+	}
+}
+
+func TestRejectedReplacementsKeepAcceptedStateForSelection(t *testing.T) {
+	// A service with two healthy instances completes one selection (cursor on
+	// a). Two replacement attempts are then rejected, each carrying a list that
+	// differs from the current one and changes an existing instance's address,
+	// so any leakage would be observable in the following selection and the
+	// final list:
+	//   - valid front instances followed by an invalid later address (and a
+	//     wrong revision): field validation wins, so the whole item is invalid
+	//     and even the valid front part must not take effect;
+	//   - a fully valid list with a mismatched expectedRevision: conflict.
+	// Neither failure may bump the revision, alter the list, addresses, health
+	// states or accepted sequences, reset a healthy instance to unknown, or
+	// move the rotation position. The later selection at the current revision
+	// must continue the rotation (b, not a again) using the old addresses.
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":22,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":99,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"not-an-address"}]},
+		{"type":"register","service":"svc","expectedRevision":99,"instances":[{"id":"a","address":"hA:9"},{"id":"b","address":"hB:9"}]},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+
+	// Failed items keep their slots and order: the later successful selections
+	// do not cancel the failures recorded before them.
+	if len(got.Results) != 8 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	if r := got.Results[0]; !r.OK || !r.Changed || r.Revision != 1 {
+		t.Fatalf("create: %+v", r)
+	}
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 11 || r.Revision != 1 {
+		t.Fatalf("first select takes the smallest healthy id: %+v", r)
+	}
+
+	// Invalid item: the bad later address makes the whole registration invalid
+	// even though earlier instances are valid and even though the revision is
+	// also wrong (field validation precedes the revision check).
+	r := got.Results[4]
+	if r.OK || r.Error != "invalid" || r.Revision != 1 ||
+		r.ExpectedRevision != 0 || r.ActualRevision != 0 {
+		t.Fatalf("invalid later address should fail the whole item as invalid: %+v", r)
+	}
+	if !strings.Contains(r.Reason, "not-an-address") {
+		t.Fatalf("invalid reason should name the offending address, got %q", r.Reason)
+	}
+
+	// Conflict item: content is valid, only the revision mismatches. It names
+	// both revisions and reports the current one; the changed-address list must
+	// not have been applied.
+	r = got.Results[5]
+	if r.OK || r.Error != "conflict" || r.ExpectedRevision != 99 || r.ActualRevision != 1 || r.Revision != 1 {
+		t.Fatalf("mismatched revision should conflict at the current revision: %+v", r)
+	}
+	if !strings.Contains(r.Reason, "revision 1") || !strings.Contains(r.Reason, "99") {
+		t.Fatalf("conflict reason should state expected and actual revision, got %q", r.Reason)
+	}
+
+	// After both rejections the rotation continues from the previously accepted
+	// position (a) using the old addresses and accepted sequences: b next, then
+	// wrap to a — never the rejected hB:9/hA:9 addresses, and never a again
+	// immediately (which would mean the rejections reset the cursor).
+	if r := got.Results[6]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 22 || r.Revision != 1 {
+		t.Fatalf("select after rejections should continue at b with its old address: %+v", r)
+	}
+	if r := got.Results[7]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 11 || r.Revision != 1 {
+		t.Fatalf("rotation wraps back to a at its old address: %+v", r)
+	}
+
+	// The final service list reflects only the accepted registration and
+	// observations: revision 1, the two original instances still healthy at
+	// their original addresses and accepted sequences; neither the would-be
+	// third instance c nor the replacement addresses appear.
+	if len(got.Services) != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	svc := got.Services[0]
+	if svc.Service != "svc" || svc.Revision != 1 {
+		t.Fatalf("service must stay at revision 1: %+v", svc)
+	}
+	if len(svc.Instances) != 2 {
+		t.Fatalf("replacement lists must not leak into the final list: %+v", svc.Instances)
+	}
+	want := []registerInstance{
+		{ID: "a", Address: "h1:1", Health: "healthy", Sequence: 11},
+		{ID: "b", Address: "h2:2", Health: "healthy", Sequence: 22},
+	}
+	for i, w := range want {
+		if svc.Instances[i] != w {
+			t.Fatalf("instance %d: got %+v want %+v", i, svc.Instances[i], w)
+		}
 	}
 }

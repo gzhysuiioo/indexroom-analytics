@@ -753,6 +753,85 @@ func TestRegistrySelectIndependentPerService(t *testing.T) {
 	}
 }
 
+// TestRegistryRejectedReplacementsKeepSelectionState locks the rule that a
+// rejected replacement is observable as a no-op through later selections, not
+// merely through its error result: after one successful selection, an invalid
+// replacement (valid front instances, invalid later address) and a revision
+// conflict leave revision, list, addresses, health and sequences untouched and
+// do not move the rotation position, so the next selection continues with the
+// previously accepted instance set.
+func TestRegistryRejectedReplacementsKeepSelectionState(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"},
+	})
+	markHealth(t, r, "svc", "a", 1, 11, true, "")
+	markHealth(t, r, "svc", "b", 1, 22, true, "")
+
+	// One completed selection: the cursor rests on a.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" || out.Address != "h1:1" || out.Sequence != 11 {
+		t.Fatalf("first select: %+v", out)
+	}
+
+	// Invalid replacement: the front instances differ from the current list
+	// (new id c) and a later instance carries a bad address. The whole request
+	// fails validation, so even the valid front part must not be staged; the
+	// wrong revision must not be reported because field validation comes first.
+	if _, err := r.ValidateRegistration("svc", 99, []Instance{
+		{ID: "a", Address: "h1:1"},
+		{ID: "c", Address: "h3:3"},
+		{ID: "b", Address: "not-an-address"},
+	}); err == nil {
+		t.Fatalf("expected invalid later address to fail validation")
+	}
+
+	// Conflict replacement: fully valid content changing existing addresses,
+	// but the expected revision does not match.
+	reg, err := r.ValidateRegistration("svc", 99, []Instance{
+		{ID: "a", Address: "hA:9"}, {ID: "b", Address: "hB:9"},
+	})
+	if err != nil {
+		t.Fatalf("valid replacement rejected: %v", err)
+	}
+	out := r.Apply(reg)
+	if out.OK || out.Kind != OutcomeConflict || out.Expected != 99 || out.Actual != 1 || out.Revision != 1 {
+		t.Fatalf("replacement at wrong revision: %+v", out)
+	}
+
+	// Revision, list, addresses, health and sequences remain the accepted ones.
+	if rev := r.RevisionOf("svc"); rev != 1 {
+		t.Fatalf("revision changed after rejected replacements: %d", rev)
+	}
+	views := r.Snapshot()
+	if len(views) != 1 || views[0].Revision != 1 || len(views[0].Instances) != 2 {
+		t.Fatalf("list changed after rejected replacements: %+v", views)
+	}
+	if inst := instanceHealth(t, r, "svc", "a"); inst != (InstanceView{ID: "a", Address: "h1:1", Health: HealthHealthy, Sequence: 11}) {
+		t.Fatalf("a must keep accepted state: %+v", inst)
+	}
+	if inst := instanceHealth(t, r, "svc", "b"); inst != (InstanceView{ID: "b", Address: "h2:2", Health: HealthHealthy, Sequence: 22}) {
+		t.Fatalf("b must keep accepted state: %+v", inst)
+	}
+
+	// The rejected lists moved neither the cursor nor the candidate set: the
+	// rotation continues just after a and lands on b carrying its old address
+	// and accepted sequence, then wraps to a rather than repeating it.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "b" || out.Address != "h2:2" || out.Sequence != 22 {
+		t.Fatalf("selection after rejections should continue at b: %+v", out)
+	}
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" || out.Address != "h1:1" || out.Sequence != 11 {
+		t.Fatalf("rotation should wrap to a at its old address: %+v", out)
+	}
+
+	// A healthy instance must not fall back to unknown through a failed
+	// replacement that changed its address — the rejection leaves the old state.
+	for _, id := range []string{"a", "b"} {
+		if inst := instanceHealth(t, r, "svc", id); inst.Health != HealthHealthy {
+			t.Fatalf("instance %s regressed to %s after rejected replacement", id, inst.Health)
+		}
+	}
+}
+
 func TestRegistrySelectValidation(t *testing.T) {
 	r := NewRegistry()
 	if _, err := r.ValidateSelection("   ", 0); err == nil {
