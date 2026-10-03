@@ -87,6 +87,50 @@ type registerOutput struct {
 	Services []registerService `json:"services"`
 }
 
+// resultRecorder accumulates per-request results in input order and tracks
+// whether any request failed.
+type resultRecorder struct {
+	results   []registerResult
+	anyFailed bool
+}
+
+// success appends a successful result.
+func (rec *resultRecorder) success(result registerResult) {
+	result.OK = true
+	rec.results = append(rec.results, result)
+}
+
+// failure appends a failed result and marks the run as failed.
+func (rec *resultRecorder) failure(result registerResult) {
+	rec.anyFailed = true
+	rec.results = append(rec.results, result)
+}
+
+// invalid records an invalid-input failure for service at its current
+// revision in the registry.
+func (rec *resultRecorder) invalid(registry *indexroom.Registry, service, reason string) {
+	rec.failure(registerResult{
+		Service:  service,
+		Error:    "invalid",
+		Reason:   reason,
+		Revision: registry.RevisionOf(service),
+	})
+}
+
+// rejection builds the failure result for a business-rule rejection: the
+// outcome's kind and reason, plus the expected/actual revisions for
+// conflicts and the revision current when the item was processed.
+func rejection(service string, kind indexroom.OutcomeKind, reason string, expected, actual, revision int) registerResult {
+	return registerResult{
+		Service:          service,
+		Error:            string(kind),
+		Reason:           reason,
+		ExpectedRevision: expected,
+		ActualRevision:   actual,
+		Revision:         revision,
+	}
+}
+
 // runRegister processes registration requests from standard input.
 // It returns the process exit code: 0 when all registrations succeed, 1 otherwise.
 func runRegister() int {
@@ -110,8 +154,7 @@ func runRegister() int {
 	}
 
 	registry := indexroom.NewRegistry()
-	results := make([]registerResult, 0, len(rawRequests))
-	anyFailed := false
+	rec := &resultRecorder{results: make([]registerResult, 0, len(rawRequests))}
 
 	for _, raw := range rawRequests {
 		var head struct {
@@ -125,14 +168,7 @@ func runRegister() int {
 		if len(head.Type) > 0 && strings.TrimSpace(string(head.Type)) != "null" {
 			var t string
 			if err := json.Unmarshal(head.Type, &t); err != nil {
-				anyFailed = true
-				results = append(results, registerResult{
-					Service:  service,
-					OK:       false,
-					Error:    "invalid",
-					Reason:   "type must be a string",
-					Revision: registry.RevisionOf(service),
-				})
+				rec.invalid(registry, service, "type must be a string")
 				continue
 			}
 			reqType = t
@@ -140,20 +176,13 @@ func runRegister() int {
 
 		switch reqType {
 		case "", "register":
-			runRegisterRequest(raw, service, registry, &results, &anyFailed)
+			runRegisterRequest(raw, service, registry, rec)
 		case "health":
-			runHealthRequest(raw, service, registry, &results, &anyFailed)
+			runHealthRequest(raw, service, registry, rec)
 		case "select":
-			runSelectRequest(raw, service, registry, &results, &anyFailed)
+			runSelectRequest(raw, service, registry, rec)
 		default:
-			anyFailed = true
-			results = append(results, registerResult{
-				Service:  service,
-				OK:       false,
-				Error:    "invalid",
-				Reason:   fmt.Sprintf("unknown type %q", reqType),
-				Revision: registry.RevisionOf(service),
-			})
+			rec.invalid(registry, service, fmt.Sprintf("unknown type %q", reqType))
 		}
 	}
 
@@ -176,105 +205,60 @@ func runRegister() int {
 		})
 	}
 
-	writeRegisterOutput(registerOutput{Results: results, Services: services})
-	if anyFailed {
+	writeRegisterOutput(registerOutput{Results: rec.results, Services: services})
+	if rec.anyFailed {
 		return 1
 	}
 	return 0
 }
 
 // runRegisterRequest processes one register request, appending its outcome.
-func runRegisterRequest(raw json.RawMessage, service string, registry *indexroom.Registry, results *[]registerResult, anyFailed *bool) {
+func runRegisterRequest(raw json.RawMessage, service string, registry *indexroom.Registry, rec *resultRecorder) {
 	var req struct {
 		Service   string          `json:"service"`
 		Revision  *int64          `json:"expectedRevision"`
 		Instances json.RawMessage `json:"instances"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   fmt.Sprintf("request must be an object with service, expectedRevision and instances: %v", err),
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, fmt.Sprintf("request must be an object with service, expectedRevision and instances: %v", err))
 		return
 	}
 	service = strings.TrimSpace(req.Service)
 
 	if req.Revision == nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   "expectedRevision is required and must be a non-negative integer",
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, "expectedRevision is required and must be a non-negative integer")
 		return
 	}
 	if !isJSONArray(req.Instances) {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   "instances must be an array",
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, "instances must be an array")
 		return
 	}
 	var instances []indexroom.Instance
 	if err := json.Unmarshal(req.Instances, &instances); err != nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   fmt.Sprintf("instances must be an array of objects with id and address: %v", err),
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, fmt.Sprintf("instances must be an array of objects with id and address: %v", err))
 		return
 	}
 
 	registration, err := registry.ValidateRegistration(service, int(*req.Revision), instances)
 	if err != nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   err.Error(),
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, err.Error())
 		return
 	}
 
 	outcome := registry.Apply(registration)
 	if !outcome.OK {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:          outcome.Service,
-			OK:               false,
-			Error:            string(outcome.Kind),
-			Reason:           outcome.Reason,
-			ExpectedRevision: outcome.Expected,
-			ActualRevision:   outcome.Actual,
-			Revision:         outcome.Revision,
-		})
+		rec.failure(rejection(outcome.Service, outcome.Kind, outcome.Reason, outcome.Expected, outcome.Actual, outcome.Revision))
 		return
 	}
-	*results = append(*results, registerResult{
+	rec.success(registerResult{
 		Service:  outcome.Service,
-		OK:       true,
 		Changed:  outcome.Changed,
 		Revision: outcome.Revision,
 	})
 }
 
 // runHealthRequest processes one health observation request, appending its outcome.
-func runHealthRequest(raw json.RawMessage, service string, registry *indexroom.Registry, results *[]registerResult, anyFailed *bool) {
+func runHealthRequest(raw json.RawMessage, service string, registry *indexroom.Registry, rec *resultRecorder) {
 	var req struct {
 		Service    string  `json:"service"`
 		InstanceID string  `json:"instanceId"`
@@ -284,49 +268,21 @@ func runHealthRequest(raw json.RawMessage, service string, registry *indexroom.R
 		Reason     *string `json:"reason"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   fmt.Sprintf("health request must be an object with service, instanceId, expectedRevision, sequence and healthy: %v", err),
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, fmt.Sprintf("health request must be an object with service, instanceId, expectedRevision, sequence and healthy: %v", err))
 		return
 	}
 	service = strings.TrimSpace(req.Service)
 
 	if req.Revision == nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   "expectedRevision is required and must be a non-negative integer",
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, "expectedRevision is required and must be a non-negative integer")
 		return
 	}
 	if req.Sequence == nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   "sequence is required and must be a positive integer",
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, "sequence is required and must be a positive integer")
 		return
 	}
 	if req.Healthy == nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   "healthy is required and must be a boolean",
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, "healthy is required and must be a boolean")
 		return
 	}
 	reason := ""
@@ -336,35 +292,19 @@ func runHealthRequest(raw json.RawMessage, service string, registry *indexroom.R
 
 	update, err := registry.ValidateHealth(service, req.InstanceID, int(*req.Revision), *req.Sequence, *req.Healthy, reason)
 	if err != nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   err.Error(),
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, err.Error())
 		return
 	}
 
 	outcome := registry.ApplyHealth(update)
 	if !outcome.OK {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:          outcome.Service,
-			OK:               false,
-			Error:            string(outcome.Kind),
-			Reason:           outcome.Reason,
-			ExpectedRevision: outcome.Expected,
-			ActualRevision:   outcome.Actual,
-			Revision:         outcome.Revision,
-			Sequence:         outcome.Sequence,
-		})
+		result := rejection(outcome.Service, outcome.Kind, outcome.Reason, outcome.Expected, outcome.Actual, outcome.Revision)
+		result.Sequence = outcome.Sequence
+		rec.failure(result)
 		return
 	}
-	*results = append(*results, registerResult{
+	rec.success(registerResult{
 		Service:  outcome.Service,
-		OK:       true,
 		Changed:  outcome.Changed,
 		Revision: outcome.Revision,
 		Sequence: outcome.Sequence,
@@ -374,66 +314,35 @@ func runHealthRequest(raw json.RawMessage, service string, registry *indexroom.R
 // runSelectRequest processes one select request, appending its outcome.
 // A selection performs no network access and never alters registrations or
 // health records; it only advances the service's healthy-instance rotation.
-func runSelectRequest(raw json.RawMessage, service string, registry *indexroom.Registry, results *[]registerResult, anyFailed *bool) {
+func runSelectRequest(raw json.RawMessage, service string, registry *indexroom.Registry, rec *resultRecorder) {
 	var req struct {
 		Service  string `json:"service"`
 		Revision *int64 `json:"expectedRevision"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   fmt.Sprintf("select request must be an object with service and expectedRevision: %v", err),
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, fmt.Sprintf("select request must be an object with service and expectedRevision: %v", err))
 		return
 	}
 	service = strings.TrimSpace(req.Service)
 
 	if req.Revision == nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   "expectedRevision is required and must be a non-negative integer",
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, "expectedRevision is required and must be a non-negative integer")
 		return
 	}
 
 	selection, err := registry.ValidateSelection(service, int(*req.Revision))
 	if err != nil {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:  service,
-			OK:       false,
-			Error:    "invalid",
-			Reason:   err.Error(),
-			Revision: registry.RevisionOf(service),
-		})
+		rec.invalid(registry, service, err.Error())
 		return
 	}
 
 	outcome := registry.Select(selection)
 	if !outcome.OK {
-		*anyFailed = true
-		*results = append(*results, registerResult{
-			Service:          outcome.Service,
-			OK:               false,
-			Error:            string(outcome.Kind),
-			Reason:           outcome.Reason,
-			ExpectedRevision: outcome.Expected,
-			ActualRevision:   outcome.Actual,
-			Revision:         outcome.Revision,
-		})
+		rec.failure(rejection(outcome.Service, outcome.Kind, outcome.Reason, outcome.Expected, outcome.Actual, outcome.Revision))
 		return
 	}
-	*results = append(*results, registerResult{
+	rec.success(registerResult{
 		Service:    outcome.Service,
-		OK:         true,
 		Revision:   outcome.Revision,
 		InstanceID: outcome.InstanceID,
 		Address:    outcome.Address,
