@@ -766,3 +766,118 @@ func TestRegistrySelectValidation(t *testing.T) {
 		t.Fatalf("trim/valid: %+v err=%v", sel, err)
 	}
 }
+
+func TestRegistryRejectedHealthReportsDoNotAffectSelection(t *testing.T) {
+	// A stale report and a same-sequence conflicting report interleaved with
+	// selections must leave both the eligible set and the rotation cursor on
+	// the previously accepted records. Both rejection directions are covered:
+	// healthy instances keep their eligibility under rejected "unhealthy"
+	// reports, and an unhealthy instance keeps its exclusion under a rejected
+	// "healthy" report.
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}, {ID: "c", Address: "h3:3"},
+	})
+	markHealth(t, r, "svc", "a", 1, 10, true, "")
+	markHealth(t, r, "svc", "b", 1, 20, true, "")
+	markHealth(t, r, "svc", "c", 1, 30, false, "c down")
+
+	// First success takes the smallest healthy id and rests the cursor on a.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" || out.Sequence != 10 {
+		t.Fatalf("first select: %+v", out)
+	}
+
+	rejectHealth := func(id string, seq int64, healthy bool, reason string, want OutcomeKind) {
+		t.Helper()
+		upd, err := r.ValidateHealth("svc", id, 1, seq, healthy, reason)
+		if err != nil {
+			t.Fatalf("validate health %s: %v", id, err)
+		}
+		out := r.ApplyHealth(upd)
+		if out.OK || out.Kind != want {
+			t.Fatalf("health %s: want %s, got %+v", id, want, out)
+		}
+	}
+
+	// Stale takedown of the healthy last-chosen instance reports its accepted
+	// sequence; the following selection still continues just after a at b.
+	rejectHealth("a", 9, false, "stale takedown", OutcomeStale)
+	if out := selected(t, r, "svc", 1); out.InstanceID != "b" || out.Address != "h2:2" || out.Sequence != 20 {
+		t.Fatalf("select after stale takedown: %+v", out)
+	}
+	if inst := instanceHealth(t, r, "svc", "a"); inst.Health != HealthHealthy || inst.Sequence != 10 || inst.Reason != "" {
+		t.Fatalf("a mutated by stale report: %+v", inst)
+	}
+
+	// Same-sequence opposite status on b conflicts and must not take it out; the
+	// rotation wraps past b back to a.
+	rejectHealth("b", 20, false, "conflict takedown", OutcomeConflict)
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" || out.Address != "h1:1" || out.Sequence != 10 {
+		t.Fatalf("select after conflicting takedown: %+v", out)
+	}
+	if inst := instanceHealth(t, r, "svc", "b"); inst.Health != HealthHealthy || inst.Sequence != 20 || inst.Reason != "" {
+		t.Fatalf("b mutated by conflicting report: %+v", inst)
+	}
+
+	// A stale recovery of the unhealthy instance must not make it eligible; the
+	// next id after a is still b, never c.
+	rejectHealth("c", 25, true, "", OutcomeStale)
+	if out := selected(t, r, "svc", 1); out.InstanceID != "b" || out.Address != "h2:2" || out.Sequence != 20 {
+		t.Fatalf("select after stale recovery: %+v", out)
+	}
+	if inst := instanceHealth(t, r, "svc", "c"); inst.Health != HealthUnhealthy || inst.Sequence != 30 || inst.Reason != "c down" {
+		t.Fatalf("c mutated by stale recovery: %+v", inst)
+	}
+}
+
+func TestRegistryRejectedRecoveryKeepsNoHealthyThenUsesNewRecord(t *testing.T) {
+	// When no instance is healthy, rejected recovery reports must keep yielding
+	// no_healthy without advancing the cursor. A later accepted higher sequence
+	// is the first thing that restores eligibility, and selection then uses the
+	// new record rather than the rejected one.
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+	markHealth(t, r, "svc", "a", 1, 1, true, "")
+	markHealth(t, r, "svc", "b", 1, 2, false, "down")
+
+	// The cursor rests on a before the only healthy instance goes down.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" {
+		t.Fatalf("select before outage: %+v", out)
+	}
+	markHealth(t, r, "svc", "a", 1, 3, false, "takedown")
+
+	assertNoHealthy := func(stage string) {
+		t.Helper()
+		sel, _ := r.ValidateSelection("svc", 1)
+		out := r.Select(sel)
+		if out.OK || out.Kind != OutcomeNoHealthy || out.InstanceID != "" || out.Address != "" {
+			t.Fatalf("%s: %+v", stage, out)
+		}
+	}
+	assertNoHealthy("after takedown")
+
+	// Stale recovery (2 < 3) and a same-sequence conflict on b change nothing.
+	upd, _ := r.ValidateHealth("svc", "a", 1, 2, true, "")
+	if out := r.ApplyHealth(upd); out.OK || out.Kind != OutcomeStale || out.Sequence != 3 {
+		t.Fatalf("stale recovery: %+v", out)
+	}
+	assertNoHealthy("after stale recovery")
+	upd, _ = r.ValidateHealth("svc", "b", 1, 2, true, "")
+	if out := r.ApplyHealth(upd); out.OK || out.Kind != OutcomeConflict || out.Sequence != 2 {
+		t.Fatalf("conflicting recovery: %+v", out)
+	}
+	assertNoHealthy("after conflicting recovery")
+
+	// A higher accepted sequence restores a; selection carries the new record.
+	markHealth(t, r, "svc", "a", 1, 4, true, "")
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" || out.Address != "h1:1" || out.Sequence != 4 {
+		t.Fatalf("selection should use the newly accepted record: %+v", out)
+	}
+
+	// b's recovery at a higher sequence joins in id order; the cursor resumes
+	// after a rather than restarting at the smallest id.
+	markHealth(t, r, "svc", "b", 1, 5, true, "")
+	if out := selected(t, r, "svc", 1); out.InstanceID != "b" || out.Address != "h2:2" || out.Sequence != 5 {
+		t.Fatalf("rotation should resume after a at b: %+v", out)
+	}
+}

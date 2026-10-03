@@ -776,3 +776,183 @@ func TestSelectDeterministic(t *testing.T) {
 		t.Fatalf("non-deterministic output:\n%s\nvs\n%s", out1, out2)
 	}
 }
+
+func TestRejectedHealthReportsDoNotAffectSelection(t *testing.T) {
+	// Stale and same-sequence-conflicting health reports alternate with selects
+	// in one batch. Each rejection must only produce a failed result: the
+	// accepted health records, the candidate set and the rotation position all
+	// stay exactly as committed earlier. Both directions are covered: a healthy
+	// instance's rejected "unhealthy" report must not remove it, and an
+	// unhealthy instance's rejected "healthy" report must not restore it.
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":10,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":20,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":30,"healthy":false,"reason":"c down"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":9,"healthy":false,"reason":"stale takedown"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":20,"healthy":false,"reason":"conflict takedown"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":25,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	// Successful later selects do not clear the batch failure status.
+	if code != 1 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	// One result per input item, in order: failures keep their slot and later
+	// items are still processed.
+	if len(got.Results) != 11 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// First success takes the smallest healthy id.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 10 {
+		t.Fatalf("first select: %+v", r)
+	}
+	// A stale report on the healthy last-chosen instance: stale states the
+	// reason, the current accepted sequence and the preserved revision.
+	if r := got.Results[5]; r.OK || r.Error != "stale" || r.Reason == "" || r.Sequence != 10 || r.Revision != 1 {
+		t.Fatalf("stale takedown of a: %+v", r)
+	}
+	// Rotation continues just after a at b; the rejected takedown neither
+	// removed a nor advanced/reset the cursor.
+	if r := got.Results[6]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 20 {
+		t.Fatalf("select after stale report: %+v", r)
+	}
+	// Same sequence with the opposite status is a conflict, again naming the
+	// current accepted sequence and keeping the revision; a matching revision
+	// carries no expected/actual revision pair.
+	if r := got.Results[7]; r.OK || r.Error != "conflict" || r.Reason == "" || r.Sequence != 20 || r.Revision != 1 || r.ExpectedRevision != 0 || r.ActualRevision != 0 {
+		t.Fatalf("conflicting takedown of b: %+v", r)
+	}
+	// b stays eligible, so the rotation wraps past it back to a carrying its
+	// accepted address and sequence 10 (never the rejected sequence 9).
+	if r := got.Results[8]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 10 {
+		t.Fatalf("select after conflict should wrap to a: %+v", r)
+	}
+	// The unhealthy instance's stale "healthy" report must not restore it; the
+	// rejection reports the accepted sequence 30.
+	if r := got.Results[9]; r.OK || r.Error != "stale" || r.Reason == "" || r.Sequence != 30 || r.Revision != 1 {
+		t.Fatalf("stale recovery of c: %+v", r)
+	}
+	// c is still excluded, so the rotation continues after a at b.
+	if r := got.Results[10]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 20 {
+		t.Fatalf("unhealthy c must not regain eligibility: %+v", r)
+	}
+	// The final service list shows only the accepted records: no rejected
+	// status, sequence or reason has leaked in.
+	if len(got.Services) != 1 || got.Services[0].Service != "svc" || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 3 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	if insts[0].ID != "a" || insts[0].Health != "healthy" || insts[0].Sequence != 10 || insts[0].Reason != "" {
+		t.Fatalf("a must keep its accepted healthy record: %+v", insts[0])
+	}
+	if insts[1].ID != "b" || insts[1].Health != "healthy" || insts[1].Sequence != 20 || insts[1].Reason != "" {
+		t.Fatalf("b must keep its accepted healthy record: %+v", insts[1])
+	}
+	if insts[2].ID != "c" || insts[2].Health != "unhealthy" || insts[2].Sequence != 30 || insts[2].Reason != "c down" {
+		t.Fatalf("c must keep its accepted unhealthy record: %+v", insts[2])
+	}
+}
+
+func TestRejectedRecoveryKeepsNoHealthyAndCursor(t *testing.T) {
+	// With no healthy instance, stale and conflicting "healthy" reports aimed
+	// at restoring an instance must keep failing selection as no_healthy and
+	// must fabricate neither a target nor an address. Only a later, higher and
+	// accepted sequence changes eligibility; the cursor then resumes from where
+	// the earlier successful selection left it and uses the new record rather
+	// than the rejected one.
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":3,"healthy":false,"reason":"takedown"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":2,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":4,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":5,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 14 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// The last successful selection before the outage rests on a.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 1 {
+		t.Fatalf("select before takedown: %+v", r)
+	}
+	// Accepted takedown at sequence 3 leaves no healthy instance.
+	if r := got.Results[4]; !r.OK || !r.Changed || r.Sequence != 3 {
+		t.Fatalf("takedown: %+v", r)
+	}
+	// no_healthy states reason and revision and gives no target or address.
+	if r := got.Results[5]; r.OK || r.Error != "no_healthy" || r.Reason == "" || r.Revision != 1 || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("no healthy after takedown: %+v", r)
+	}
+	// Stale recovery (2 < 3): rejected with the current accepted sequence.
+	if r := got.Results[6]; r.OK || r.Error != "stale" || r.Reason == "" || r.Sequence != 3 || r.Revision != 1 {
+		t.Fatalf("stale recovery of a: %+v", r)
+	}
+	if r := got.Results[7]; r.OK || r.Error != "no_healthy" || r.Revision != 1 || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("a must not recover from a stale report: %+v", r)
+	}
+	// Same-sequence opposite status on the unhealthy instance: conflict.
+	if r := got.Results[8]; r.OK || r.Error != "conflict" || r.Reason == "" || r.Sequence != 2 || r.Revision != 1 {
+		t.Fatalf("conflicting recovery of b: %+v", r)
+	}
+	if r := got.Results[9]; r.OK || r.Error != "no_healthy" || r.Revision != 1 || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("b must not recover from a conflicting report: %+v", r)
+	}
+	// A higher accepted sequence restores a.
+	if r := got.Results[10]; !r.OK || !r.Changed || r.Sequence != 4 {
+		t.Fatalf("accepted recovery of a: %+v", r)
+	}
+	// The failed selections and rejected reports never moved the cursor, and the
+	// only healthy instance is a; it is picked with the new accepted sequence.
+	if r := got.Results[11]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 4 {
+		t.Fatalf("selection after recovery must use the new record: %+v", r)
+	}
+	if r := got.Results[12]; !r.OK || !r.Changed || r.Sequence != 5 {
+		t.Fatalf("accepted recovery of b: %+v", r)
+	}
+	// Rotation continues just after a at b rather than restarting.
+	if r := got.Results[13]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 5 {
+		t.Fatalf("rotation should resume after a at b: %+v", r)
+	}
+	// Final list holds only accepted records and reasons.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 2 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	if insts[0].ID != "a" || insts[0].Health != "healthy" || insts[0].Sequence != 4 || insts[0].Reason != "" {
+		t.Fatalf("a final record: %+v", insts[0])
+	}
+	if insts[1].ID != "b" || insts[1].Health != "healthy" || insts[1].Sequence != 5 || insts[1].Reason != "" {
+		t.Fatalf("b final record: %+v", insts[1])
+	}
+}
