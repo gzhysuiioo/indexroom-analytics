@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"unicode/utf8"
 )
 
 // ErrInvalidSnapshot marks a rejected snapshot document: malformed or
@@ -14,9 +15,11 @@ import (
 // missing, mistyped, unknown, or duplicated fields, a null where version,
 // tip, height, hash, parent, or a transaction identifier is required,
 // heights that do not ascend consecutively from 1, an empty or duplicated
-// hash, a broken parent link, a version-2 timestamp that is missing or
-// neither null nor a non-negative integer, or a tip that disagrees with the
-// block list. A rejected restore never changes the index.
+// hash, a broken parent link, a hash, parent, or transaction identifier
+// carrying invalid UTF-8 or an unpaired surrogate escape, a version-2
+// timestamp that is missing or neither null nor a non-negative integer, or a
+// tip that disagrees with the block list. A rejected restore never changes
+// the index.
 var ErrInvalidSnapshot = errors.New("indexroom: invalid snapshot")
 
 const (
@@ -415,10 +418,10 @@ func finishSnapshotBlock(fields map[string]json.RawMessage) (Block, error) {
 	if block.Height, err = snapshotInt64(fields["height"], "height"); err != nil {
 		return block, err
 	}
-	if block.Hash, err = snapshotString(fields["hash"], "hash"); err != nil {
+	if block.Hash, err = snapshotString(fields["hash"], "hash", block.Height); err != nil {
 		return block, err
 	}
-	if block.Parent, err = snapshotString(fields["parent"], "parent"); err != nil {
+	if block.Parent, err = snapshotString(fields["parent"], "parent", block.Height); err != nil {
 		return block, err
 	}
 	txs, err := parseSnapshotTxs(json.NewDecoder(bytes.NewReader(fields["txs"])), block.Height)
@@ -443,8 +446,11 @@ func snapshotInt64(raw json.RawMessage, field string) (int64, error) {
 }
 
 // snapshotString decodes one required string field, rejecting null rather
-// than letting it pass as the empty string.
-func snapshotString(raw json.RawMessage, field string) (string, error) {
+// than letting it pass as the empty string, and rejecting invalid UTF-8 and
+// unpaired surrogate escapes rather than letting the decoder silently
+// rewrite them as U+FFFD. Hash, parent, and transaction identifiers take
+// part in exact matching, so a rewrite could merge distinct identifiers.
+func snapshotString(raw json.RawMessage, field string, height int64) (string, error) {
 	if isSnapshotNull(raw) {
 		return "", invalidSnapshot("field %q must not be null", field)
 	}
@@ -452,7 +458,83 @@ func snapshotString(raw json.RawMessage, field string) (string, error) {
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return "", classifySnapshotErr(fmt.Errorf("field %q: %w", field, err))
 	}
+	if !validSnapshotString(raw) {
+		return "", invalidSnapshot("block at height %d: field %q contains invalid UTF-8 or an unpaired surrogate escape", height, field)
+	}
 	return s, nil
+}
+
+// validSnapshotString reports whether a raw JSON string literal decodes
+// exactly as written: every byte sequence is valid UTF-8 and every \u escape
+// naming a surrogate is one half of a properly ordered high-low pair. The
+// decoder has already accepted the literal, so escape syntax itself is not
+// rechecked; anything unexpected is treated as valid here and reported by
+// the decoder's own error path. A literal U+FFFD encoded directly is valid —
+// only content the decoder would have to rewrite is rejected.
+func validSnapshotString(raw json.RawMessage) bool {
+	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		return true // not a string literal; the type error is reported elsewhere
+	}
+	inner := raw[1 : len(raw)-1]
+	for i := 0; i < len(inner); {
+		switch c := inner[i]; {
+		case c == '\\':
+			if i+1 >= len(inner) || inner[i+1] != 'u' {
+				i += 2
+				continue
+			}
+			if i+6 > len(inner) {
+				return true
+			}
+			r1, ok := snapshotHex(inner[i+2 : i+6])
+			if !ok {
+				return true
+			}
+			switch {
+			case r1 >= 0xD800 && r1 <= 0xDBFF:
+				// A high surrogate must be immediately followed by a low
+				// surrogate escape.
+				if i+12 <= len(inner) && inner[i+6] == '\\' && inner[i+7] == 'u' {
+					if r2, ok := snapshotHex(inner[i+8 : i+12]); ok && r2 >= 0xDC00 && r2 <= 0xDFFF {
+						i += 12
+						continue
+					}
+				}
+				return false
+			case r1 >= 0xDC00 && r1 <= 0xDFFF:
+				return false
+			}
+			i += 6
+		case c < utf8.RuneSelf:
+			i++
+		default:
+			r, size := utf8.DecodeRune(inner[i:])
+			if r == utf8.RuneError && size == 1 {
+				return false
+			}
+			i += size
+		}
+	}
+	return true
+}
+
+// snapshotHex parses exactly four hexadecimal digits.
+func snapshotHex(b []byte) (rune, bool) {
+	var v rune
+	for _, c := range b {
+		v <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			v |= rune(c - '0')
+		case c >= 'a' && c <= 'f':
+			v |= rune(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			v |= rune(c-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return v, true
 }
 
 // isSnapshotNull reports whether a raw field value is the JSON null literal.
@@ -476,7 +558,8 @@ func parseSnapshotTimestamp(raw json.RawMessage) (*int64, error) {
 
 // parseSnapshotTxs reads one txs array, preserving duplicates and empty
 // identifiers exactly as written. A null element is rejected, naming the
-// block's height and the element's zero-based position.
+// block's height and the element's zero-based position, and so is an
+// element whose string encoding the decoder would have to rewrite.
 func parseSnapshotTxs(dec *json.Decoder, height int64) ([]string, error) {
 	tok, err := dec.Token()
 	if err != nil {
@@ -487,14 +570,22 @@ func parseSnapshotTxs(dec *json.Decoder, height int64) ([]string, error) {
 	}
 	txs := []string{}
 	for dec.More() {
-		var tx *string
-		if err := dec.Decode(&tx); err != nil {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
 			return nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err))
 		}
-		if tx == nil {
-			return nil, invalidSnapshot("block at height %d: txs element %d must not be null", height, len(txs))
+		pos := len(txs)
+		if isSnapshotNull(raw) {
+			return nil, invalidSnapshot("block at height %d: txs element %d must not be null", height, pos)
 		}
-		txs = append(txs, *tx)
+		var tx string
+		if err := json.Unmarshal(raw, &tx); err != nil {
+			return nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err))
+		}
+		if !validSnapshotString(raw) {
+			return nil, invalidSnapshot("block at height %d: txs element %d contains invalid UTF-8 or an unpaired surrogate escape", height, pos)
+		}
+		txs = append(txs, tx)
 	}
 	if _, err := dec.Token(); err != nil { // closing ']'
 		return nil, classifySnapshotErr(err)
