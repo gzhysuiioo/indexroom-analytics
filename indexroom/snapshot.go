@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"unicode/utf8"
 )
 
@@ -31,36 +32,27 @@ const (
 	snapshotVersion2 = 2
 )
 
-// snapshotDoc is the version-1 wire form of an exported main chain.
+// snapshotDoc is the wire form of an exported main chain. Both layout
+// versions share one shape: Version selects whether every block carries its
+// Timestamp field.
 type snapshotDoc struct {
 	Version int64           `json:"version"`
 	Tip     int64           `json:"tip"`
 	Blocks  []snapshotBlock `json:"blocks"`
 }
 
-// snapshotBlock is the version-1 wire form of one block.
+// snapshotBlock is the wire form of one block, shared by both versions.
+// Height, hash, parent, and the transaction list follow the same rules in
+// either layout. The timestamp is version 2 only and carried as a raw
+// literal: nil is omitted altogether (version 1), "null" marks a missing
+// time, and integer bytes render the Unix-seconds value (version 2). It
+// stays the final field in every layout.
 type snapshotBlock struct {
-	Height int64    `json:"height"`
-	Hash   string   `json:"hash"`
-	Parent string   `json:"parent"`
-	Txs    []string `json:"txs"`
-}
-
-// snapshotDocV2 is the timestamp-bearing wire form.
-type snapshotDocV2 struct {
-	Version int64             `json:"version"`
-	Tip     int64             `json:"tip"`
-	Blocks  []snapshotBlockV2 `json:"blocks"`
-}
-
-// snapshotBlockV2 is the version-2 wire form of one block. A nil Timestamp
-// serializes as null.
-type snapshotBlockV2 struct {
-	Height    int64    `json:"height"`
-	Hash      string   `json:"hash"`
-	Parent    string   `json:"parent"`
-	Txs       []string `json:"txs"`
-	Timestamp *int64   `json:"timestamp"`
+	Height    int64           `json:"height"`
+	Hash      string          `json:"hash"`
+	Parent    string          `json:"parent"`
+	Txs       []string        `json:"txs"`
+	Timestamp json.RawMessage `json:"timestamp,omitempty"`
 }
 
 // Export writes the current main chain to w as a JSON snapshot: a single
@@ -80,60 +72,8 @@ type snapshotBlockV2 struct {
 // and appends proceed while the stream is still being written. A write
 // failure is reported and leaves the index untouched.
 func (index *Index) Export(w io.Writer) error {
-	index.mu.Lock()
-	version := int64(snapshotVersion1)
-	for height := int64(1); height <= index.Tip; height++ {
-		if index.Blocks[height].Time != nil {
-			version = snapshotVersion2
-			break
-		}
-	}
-	var raw []byte
-	var err error
-	if version == snapshotVersion1 {
-		doc := snapshotDoc{
-			Version: snapshotVersion1,
-			Tip:     index.Tip,
-			Blocks:  make([]snapshotBlock, 0, int(index.Tip)),
-		}
-		for height := int64(1); height <= index.Tip; height++ {
-			block := index.Blocks[height]
-			txs := make([]string, len(block.Txs))
-			copy(txs, block.Txs)
-			doc.Blocks = append(doc.Blocks, snapshotBlock{
-				Height: block.Height,
-				Hash:   block.Hash,
-				Parent: block.Parent,
-				Txs:    txs,
-			})
-		}
-		index.mu.Unlock()
-		raw, err = json.Marshal(doc)
-	} else {
-		doc := snapshotDocV2{
-			Version: snapshotVersion2,
-			Tip:     index.Tip,
-			Blocks:  make([]snapshotBlockV2, 0, int(index.Tip)),
-		}
-		for height := int64(1); height <= index.Tip; height++ {
-			block := index.Blocks[height]
-			txs := make([]string, len(block.Txs))
-			copy(txs, block.Txs)
-			entry := snapshotBlockV2{
-				Height: block.Height,
-				Hash:   block.Hash,
-				Parent: block.Parent,
-				Txs:    txs,
-			}
-			if block.Time != nil {
-				t := *block.Time
-				entry.Timestamp = &t
-			}
-			doc.Blocks = append(doc.Blocks, entry)
-		}
-		index.mu.Unlock()
-		raw, err = json.Marshal(doc)
-	}
+	doc := index.snapshotChain()
+	raw, err := json.Marshal(doc)
 	if err != nil {
 		panic(err) // snapshot docs only contain marshalable fields
 	}
@@ -145,6 +85,65 @@ func (index *Index) Export(w io.Writer) error {
 		return fmt.Errorf("indexroom: export snapshot: %w", io.ErrShortWrite)
 	}
 	return nil
+}
+
+// snapshotChain copies the current main chain into the export wire
+// form: blocks by ascending height, each with its transactions copied in
+// original order. This is the single place that turns stored blocks into the
+// shared document fields, so both layout versions keep identical rules for
+// height, hash, parent, and the transaction list; the only version-dependent
+// field is the timestamp literal.
+//
+// The version is selected from the same chain copy. Any block carrying a
+// timestamp — even a zero — makes the document version 2, after which every
+// block gets a timestamp field, null where its time is missing; a chain
+// whose blocks all lack times stays version 1 with no timestamp field.
+func (index *Index) snapshotChain() snapshotDoc {
+	index.mu.Lock()
+	defer index.mu.Unlock()
+	version := int64(snapshotVersion1)
+	for height := int64(1); height <= index.Tip; height++ {
+		if index.Blocks[height].Time != nil {
+			version = snapshotVersion2
+			break
+		}
+	}
+	doc := snapshotDoc{
+		Version: version,
+		Tip:     index.Tip,
+		Blocks:  make([]snapshotBlock, 0, int(index.Tip)),
+	}
+	for height := int64(1); height <= index.Tip; height++ {
+		block := index.Blocks[height]
+		txs := make([]string, len(block.Txs))
+		copy(txs, block.Txs)
+		entry := snapshotBlock{
+			Height: block.Height,
+			Hash:   block.Hash,
+			Parent: block.Parent,
+			Txs:    txs,
+		}
+		if version == snapshotVersion2 {
+			entry.Timestamp = snapshotTimestampLiteral(block.Time)
+		}
+		doc.Blocks = append(doc.Blocks, entry)
+	}
+	return doc
+}
+
+// snapshotMissingTimestamp is the raw JSON literal written for a block whose
+// time is missing in a version-2 document.
+var snapshotMissingTimestamp = json.RawMessage("null")
+
+// snapshotTimestampLiteral renders a stored block time as its version-2
+// timestamp literal: null for a missing time, otherwise its non-negative
+// Unix-seconds value as a bare integer. Stored times are guaranteed
+// non-negative by Append, Reorg, and Restore validation.
+func snapshotTimestampLiteral(time *int64) json.RawMessage {
+	if time == nil {
+		return snapshotMissingTimestamp
+	}
+	return json.RawMessage(strconv.AppendInt(nil, *time, 10))
 }
 
 // Restore replaces the whole main chain with the snapshot read from r. The
