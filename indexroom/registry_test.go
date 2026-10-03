@@ -766,3 +766,103 @@ func TestRegistrySelectValidation(t *testing.T) {
 		t.Fatalf("trim/valid: %+v err=%v", sel, err)
 	}
 }
+
+// TestRegistryEmptyListTakesPartInRevisionGate pins the shared revision rule:
+// a registered service whose instance list is empty still participates at its
+// real revision. It must not be treated as an unknown (revision 0) service, and
+// the gate's verdict must stay distinct from each operation's own result.
+func TestRegistryEmptyListTakesPartInRevisionGate(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h:1"}})
+	registerService(t, r, "svc", 1, nil) // replaces with an empty list, revision 2
+
+	// Health at an outdated revision conflicts at the real revision, even though
+	// the service currently has no instance the request could match.
+	upd, _ := r.ValidateHealth("svc", "a", 1, 9, true, "")
+	out := r.ApplyHealth(upd)
+	if out.OK || out.Kind != OutcomeConflict || out.Expected != 1 || out.Actual != 2 || out.Revision != 2 {
+		t.Fatalf("health outdated revision on empty service: %+v", out)
+	}
+
+	// Matching revision reaches health's own rule: the instance is not found.
+	upd, _ = r.ValidateHealth("svc", "a", 2, 9, true, "")
+	out = r.ApplyHealth(upd)
+	if out.OK || out.Kind != OutcomeNotFound || out.Revision != 2 {
+		t.Fatalf("health matching revision on empty service: %+v", out)
+	}
+
+	// Select at an outdated revision conflicts before the no_healthy rule.
+	sel, _ := r.ValidateSelection("svc", 1)
+	sout := r.Select(sel)
+	if sout.OK || sout.Kind != OutcomeConflict || sout.Expected != 1 || sout.Actual != 2 || sout.Revision != 2 {
+		t.Fatalf("select outdated revision on empty service: %+v", sout)
+	}
+
+	// Matching revision reaches select's own rule: the present-but-empty service
+	// has no healthy instance.
+	sel, _ = r.ValidateSelection("svc", 2)
+	sout = r.Select(sel)
+	if sout.OK || sout.Kind != OutcomeNoHealthy || sout.Revision != 2 {
+		t.Fatalf("select matching revision on empty service: %+v", sout)
+	}
+}
+
+// TestRegistryHealthRevisionConflictPrecedesBusinessRules pins gate precedence:
+// a revision mismatch is reported as conflict regardless of a missing instance
+// or a newer/larger sequence, and neither observation nor rotation moves.
+func TestRegistryHealthRevisionConflictPrecedesBusinessRules(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h:1"}})
+
+	upd, _ := r.ValidateHealth("svc", "ghost", 2, 999, true, "")
+	out := r.ApplyHealth(upd)
+	if out.OK || out.Kind != OutcomeConflict || out.Expected != 2 || out.Actual != 1 || out.Revision != 1 {
+		t.Fatalf("missing instance must not mask the revision conflict: %+v", out)
+	}
+	if out.Sequence != 0 || out.InstanceID != "" {
+		t.Fatalf("conflict must not borrow business fields: %+v", out)
+	}
+
+	// Unknown service, non-zero expected revision: conflict at revision 0 even
+	// though the instance cannot exist either.
+	upd, _ = r.ValidateHealth("other", "ghost", 4, 999, true, "")
+	out = r.ApplyHealth(upd)
+	if out.OK || out.Kind != OutcomeConflict || out.Expected != 4 || out.Actual != 0 || out.Revision != 0 {
+		t.Fatalf("unknown service wrong revision: %+v", out)
+	}
+
+	// No observation landed for either request.
+	if views := r.Snapshot(); len(views) != 1 || views[0].Revision != 1 || len(views[0].Instances) != 1 {
+		t.Fatalf("state changed after revision conflicts: %+v", views)
+	}
+	if inst := instanceHealth(t, r, "svc", "a"); inst.Health != HealthUnknown || inst.Sequence != 0 {
+		t.Fatalf("existing instance touched by rejected report: %+v", inst)
+	}
+}
+
+// TestRegistrySharedValidationOrderAndPrecedence pins the shared field checks
+// extracted for health and select: per-field order is preserved and invalid
+// fields win over any revision or service-presence judgment.
+func TestRegistrySharedValidationOrderAndPrecedence(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h:1"}})
+
+	// Health keeps checking the instance id before expectedRevision.
+	if _, err := r.ValidateHealth("svc", "  ", -1, 1, true, ""); err == nil || err.Error() != "instance id must not be empty" {
+		t.Fatalf("health field order: %v", err)
+	}
+	// Invalid fields report invalid even against an existing service whose
+	// current revision differs, and even when the service is unknown.
+	if _, err := r.ValidateHealth("svc", "a", -7, 1, true, ""); err == nil || err.Error() != "expectedRevision must be a non-negative integer" {
+		t.Fatalf("health negative revision against existing service: %v", err)
+	}
+	if _, err := r.ValidateHealth("   ", "a", 5, 1, true, ""); err == nil || err.Error() != "service name must not be empty" {
+		t.Fatalf("health empty service: %v", err)
+	}
+	if _, err := r.ValidateSelection("svc", -7); err == nil || err.Error() != "expectedRevision must be a non-negative integer" {
+		t.Fatalf("select negative revision against existing service: %v", err)
+	}
+	if _, err := r.ValidateSelection("   ", 5); err == nil || err.Error() != "service name must not be empty" {
+		t.Fatalf("select empty service: %v", err)
+	}
+}
