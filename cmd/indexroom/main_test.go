@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -968,5 +969,214 @@ func TestSelectDeterministic(t *testing.T) {
 	out2, _ := runRegisterWith(t, input)
 	if out1 != out2 {
 		t.Fatalf("non-deterministic output:\n%s\nvs\n%s", out1, out2)
+	}
+}
+
+// TestRejectedReplacementKeepsAcceptedStateAndRotation is the regression guard
+// for replacement requests against an existing service whose rotation is
+// already in use: a rejected register must not partially replace instances,
+// reset accepted health, consume a revision or move the selection position, and
+// later selects in the same batch must keep using the previously accepted
+// state. Two rejection conditions are exercised:
+//
+//   - a list with a valid prefix that changes an existing address followed by an
+//     invalid instance address is invalid as a whole (field validation precedes
+//     the revision check, so a simultaneously wrong expectedRevision still
+//     reports invalid), and the valid prefix must not take effect;
+//   - a fully valid list with a mismatched expectedRevision is a conflict
+//     naming both revisions; no part of the replacement is applied.
+func TestRejectedReplacementKeepsAcceptedStateAndRotation(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"h1:8080"},{"id":"i2","address":"h2:8080"}]},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":22,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":9,"instances":[{"id":"i1","address":"h9:8080"},{"id":"i2","address":"bad-address"}]},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":5,"instances":[{"id":"i1","address":"hx:8080"},{"id":"i2","address":"h2:8080"}]},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains failures, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	// The failed items keep their slots, in input order, with the later
+	// successful selects still present; a later success does not cancel the
+	// earlier failures.
+	if len(got.Results) != 8 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 0: accepted registration at revision 1.
+	if r := got.Results[0]; !r.OK || !r.Changed || r.Revision != 1 {
+		t.Fatalf("result 0: %+v", r)
+	}
+	// 1-2: both offline health observations accepted without a revision bump.
+	if r := got.Results[1]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 11 {
+		t.Fatalf("result 1: %+v", r)
+	}
+	if r := got.Results[2]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 22 {
+		t.Fatalf("result 2: %+v", r)
+	}
+	// 3: first selection takes the smallest healthy id, cursor rests on i1.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:8080" || r.Sequence != 11 || r.Revision != 1 {
+		t.Fatalf("result 3: %+v", r)
+	}
+	// 4: the later instance address is invalid. The whole item is invalid even
+	// though expectedRevision 9 is also wrong, because field validation precedes
+	// the revision check; the reason names the bad address and no revision
+	// comparison is reported. The valid prefix (i1's new address) must not be
+	// applied either.
+	if r := got.Results[4]; r.OK || r.Error != "invalid" || r.Revision != 1 ||
+		r.ExpectedRevision != 0 || r.ActualRevision != 0 ||
+		r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("result 4 invalid rejection: %+v", r)
+	}
+	if !strings.Contains(got.Results[4].Reason, `instance address "bad-address" is not a host:port address`) {
+		t.Fatalf("result 4 reason should name the bad address, got %q", got.Results[4].Reason)
+	}
+	// 5: selection after the invalid replacement continues just after i1 and
+	// lands on i2 using its ORIGINAL address and accepted sequence, proving the
+	// rejected list neither reset i2 to unknown nor advanced the cursor.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "i2" || r.Address != "h2:8080" || r.Sequence != 22 || r.Revision != 1 {
+		t.Fatalf("result 5: %+v", r)
+	}
+	// 6: the list itself is valid, only expectedRevision mismatches: conflict
+	// states the expected and current revisions; no new address is accepted.
+	if r := got.Results[6]; r.OK || r.Error != "conflict" ||
+		r.Reason != `service "svc" is at revision 1, not 5` ||
+		r.Revision != 1 || r.ExpectedRevision != 5 || r.ActualRevision != 1 {
+		t.Fatalf("result 6 conflict: %+v", r)
+	}
+	// 7: past the end the rotation wraps to the smallest healthy id, returning
+	// i1's ORIGINAL address h1:8080 and sequence 11 — not the rejected hx:8080,
+	// and not i2 again, which would mean the failed conflict reset the cursor.
+	if r := got.Results[7]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:8080" || r.Sequence != 11 || r.Revision != 1 {
+		t.Fatalf("result 7: %+v", r)
+	}
+
+	// The final service list reflects only accepted registrations and
+	// observations: revision unchanged at 1, both original addresses, both
+	// instances still healthy with their accepted sequences, and neither
+	// rejected address present anywhere.
+	if len(got.Services) != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	svc := got.Services[0]
+	if svc.Service != "svc" || svc.Revision != 1 {
+		t.Fatalf("service view: %+v", svc)
+	}
+	if len(svc.Instances) != 2 {
+		t.Fatalf("instances: %+v", svc.Instances)
+	}
+	wantInsts := []registerInstance{
+		{ID: "i1", Address: "h1:8080", Health: "healthy", Sequence: 11},
+		{ID: "i2", Address: "h2:8080", Health: "healthy", Sequence: 22},
+	}
+	for i, want := range wantInsts {
+		if svc.Instances[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, svc.Instances[i], want)
+		}
+	}
+}
+
+// TestRejectedConflictReplacementKeepsRotationPosition isolates the rotation
+// guarantee at the batch level: the conflicting replacement is the very next
+// item after the first successful selection, so the following select must
+// continue at the next healthy id (i2). A failure path that reset the rotation
+// would select i1 again instead. The conflicting list is otherwise valid and
+// changes i1's address, which also must not take effect.
+func TestRejectedConflictReplacementKeepsRotationPosition(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"h1:8080"},{"id":"i2","address":"h2:8080"}]},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":22,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":7,"instances":[{"id":"i1","address":"hx:8080"},{"id":"i2","address":"h2:8080"}]},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains a failure, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 6 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	if r := got.Results[3]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:8080" || r.Sequence != 11 {
+		t.Fatalf("first select: %+v", r)
+	}
+	if r := got.Results[4]; r.OK || r.Error != "conflict" ||
+		r.Revision != 1 || r.ExpectedRevision != 7 || r.ActualRevision != 1 {
+		t.Fatalf("conflicting replacement: %+v", r)
+	}
+	// The conflict left the cursor just after i1: i2 is next, not i1 again.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "i2" || r.Address != "h2:8080" || r.Sequence != 22 || r.Revision != 1 {
+		t.Fatalf("select after conflict must continue at i2 with its original state: %+v", r)
+	}
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	if insts := got.Services[0].Instances; len(insts) != 2 ||
+		insts[0].ID != "i1" || insts[0].Address != "h1:8080" || insts[0].Health != "healthy" || insts[0].Sequence != 11 ||
+		insts[1].ID != "i2" || insts[1].Address != "h2:8080" || insts[1].Health != "healthy" || insts[1].Sequence != 22 {
+		t.Fatalf("final list must keep only accepted state: %+v", insts)
+	}
+}
+
+// TestRejectedInvalidReplacementKeepsRotationPosition is the invalid-content
+// counterpart: the malformed replacement follows the first successful
+// selection immediately, so the next select must still move to i2 rather than
+// repeating i1, and the valid prefix changing i1's address must not apply.
+func TestRejectedInvalidReplacementKeepsRotationPosition(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"h1:8080"},{"id":"i2","address":"h2:8080"}]},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":22,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":7,"instances":[{"id":"i1","address":"h9:8080"},{"id":"i2","address":"bad-address"}]},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains a failure, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 6 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	if r := got.Results[3]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:8080" || r.Sequence != 11 {
+		t.Fatalf("first select: %+v", r)
+	}
+	// Wrong revision AND invalid content: invalid wins; the reason is the
+	// address problem, with no expected/actual revision comparison reported.
+	if r := got.Results[4]; r.OK || r.Error != "invalid" || r.Revision != 1 ||
+		r.ExpectedRevision != 0 || r.ActualRevision != 0 {
+		t.Fatalf("invalid replacement: %+v", r)
+	}
+	if !strings.Contains(got.Results[4].Reason, `instance address "bad-address" is not a host:port address`) {
+		t.Fatalf("invalid reason should name the bad address, got %q", got.Results[4].Reason)
+	}
+	// i1's valid-prefix new address and any cursor reset must both be absent:
+	// the rotation continues at i2 with its original address and sequence.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "i2" || r.Address != "h2:8080" || r.Sequence != 22 || r.Revision != 1 {
+		t.Fatalf("select after invalid replacement must continue at i2 with its original state: %+v", r)
+	}
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	if insts := got.Services[0].Instances; len(insts) != 2 ||
+		insts[0].ID != "i1" || insts[0].Address != "h1:8080" || insts[0].Health != "healthy" || insts[0].Sequence != 11 ||
+		insts[1].ID != "i2" || insts[1].Address != "h2:8080" || insts[1].Health != "healthy" || insts[1].Sequence != 22 {
+		t.Fatalf("final list must keep only accepted state: %+v", insts)
 	}
 }

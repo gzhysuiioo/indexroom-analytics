@@ -1,6 +1,9 @@
 package indexroom
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func validInstances() []Instance {
 	return []Instance{
@@ -861,5 +864,122 @@ func TestSharedRevisionGateValidationPrecedesRevision(t *testing.T) {
 	}
 	if _, err := r.ValidateSelection("missing", -1); err == nil {
 		t.Fatalf("negative revision select should be invalid")
+	}
+}
+
+// assertAcceptedServiceState locks the state established before the rejected
+// replacements: revision 1, original addresses, accepted healthy observations.
+func assertAcceptedServiceState(t *testing.T, r *Registry) {
+	t.Helper()
+	if rev := r.RevisionOf("svc"); rev != 1 {
+		t.Fatalf("revision should stay 1 after the rejected replacement, got %d", rev)
+	}
+	views := r.Snapshot()
+	if len(views) != 1 || views[0].Service != "svc" || views[0].Revision != 1 {
+		t.Fatalf("service view mutated: %+v", views)
+	}
+	if inst := instanceHealth(t, r, "svc", "a"); inst.Address != "h1:1" ||
+		inst.Health != HealthHealthy || inst.Sequence != 11 || inst.Reason != "" {
+		t.Fatalf("a must keep its original address and accepted healthy record: %+v", inst)
+	}
+	if inst := instanceHealth(t, r, "svc", "b"); inst.Address != "h2:2" ||
+		inst.Health != HealthHealthy || inst.Sequence != 22 || inst.Reason != "" {
+		t.Fatalf("b must keep its original address and accepted healthy record: %+v", inst)
+	}
+}
+
+// TestRegistryInvalidReplacementKeepsAcceptedStateAndCursor covers the invalid
+// rejection condition: a list whose prefix is valid (and changes an existing
+// instance's address) but whose later instance has an invalid address is
+// rejected as a whole. Field validation precedes the revision comparison, so a
+// simultaneously wrong expectedRevision still reports invalid and Apply is
+// never reached; neither the valid prefix nor any reset to unknown may leak
+// through, the revision is not consumed and the rotation position survives.
+func TestRegistryInvalidReplacementKeepsAcceptedStateAndCursor(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+	markHealth(t, r, "svc", "a", 1, 11, true, "")
+	markHealth(t, r, "svc", "b", 1, 22, true, "")
+	// One successful selection lands the cursor on a.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" || out.Address != "h1:1" || out.Sequence != 11 {
+		t.Fatalf("first select: %+v", out)
+	}
+
+	// Valid prefix that would move a to a new address, invalid address later;
+	// expectedRevision 9 is also wrong but must not downgrade the answer to a
+	// conflict.
+	reg, err := r.ValidateRegistration("svc", 9, []Instance{
+		{ID: "a", Address: "h9:9"},
+		{ID: "b", Address: "bad-address"},
+	})
+	if err == nil {
+		t.Fatalf("expected an invalid-address error, got registration %+v", reg)
+	}
+	if msg := err.Error(); !strings.Contains(msg, `instance address "bad-address" is not a host:port address`) {
+		t.Fatalf("error should name the invalid address, got %q", msg)
+	}
+	if reg.Service != "" || reg.Revision != 0 || reg.Instances != nil {
+		t.Fatalf("failed validation must not return a partial registration: %+v", reg)
+	}
+
+	// Nothing was applied: revision, original addresses, health and sequences
+	// are all the accepted ones; the rejected new address is absent.
+	assertAcceptedServiceState(t, r)
+
+	// The cursor did not move: the rotation continues just after a and returns
+	// b's original address and accepted sequence instead of repeating a.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "b" || out.Address != "h2:2" || out.Sequence != 22 || out.Revision != 1 {
+		t.Fatalf("select after invalid replacement should resume at b with its original state: %+v", out)
+	}
+	// Past the end the rotation wraps; the rejected new address must never be
+	// selectable even though it sat in the valid prefix.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" || out.Address != "h1:1" || out.Sequence != 11 {
+		t.Fatalf("wrapped select should use a's original address, got %+v", out)
+	}
+}
+
+// TestRegistryConflictReplacementKeepsAcceptedStateAndCursor covers the
+// conflict rejection condition: a fully valid replacement list that changes an
+// existing address but carries an expectedRevision other than the current one
+// is reported as conflict with both revisions and changes nothing — no revision
+// bump, no address change, no health reset, no cursor movement.
+func TestRegistryConflictReplacementKeepsAcceptedStateAndCursor(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+	markHealth(t, r, "svc", "a", 1, 11, true, "")
+	markHealth(t, r, "svc", "b", 1, 22, true, "")
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" || out.Address != "h1:1" || out.Sequence != 11 {
+		t.Fatalf("first select: %+v", out)
+	}
+
+	// Entire list parses; only expectedRevision 5 mismatches the current 1.
+	reg, err := r.ValidateRegistration("svc", 5, []Instance{
+		{ID: "a", Address: "hx:8080"},
+		{ID: "b", Address: "h2:2"},
+	})
+	if err != nil {
+		t.Fatalf("content should be valid, got %v", err)
+	}
+	out := r.Apply(reg)
+	if out.OK || out.Kind != OutcomeConflict || out.Changed ||
+		out.Expected != 5 || out.Actual != 1 || out.Revision != 1 {
+		t.Fatalf("replacement should conflict without changing state: %+v", out)
+	}
+	if msg := out.Reason; !strings.Contains(msg, "revision 1, not 5") {
+		t.Fatalf("conflict reason should state both revisions, got %q", msg)
+	}
+
+	// The valid-but-conflicting replacement left no trace: a is still at its
+	// original address, healthy at the accepted sequence 11.
+	assertAcceptedServiceState(t, r)
+
+	// The completed selection's position is untouched: the next healthy target
+	// in rotation is b, then the wrap returns a's original address — never the
+	// rejected hx:8080 and never a repeated a.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "b" || out.Address != "h2:2" || out.Sequence != 22 || out.Revision != 1 {
+		t.Fatalf("select after conflict should resume at b with its original state: %+v", out)
+	}
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" || out.Address != "h1:1" || out.Sequence != 11 || out.Revision != 1 {
+		t.Fatalf("wrapped select should use a's original address, got %+v", out)
 	}
 }
