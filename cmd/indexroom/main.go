@@ -47,6 +47,9 @@ func usage() {
 	fmt.Println("select request chooses one healthy instance, rotating per service by ascending")
 	fmt.Println("instance id; it performs no network access and never changes revisions or")
 	fmt.Println("health records, and reports invalid/conflict/not_found/no_healthy on failure.")
+	fmt.Println("A select request may carry an optional \"sessionKey\" string: requests in the")
+	fmt.Println("same service with the same trimmed key reuse the instance first chosen for")
+	fmt.Println("that key while it stays registered and healthy, without moving the rotation.")
 	fmt.Println("Exit status is 0 only when every request succeeds.")
 }
 
@@ -325,11 +328,13 @@ func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 
 // selectRequest processes one select request, appending its outcome.
 // A selection performs no network access and never alters registrations or
-// health records; it only advances the service's healthy-instance rotation.
+// health records; it only advances the service's healthy-instance rotation
+// and, for requests carrying a sessionKey, maintains that session's binding.
 func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 	var req struct {
-		Service  string `json:"service"`
-		Revision *int64 `json:"expectedRevision"`
+		Service  string          `json:"service"`
+		Revision *int64          `json:"expectedRevision"`
+		Session  json.RawMessage `json:"sessionKey"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		p.invalidf(service, "select request must be an object with service and expectedRevision: %v", err)
@@ -342,7 +347,25 @@ func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 		return
 	}
 
-	selection, err := p.registry.ValidateSelection(service, int(*req.Revision))
+	// sessionKey is optional: absent means an ordinary rotating selection. An
+	// explicitly provided null, a non-string value or a blank string is
+	// invalid; the registry trims the key and treats keys equal after trimming
+	// as the same session.
+	var sessionKey *string
+	if len(req.Session) > 0 {
+		if strings.TrimSpace(string(req.Session)) == "null" {
+			p.invalid(service, "sessionKey must be a string, not null")
+			return
+		}
+		var key string
+		if err := json.Unmarshal(req.Session, &key); err != nil {
+			p.invalid(service, "sessionKey must be a string")
+			return
+		}
+		sessionKey = &key
+	}
+
+	selection, err := p.registry.ValidateSelectionWithSession(service, int(*req.Revision), sessionKey)
 	if err != nil {
 		p.invalid(service, err.Error())
 		return

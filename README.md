@@ -63,6 +63,18 @@ matching revision is `not_found`, and a service with no healthy instance is
 `no_healthy`. Every failure states the reason and current revision and leaves
 the rotation position intact.
 
+A `select` request may carry an optional `sessionKey` string to pin the
+request to a per-service session. The key's first successful selection rotates
+normally and remembers the chosen instance; later requests with the same key
+reuse that instance — its current address and latest accepted health
+`sequence` — while it stays registered and healthy, without moving the
+rotation. If the bound instance was removed or is currently `unknown` or
+`unhealthy`, the request falls back to the normal rotation and rebinds only on
+success. Keys are trimmed before use (keys equal after trimming share one
+session), bindings are independent per service, and an explicit `null`, a
+non-string or a blank-after-trim key is `invalid` with a reason naming the
+`sessionKey` problem. Failed selections never create or rewrite a binding.
+
 ## 离线健康上报（`health` 请求）中文说明
 
 `health` 请求在 `register` 命令的同一批 `requests` 中记录一条离线健康观察，不做任何网络探测。规则如下：
@@ -123,6 +135,16 @@ echo '{"requests":[
 6. 目标选择使用已接受的恢复结果，选中 `i1`，返回其地址和最新健康序号 11。
 
 末尾的 `services` 列表显示每个实例的最终健康状态和最新序号（`i1` 为 `healthy`、序号 11、无原因）。本批次含有失败项（第 4 项），进程退出状态为 1，但后续成功项仍然生效；只有全部请求成功时退出状态才为 0。
+
+## 会话保持（`select` 请求的 `sessionKey`）中文说明
+
+`select` 请求可以携带可选的字符串 `sessionKey`，把请求绑定到该服务下的一个会话：
+
+- 会话键第一次成功选择时按当时的轮询位置选出健康实例并记住绑定，轮询位置照常推进；之后复用绑定时直接返回该实例当前的地址和最新已接受的健康序号，**不推进**轮询位置。因此带会话键和不带会话键的请求交错时，普通选择仍从最近一次实际轮询选中的实例之后继续。
+- 绑定按服务独立：不同服务使用相同会话键互不影响；未提供 `sessionKey` 的请求继续按原有规则轮询。
+- 判断绑定是否可用以本次选择处理时的状态为准：绑定的实例已被删除，或当前健康状态为 `unknown`/`unhealthy` 时，本次按轮询规则重新选择，仅在成功时替换绑定；实例曾经不健康但在本次请求前已恢复的，可以继续复用。同一实例标识更换地址后健康记录会重置，必须先按既有规则重新上报健康，才能返回当前地址。
+- 会话键先去除两端空白，整理后相同的键视为同一会话；显式提供 `null`、非字符串或纯空白字符串时返回 `invalid`，原因中指明 `sessionKey` 问题。字段检查仍先于修订号判断。
+- 失败项（`invalid`、`conflict`、`not_found`、`no_healthy`）不创建或改写绑定，也不移动轮询位置；批次中后续请求照常处理。会话选择不改变注册修订号或健康记录。
 
 ## 技术方向
 

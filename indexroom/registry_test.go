@@ -983,3 +983,260 @@ func TestRegistryConflictReplacementKeepsAcceptedStateAndCursor(t *testing.T) {
 		t.Fatalf("wrapped select should use a's original address, got %+v", out)
 	}
 }
+
+// selectedWithSession runs one successful select carrying a session key.
+func selectedWithSession(t *testing.T, r *Registry, service string, revision int, key string) SelectOutcome {
+	t.Helper()
+	sel, err := r.ValidateSelectionWithSession(service, revision, &key)
+	if err != nil {
+		t.Fatalf("validate select %s key %q: %v", service, key, err)
+	}
+	out := r.Select(sel)
+	if !out.OK {
+		t.Fatalf("select %s key %q: %+v", service, key, out)
+	}
+	return out
+}
+
+func TestRegistrySelectSessionStickyAndCursor(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}, {ID: "c", Address: "h3:3"},
+	})
+	markHealth(t, r, "svc", "a", 1, 1, true, "")
+	markHealth(t, r, "svc", "b", 1, 2, true, "")
+	markHealth(t, r, "svc", "c", 1, 3, true, "")
+
+	// First use of the key rotates like a plain selection: smallest id, and
+	// the cursor advances to a.
+	if out := selectedWithSession(t, r, "svc", 1, "s1"); out.InstanceID != "a" || out.Sequence != 1 {
+		t.Fatalf("first session select: %+v", out)
+	}
+	// Reuse returns the bound instance without moving the cursor.
+	if out := selectedWithSession(t, r, "svc", 1, "s1"); out.InstanceID != "a" {
+		t.Fatalf("session reuse: %+v", out)
+	}
+	// A plain selection continues just after a, proving the reuse above did
+	// not advance the rotation.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "b" {
+		t.Fatalf("plain select after reuse: %+v", out)
+	}
+	// The session is still bound to a.
+	if out := selectedWithSession(t, r, "svc", 1, "s1"); out.InstanceID != "a" {
+		t.Fatalf("session reuse after plain select: %+v", out)
+	}
+	// The next plain selection continues after b.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "c" {
+		t.Fatalf("plain select should continue after b: %+v", out)
+	}
+}
+
+func TestRegistrySelectSessionReflectsLatestSequence(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+	markHealth(t, r, "svc", "a", 1, 1, true, "")
+	markHealth(t, r, "svc", "b", 1, 1, true, "")
+
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "a" || out.Sequence != 1 {
+		t.Fatalf("bind: %+v", out)
+	}
+	// A newer accepted observation on the bound instance is reflected by the
+	// next reuse, address and sequence both current.
+	markHealth(t, r, "svc", "a", 1, 7, true, "")
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "a" || out.Address != "h1:1" || out.Sequence != 7 {
+		t.Fatalf("reuse should carry the latest accepted sequence: %+v", out)
+	}
+}
+
+func TestRegistrySelectSessionFallbackOnUnhealthy(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+	markHealth(t, r, "svc", "a", 1, 1, true, "")
+	markHealth(t, r, "svc", "b", 1, 1, true, "")
+
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "a" {
+		t.Fatalf("bind: %+v", out)
+	}
+	// The bound instance turns unhealthy: the session falls back to the
+	// rotation (continuing after a) and rebinds to the newly chosen instance.
+	markHealth(t, r, "svc", "a", 1, 2, false, "down")
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "b" || out.Sequence != 1 {
+		t.Fatalf("fallback select: %+v", out)
+	}
+	// a recovers before the next request, but the binding moved to b.
+	markHealth(t, r, "svc", "a", 1, 3, true, "")
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "b" {
+		t.Fatalf("binding should have moved to b: %+v", out)
+	}
+}
+
+func TestRegistrySelectSessionReuseAfterRecovery(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+	markHealth(t, r, "svc", "a", 1, 1, true, "")
+	markHealth(t, r, "svc", "b", 1, 1, true, "")
+
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "a" {
+		t.Fatalf("bind: %+v", out)
+	}
+	// a flaps unhealthy and recovers before the next session request: the
+	// binding is judged at selection time, so it is still reused.
+	markHealth(t, r, "svc", "a", 1, 2, false, "down")
+	markHealth(t, r, "svc", "a", 1, 3, true, "")
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "a" || out.Sequence != 3 {
+		t.Fatalf("recovered binding should be reused: %+v", out)
+	}
+}
+
+func TestRegistrySelectSessionFallbackOnRemoval(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+	markHealth(t, r, "svc", "a", 1, 1, true, "")
+	markHealth(t, r, "svc", "b", 1, 1, true, "")
+
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "a" {
+		t.Fatalf("bind: %+v", out)
+	}
+	// The bound instance is removed from the list: fall back to the rotation.
+	registerService(t, r, "svc", 1, []Instance{{ID: "b", Address: "h2:2"}})
+	if out := selectedWithSession(t, r, "svc", 2, "s"); out.InstanceID != "b" {
+		t.Fatalf("fallback after removal: %+v", out)
+	}
+	// Re-adding a does not steal the binding back.
+	registerService(t, r, "svc", 2, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+	markHealth(t, r, "svc", "a", 3, 1, true, "")
+	if out := selectedWithSession(t, r, "svc", 3, "s"); out.InstanceID != "b" {
+		t.Fatalf("binding should stay on b: %+v", out)
+	}
+}
+
+func TestRegistrySelectSessionAddressChangeResetsBinding(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+	markHealth(t, r, "svc", "a", 1, 5, true, "")
+	markHealth(t, r, "svc", "b", 1, 1, true, "")
+
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "a" {
+		t.Fatalf("bind: %+v", out)
+	}
+	// a keeps its id but moves to a new address: its health resets to unknown,
+	// so the session must not reuse the old address's health record and falls
+	// back to the rotation, rebinding to b.
+	registerService(t, r, "svc", 1, []Instance{{ID: "a", Address: "h9:9"}, {ID: "b", Address: "h2:2"}})
+	if out := selectedWithSession(t, r, "svc", 2, "s"); out.InstanceID != "b" || out.Address != "h2:2" {
+		t.Fatalf("address change must not reuse old health: %+v", out)
+	}
+	// Only after a fresh observation at the new address is a eligible again;
+	// the binding stays on b regardless.
+	markHealth(t, r, "svc", "a", 2, 1, true, "")
+	if out := selectedWithSession(t, r, "svc", 2, "s"); out.InstanceID != "b" {
+		t.Fatalf("binding should stay on b: %+v", out)
+	}
+}
+
+func TestRegistrySelectSessionPerServiceBindings(t *testing.T) {
+	r := NewRegistry()
+	for _, svc := range []string{"s1", "s2"} {
+		registerService(t, r, svc, 0, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+		markHealth(t, r, svc, "a", 1, 1, true, "")
+		markHealth(t, r, svc, "b", 1, 1, true, "")
+	}
+	// The same key binds independently per service.
+	if out := selectedWithSession(t, r, "s1", 1, "k"); out.InstanceID != "a" {
+		t.Fatalf("s1 bind: %+v", out)
+	}
+	if out := selectedWithSession(t, r, "s2", 1, "k"); out.InstanceID != "a" {
+		t.Fatalf("s2 bind: %+v", out)
+	}
+	// Move s2's rotation with a plain select; s1's binding is unaffected.
+	if out := selected(t, r, "s2", 1); out.InstanceID != "b" {
+		t.Fatalf("s2 plain select: %+v", out)
+	}
+	if out := selectedWithSession(t, r, "s1", 1, "k"); out.InstanceID != "a" {
+		t.Fatalf("s1 reuse: %+v", out)
+	}
+	if out := selectedWithSession(t, r, "s2", 1, "k"); out.InstanceID != "a" {
+		t.Fatalf("s2 reuse: %+v", out)
+	}
+}
+
+func TestRegistrySelectSessionFailuresKeepBindingAndCursor(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+	markHealth(t, r, "svc", "a", 1, 1, true, "")
+	markHealth(t, r, "svc", "b", 1, 1, true, "")
+
+	// A conflicting session select creates no binding and moves no cursor.
+	sel, err := r.ValidateSelectionWithSession("svc", 9, strPtr("s"))
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if out := r.Select(sel); out.OK || out.Kind != OutcomeConflict {
+		t.Fatalf("conflict select: %+v", out)
+	}
+	// The first successful select (plain) still takes the smallest id.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" {
+		t.Fatalf("plain select after conflict: %+v", out)
+	}
+	// The key was never bound: its first success rotates after a to b.
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "b" {
+		t.Fatalf("first session success should rotate to b: %+v", out)
+	}
+
+	// no_healthy with a key neither rewrites the binding nor moves the cursor.
+	markHealth(t, r, "svc", "a", 1, 2, false, "down")
+	markHealth(t, r, "svc", "b", 1, 2, false, "down")
+	sel, err = r.ValidateSelectionWithSession("svc", 1, strPtr("s"))
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if out := r.Select(sel); out.OK || out.Kind != OutcomeNoHealthy {
+		t.Fatalf("no_healthy select: %+v", out)
+	}
+	// b recovers: the binding survived the failed request and is reused.
+	markHealth(t, r, "svc", "b", 1, 3, true, "")
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "b" || out.Sequence != 3 {
+		t.Fatalf("binding should survive no_healthy: %+v", out)
+	}
+}
+
+func TestRegistrySelectSessionKeyValidation(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}})
+	markHealth(t, r, "svc", "a", 1, 1, true, "")
+	markHealth(t, r, "svc", "b", 1, 1, true, "")
+
+	// Keys are trimmed; keys equal after trimming share one session.
+	if out := selectedWithSession(t, r, "svc", 1, "  k  "); out.InstanceID != "a" {
+		t.Fatalf("bind with padded key: %+v", out)
+	}
+	if out := selectedWithSession(t, r, "svc", 1, "k"); out.InstanceID != "a" {
+		t.Fatalf("trimmed key should reuse the same session: %+v", out)
+	}
+
+	// A blank-after-trim key is invalid and must not reach the registry.
+	if _, err := r.ValidateSelectionWithSession("svc", 1, strPtr("   ")); err == nil {
+		t.Fatalf("blank session key should be invalid")
+	}
+	if _, err := r.ValidateSelectionWithSession("svc", 1, strPtr("")); err == nil {
+		t.Fatalf("empty session key should be invalid")
+	}
+
+	// A nil key means no session: plain rotation, continuing after a.
+	sel, err := r.ValidateSelectionWithSession("svc", 1, nil)
+	if err != nil {
+		t.Fatalf("nil key validate: %v", err)
+	}
+	if sel.SessionKey != "" {
+		t.Fatalf("nil key should mean no session: %+v", sel)
+	}
+	if out := r.Select(sel); !out.OK || out.InstanceID != "b" {
+		t.Fatalf("nil key should rotate plainly: %+v", out)
+	}
+	// The session binding is untouched by the plain rotation.
+	if out := selectedWithSession(t, r, "svc", 1, "k"); out.InstanceID != "a" {
+		t.Fatalf("session reuse after plain select: %+v", out)
+	}
+}
+
+func strPtr(s string) *string { return &s }

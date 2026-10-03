@@ -1354,3 +1354,231 @@ func TestRejectedInvalidReplacementKeepsRotationPosition(t *testing.T) {
 		t.Fatalf("final list must keep only accepted state: %+v", insts)
 	}
 }
+
+// TestSelectSessionKeySticky covers the session flow end to end: the first
+// request with a key rotates and binds, later requests with the same trimmed
+// key reuse the bound instance without moving the rotation, and plain selects
+// interleaved between them keep rotating from the last rotated position.
+func TestSelectSessionKeySticky(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":3,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s1"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s1"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"  s1  "},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 9 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 4: first use of the key rotates to the smallest id and binds s1 -> a.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 1 {
+		t.Fatalf("first session select: %+v", r)
+	}
+	// 5: reuse returns a again without advancing the rotation.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "a" || r.Sequence != 1 {
+		t.Fatalf("session reuse: %+v", r)
+	}
+	// 6: a plain select continues just after a, proving the reuse did not
+	// move the cursor.
+	if r := got.Results[6]; !r.OK || r.InstanceID != "b" || r.Sequence != 2 {
+		t.Fatalf("plain select after reuse: %+v", r)
+	}
+	// 7: the padded key trims to the same session and still reuses a.
+	if r := got.Results[7]; !r.OK || r.InstanceID != "a" {
+		t.Fatalf("padded key should reuse the same session: %+v", r)
+	}
+	// 8: the next plain select continues after b.
+	if r := got.Results[8]; !r.OK || r.InstanceID != "c" || r.Sequence != 3 {
+		t.Fatalf("plain select should continue after b: %+v", r)
+	}
+}
+
+// TestSelectSessionKeyFallbackAndRecovery walks a session through the bound
+// instance turning unhealthy (fallback rebinds through the rotation), the old
+// instance recovering (the binding stays moved), and a no_healthy gap that
+// leaves the binding intact for the next reuse.
+func TestSelectSessionKeyFallbackAndRecovery(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":2,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":3,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":4,"healthy":false,"reason":"down"},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":3,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains a no_healthy failure, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 13 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 3: bind s -> a.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" {
+		t.Fatalf("bind: %+v", r)
+	}
+	// 5: a is unhealthy; the session falls back to the rotation (after a) and
+	// rebinds to b.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 1 {
+		t.Fatalf("fallback select: %+v", r)
+	}
+	// 7: a recovered, but the binding moved to b.
+	if r := got.Results[7]; !r.OK || r.InstanceID != "b" {
+		t.Fatalf("binding should have moved to b: %+v", r)
+	}
+	// 10: nothing healthy; the failed request keeps the binding and cursor.
+	if r := got.Results[10]; r.OK || r.Error != "no_healthy" || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("no_healthy: %+v", r)
+	}
+	// 12: b recovered; the binding survived and the reuse reports b's latest
+	// accepted sequence.
+	if r := got.Results[12]; !r.OK || r.InstanceID != "b" || r.Sequence != 3 {
+		t.Fatalf("reuse after recovery: %+v", r)
+	}
+}
+
+func TestSelectSessionKeyValidationErrors(t *testing.T) {
+	cases := map[string]string{
+		"explicit null": `{"requests":[{"type":"select","service":"s","expectedRevision":0,"sessionKey":null}]}`,
+		"number":        `{"requests":[{"type":"select","service":"s","expectedRevision":0,"sessionKey":5}]}`,
+		"boolean":       `{"requests":[{"type":"select","service":"s","expectedRevision":0,"sessionKey":true}]}`,
+		"object":        `{"requests":[{"type":"select","service":"s","expectedRevision":0,"sessionKey":{}}]}`,
+		"array":         `{"requests":[{"type":"select","service":"s","expectedRevision":0,"sessionKey":[]}]}`,
+		"blank string":  `{"requests":[{"type":"select","service":"s","expectedRevision":0,"sessionKey":"   "}]}`,
+		"empty string":  `{"requests":[{"type":"select","service":"s","expectedRevision":0,"sessionKey":""}]}`,
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			out, code := runRegisterWith(t, input)
+			if code != 1 {
+				t.Fatalf("exit code: %d", code)
+			}
+			var got registerOutput
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("output is not JSON: %v\n%s", err, out)
+			}
+			if len(got.Results) != 1 || got.Results[0].OK || got.Results[0].Error != "invalid" {
+				t.Fatalf("expected one invalid result, got %+v", got.Results)
+			}
+			if !strings.Contains(got.Results[0].Reason, "sessionKey") {
+				t.Fatalf("reason should name the sessionKey problem, got %q", got.Results[0].Reason)
+			}
+			if len(got.Services) != 0 {
+				t.Fatalf("no service should be created: %+v", got.Services)
+			}
+		})
+	}
+}
+
+// TestSelectSessionKeyInvalidPrecedesRevision locks the ordering: an invalid
+// sessionKey reports invalid even when expectedRevision is also wrong, and the
+// failure creates no binding — a later valid request with the same key still
+// rotates as a first use.
+func TestSelectSessionKeyInvalidPrecedesRevision(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":99,"sessionKey":"  "},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d", code)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 6 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 3: blank sessionKey wins over the wrong revision: invalid, no revision
+	// comparison reported, and no binding created.
+	if r := got.Results[3]; r.OK || r.Error != "invalid" || r.Revision != 1 ||
+		r.ExpectedRevision != 0 || r.ActualRevision != 0 {
+		t.Fatalf("invalid sessionKey: %+v", r)
+	}
+	if !strings.Contains(got.Results[3].Reason, "sessionKey") {
+		t.Fatalf("reason should name sessionKey, got %q", got.Results[3].Reason)
+	}
+	// 4: the failed item left no trace — the key's first success rotates to a.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" {
+		t.Fatalf("first session select: %+v", r)
+	}
+	// 5: reuse.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "a" {
+		t.Fatalf("session reuse: %+v", r)
+	}
+}
+
+// TestSelectSessionKeyPerService checks at the batch level that the same key
+// in two services binds independently.
+func TestSelectSessionKeyPerService(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"s1","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"register","service":"s2","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"s1","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"s1","instanceId":"b","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"s2","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"s2","instanceId":"b","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"s1","expectedRevision":1,"sessionKey":"k"},
+		{"type":"select","service":"s2","expectedRevision":1,"sessionKey":"k"},
+		{"type":"select","service":"s1","expectedRevision":1},
+		{"type":"select","service":"s1","expectedRevision":1,"sessionKey":"k"},
+		{"type":"select","service":"s2","expectedRevision":1,"sessionKey":"k"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 11 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 6-7: the same key binds a in each service independently.
+	if r := got.Results[6]; !r.OK || r.InstanceID != "a" {
+		t.Fatalf("s1 bind: %+v", r)
+	}
+	if r := got.Results[7]; !r.OK || r.InstanceID != "a" {
+		t.Fatalf("s2 bind: %+v", r)
+	}
+	// 8: a plain select on s1 rotates to b without touching s2's rotation.
+	if r := got.Results[8]; !r.OK || r.InstanceID != "b" {
+		t.Fatalf("s1 plain select: %+v", r)
+	}
+	// 9-10: both sessions still reuse their own a.
+	if r := got.Results[9]; !r.OK || r.InstanceID != "a" {
+		t.Fatalf("s1 reuse: %+v", r)
+	}
+	if r := got.Results[10]; !r.OK || r.InstanceID != "a" {
+		t.Fatalf("s2 reuse: %+v", r)
+	}
+}
