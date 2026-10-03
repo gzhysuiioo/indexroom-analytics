@@ -167,15 +167,111 @@ func (r *Registry) RevisionOf(service string) int {
 	return 0
 }
 
+// validateServiceName is the service-identity field shared by every request:
+// the trimmed name must not be blank.
+func validateServiceName(service string) (string, error) {
+	name := strings.TrimSpace(service)
+	if name == "" {
+		return "", errInvalid("service name must not be empty")
+	}
+	return name, nil
+}
+
+// validateExpectedRevision is the revision field shared by every request: it
+// must be a non-negative integer. Callers check their remaining content fields
+// after this one, so content validity is fully established before any revision
+// comparison against the registry.
+func validateExpectedRevision(revision int) error {
+	if revision < 0 {
+		return errInvalid("expectedRevision must be a non-negative integer")
+	}
+	return nil
+}
+
+// revisionFailure describes the common revision-gate result shared by health
+// observations and selections. It carries no operation-specific fields: each
+// operation maps it onto its own result so stale health sequences, missing
+// instances and missing healthy targets never get mixed together.
+type revisionFailure struct {
+	kind     OutcomeKind
+	reason   string
+	revision int // current revision (0 for an unknown service)
+	expected int
+	actual   int
+}
+
+// checkServiceRevision applies the gate the health and select operations share.
+// Content validation has already happened by the time it runs, so an invalid
+// field never reaches it. It first looks the service up (an unknown service is
+// at revision 0) and compares revisions: a mismatch is a conflict carrying the
+// request's expectedRevision and the actual revision, even when the service or
+// the targeted instance is missing. With matching revisions an unknown service
+// is not_found; a registered service with an empty instance list is still
+// returned, so it compares by its real revision rather than being treated as
+// absent. Returning nil means the gate passed and the caller owns the rest.
+func (r *Registry) checkServiceRevision(service string, expected int) (*serviceState, *revisionFailure) {
+	st, exists := r.services[service]
+	actual := 0
+	if exists {
+		actual = st.revision
+	}
+	if expected != actual {
+		return nil, &revisionFailure{
+			kind:     OutcomeConflict,
+			reason:   fmt.Sprintf("service %q is at revision %d, not %d", service, actual, expected),
+			revision: actual,
+			expected: expected,
+			actual:   actual,
+		}
+	}
+	if !exists {
+		return nil, &revisionFailure{
+			kind:     OutcomeNotFound,
+			reason:   fmt.Sprintf("service %q does not exist", service),
+			revision: 0,
+		}
+	}
+	return st, nil
+}
+
+// asHealth maps the shared revision gate failure onto a health result. The
+// operation-specific fields (instance id and the current sequence) stay zero so
+// they remain omitted exactly as health's own revision failures always have.
+func (f *revisionFailure) asHealth(service string) HealthOutcome {
+	return HealthOutcome{
+		Service:  service,
+		OK:       false,
+		Kind:     f.kind,
+		Reason:   f.reason,
+		Revision: f.revision,
+		Expected: f.expected,
+		Actual:   f.actual,
+	}
+}
+
+// asSelect maps the shared revision gate failure onto a selection result, which
+// never fabricates an instance id, address or sequence on rejection.
+func (f *revisionFailure) asSelect(service string) SelectOutcome {
+	return SelectOutcome{
+		Service:  service,
+		OK:       false,
+		Kind:     f.kind,
+		Reason:   f.reason,
+		Revision: f.revision,
+		Expected: f.expected,
+		Actual:   f.actual,
+	}
+}
+
 // ValidateRegistration trims and validates one request without mutating the registry.
 // Content validity is established before any revision check.
 func (r *Registry) ValidateRegistration(service string, revision int, instances []Instance) (Registration, error) {
-	name := strings.TrimSpace(service)
-	if name == "" {
-		return Registration{}, errInvalid("service name must not be empty")
+	name, err := validateServiceName(service)
+	if err != nil {
+		return Registration{}, err
 	}
-	if revision < 0 {
-		return Registration{}, errInvalid("expectedRevision must be a non-negative integer")
+	if err := validateExpectedRevision(revision); err != nil {
+		return Registration{}, err
 	}
 	seen := make(map[string]bool, len(instances))
 	valid := make([]Instance, 0, len(instances))
@@ -254,16 +350,16 @@ func (r *Registry) Apply(reg Registration) Outcome {
 // ValidateHealth trims and validates one health observation without mutating
 // the registry. Content validity is established before any revision check.
 func (r *Registry) ValidateHealth(service, instanceID string, revision int, sequence int64, healthy bool, reason string) (HealthUpdate, error) {
-	name := strings.TrimSpace(service)
-	if name == "" {
-		return HealthUpdate{}, errInvalid("service name must not be empty")
+	name, err := validateServiceName(service)
+	if err != nil {
+		return HealthUpdate{}, err
 	}
 	id := strings.TrimSpace(instanceID)
 	if id == "" {
 		return HealthUpdate{}, errInvalid("instance id must not be empty")
 	}
-	if revision < 0 {
-		return HealthUpdate{}, errInvalid("expectedRevision must be a non-negative integer")
+	if err := validateExpectedRevision(revision); err != nil {
+		return HealthUpdate{}, err
 	}
 	if sequence <= 0 {
 		return HealthUpdate{}, errInvalid("sequence must be a positive integer")
@@ -285,41 +381,24 @@ func (r *Registry) ValidateHealth(service, instanceID string, revision int, sequ
 	}, nil
 }
 
-// ApplyHealth checks the revision and records an offline observation.
+// ApplyHealth records an offline observation once the shared revision gate has
+// passed.
 //
-// The revision is checked first: a mismatch is a conflict carrying the request
-// and current revisions, even when the instance exists. With a matching
-// revision, a missing service or instance is not_found. Sequence handling:
+// The gate is shared with Select (see checkServiceRevision): a revision
+// mismatch is a conflict carrying the request and current revisions even when
+// the service or the targeted instance is missing, and a matching request for
+// an unknown service is not_found. Only after it does health apply its own
+// rules:
+//   - a missing instance is not_found;
 //   - a sequence below the accepted one is stale and reports the current sequence;
 //   - the same sequence with identical normalized status and reason succeeds
 //     without changing state;
 //   - the same sequence with different content is a conflict;
 //   - a newer sequence writes the status and reason.
 func (r *Registry) ApplyHealth(upd HealthUpdate) HealthOutcome {
-	st, exists := r.services[upd.Service]
-	actual := 0
-	if exists {
-		actual = st.revision
-	}
-	if upd.Revision != actual {
-		return HealthOutcome{
-			Service:  upd.Service,
-			OK:       false,
-			Kind:     OutcomeConflict,
-			Reason:   fmt.Sprintf("service %q is at revision %d, not %d", upd.Service, actual, upd.Revision),
-			Expected: upd.Revision,
-			Actual:   actual,
-			Revision: actual,
-		}
-	}
-	if !exists {
-		return HealthOutcome{
-			Service:  upd.Service,
-			OK:       false,
-			Kind:     OutcomeNotFound,
-			Reason:   fmt.Sprintf("service %q does not exist", upd.Service),
-			Revision: 0,
-		}
+	st, fail := r.checkServiceRevision(upd.Service, upd.Revision)
+	if fail != nil {
+		return fail.asHealth(upd.Service)
 	}
 	cur, ok := st.instances[upd.InstanceID]
 	if !ok {
@@ -391,22 +470,26 @@ func (r *Registry) ApplyHealth(upd HealthUpdate) HealthOutcome {
 // ValidateSelection trims and validates one select request without touching
 // the registry. Content validity is established before any revision check.
 func (r *Registry) ValidateSelection(service string, revision int) (Selection, error) {
-	name := strings.TrimSpace(service)
-	if name == "" {
-		return Selection{}, errInvalid("service name must not be empty")
+	name, err := validateServiceName(service)
+	if err != nil {
+		return Selection{}, err
 	}
-	if revision < 0 {
-		return Selection{}, errInvalid("expectedRevision must be a non-negative integer")
+	if err := validateExpectedRevision(revision); err != nil {
+		return Selection{}, err
 	}
 	return Selection{Service: name, Revision: revision}, nil
 }
 
-// Select checks the revision and chooses one healthy instance for the service.
+// Select chooses one healthy instance for the service once the shared revision
+// gate has passed.
 //
-// The revision is checked first: a mismatch is a conflict carrying the request
-// and current revisions (an unknown service is at revision 0). With a matching
-// revision, a missing service is not_found. When the service exists but has no
-// healthy instance the outcome is no_healthy and no address is fabricated.
+// The gate is shared with ApplyHealth (see checkServiceRevision): a mismatch is
+// a conflict carrying the request and current revisions (an unknown service is
+// at revision 0), and a matching request for an unknown service is not_found.
+// Only after it does select apply its own rule: an existing service with no
+// healthy instance is no_healthy and no address is fabricated. A registered
+// service with an empty instance list still compares by its real revision; the
+// gate hands it through so the answer is no_healthy, not not_found.
 //
 // Healthy instances rotate per service by ascending instance id: the first
 // success takes the smallest id and each later success continues just after
@@ -415,30 +498,9 @@ func (r *Registry) ValidateSelection(service string, revision int) (Selection, e
 // health changes alter the candidate set immediately but never reset the
 // rotation; failed selections leave the cursor where it was.
 func (r *Registry) Select(sel Selection) SelectOutcome {
-	st, exists := r.services[sel.Service]
-	actual := 0
-	if exists {
-		actual = st.revision
-	}
-	if sel.Revision != actual {
-		return SelectOutcome{
-			Service:  sel.Service,
-			OK:       false,
-			Kind:     OutcomeConflict,
-			Reason:   fmt.Sprintf("service %q is at revision %d, not %d", sel.Service, actual, sel.Revision),
-			Expected: sel.Revision,
-			Actual:   actual,
-			Revision: actual,
-		}
-	}
-	if !exists {
-		return SelectOutcome{
-			Service:  sel.Service,
-			OK:       false,
-			Kind:     OutcomeNotFound,
-			Reason:   fmt.Sprintf("service %q does not exist", sel.Service),
-			Revision: 0,
-		}
+	st, fail := r.checkServiceRevision(sel.Service, sel.Revision)
+	if fail != nil {
+		return fail.asSelect(sel.Service)
 	}
 
 	healthy := make([]string, 0, len(st.instances))

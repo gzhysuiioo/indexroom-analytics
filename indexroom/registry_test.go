@@ -766,3 +766,100 @@ func TestRegistrySelectValidation(t *testing.T) {
 		t.Fatalf("trim/valid: %+v err=%v", sel, err)
 	}
 }
+
+// TestSharedRevisionGateEmptyInstanceService locks the rule shared by health
+// and select: a registered service whose instance list is empty still compares
+// by its real revision instead of being treated as absent.
+func TestSharedRevisionGateEmptyInstanceService(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h:1"}})
+	registerService(t, r, "svc", 1, nil) // empty list bumps to revision 2
+
+	// Both operations, wrong expected revision against the empty service: a
+	// conflict carrying the real revision, not not_found at revision 0.
+	upd, _ := r.ValidateHealth("svc", "a", 1, 1, true, "")
+	if out := r.ApplyHealth(upd); out.OK || out.Kind != OutcomeConflict ||
+		out.Expected != 1 || out.Actual != 2 || out.Revision != 2 {
+		t.Fatalf("health empty-service conflict: %+v", out)
+	}
+	sel, _ := r.ValidateSelection("svc", 1)
+	if out := r.Select(sel); out.OK || out.Kind != OutcomeConflict ||
+		out.Expected != 1 || out.Actual != 2 || out.Revision != 2 {
+		t.Fatalf("select empty-service conflict: %+v", out)
+	}
+
+	// Matching revision: the gate passes. Health then reports the missing
+	// instance (its own not_found), while select reports no_healthy; the two
+	// business results must not be mixed.
+	upd, _ = r.ValidateHealth("svc", "a", 2, 1, true, "")
+	if out := r.ApplyHealth(upd); out.OK || out.Kind != OutcomeNotFound || out.Revision != 2 {
+		t.Fatalf("health through gate on empty service: %+v", out)
+	}
+	sel, _ = r.ValidateSelection("svc", 2)
+	if out := r.Select(sel); out.OK || out.Kind != OutcomeNoHealthy ||
+		out.Revision != 2 || out.InstanceID != "" || out.Address != "" {
+		t.Fatalf("select through gate on empty service: %+v", out)
+	}
+}
+
+// TestSharedRevisionGateConflictPrecedesHealthBusinessRules locks that a
+// revision mismatch on a health request is reported as conflict even when the
+// instance is missing or the carried sequence is larger than anything seen.
+func TestSharedRevisionGateConflictPrecedesHealthBusinessRules(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "h:1"}})
+	markHealth(t, r, "svc", "a", 1, 5, true, "")
+
+	// Missing instance plus a larger sequence, wrong revision: conflict first.
+	upd, _ := r.ValidateHealth("svc", "ghost", 9, 100, true, "")
+	out := r.ApplyHealth(upd)
+	if out.OK || out.Kind != OutcomeConflict || out.Expected != 9 ||
+		out.Actual != 1 || out.Revision != 1 {
+		t.Fatalf("missing instance must not mask revision conflict: %+v", out)
+	}
+
+	// Existing instance with a larger sequence, wrong revision: still conflict;
+	// the observation must not have been written.
+	upd, _ = r.ValidateHealth("svc", "a", 2, 100, false, "down")
+	out = r.ApplyHealth(upd)
+	if out.OK || out.Kind != OutcomeConflict || out.Expected != 2 || out.Actual != 1 {
+		t.Fatalf("larger sequence must not mask revision conflict: %+v", out)
+	}
+	if inst := instanceHealth(t, r, "svc", "a"); inst.Health != HealthHealthy || inst.Sequence != 5 {
+		t.Fatalf("observation written despite conflict: %+v", inst)
+	}
+
+	// Unknown service with a non-zero expected revision conflicts even though
+	// the instance cannot exist; expected 0 on the same unknown service is the
+	// operation-specific not_found.
+	upd, _ = r.ValidateHealth("other", "a", 3, 100, true, "")
+	if out := r.ApplyHealth(upd); out.OK || out.Kind != OutcomeConflict ||
+		out.Expected != 3 || out.Actual != 0 || out.Revision != 0 {
+		t.Fatalf("unknown service wrong revision: %+v", out)
+	}
+	upd, _ = r.ValidateHealth("other", "a", 0, 1, true, "")
+	if out := r.ApplyHealth(upd); out.OK || out.Kind != OutcomeNotFound || out.Revision != 0 {
+		t.Fatalf("unknown service expected 0: %+v", out)
+	}
+}
+
+// TestSharedRevisionGateValidationPrecedesRevision locks the ordering shared by
+// both operations: own-field validity is judged before the revision comparison
+// even when the service is absent, so the answer is invalid rather than
+// conflict or not_found.
+func TestSharedRevisionGateValidationPrecedesRevision(t *testing.T) {
+	r := NewRegistry()
+
+	if _, err := r.ValidateHealth("   ", "a", 5, 1, true, ""); err == nil {
+		t.Fatalf("blank service health should be invalid before the revision check")
+	}
+	if _, err := r.ValidateHealth("missing", "a", -1, 1, true, ""); err == nil {
+		t.Fatalf("negative revision health should be invalid")
+	}
+	if _, err := r.ValidateSelection("   ", 5); err == nil {
+		t.Fatalf("blank service select should be invalid before the revision check")
+	}
+	if _, err := r.ValidateSelection("missing", -1); err == nil {
+		t.Fatalf("negative revision select should be invalid")
+	}
+}
