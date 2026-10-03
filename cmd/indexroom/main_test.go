@@ -602,6 +602,165 @@ func TestSelectCursorNotAdvancedByDuplicatesOrFailures(t *testing.T) {
 	}
 }
 
+func TestSelectAddressReplacementKeepsRotation(t *testing.T) {
+	// One instance keeps its id but gets a new address: the registration bumps
+	// once, that instance resets to unknown/0 while untouched instances keep
+	// their observations, and the rotation continues after the last chosen id
+	// instead of restarting at the smallest id.
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"},{"id":"d","address":"h4:4"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":12,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":13,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"d","expectedRevision":1,"sequence":14,"healthy":false,"reason":"connection refused"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[{"id":"a","address":"h9:9"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"},{"id":"d","address":"h4:4"}]},
+		{"type":"select","service":"svc","expectedRevision":2},
+		{"type":"select","service":"svc","expectedRevision":2}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 10 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// Rotation before the replacement: a then b, cursor rests on b.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 11 {
+		t.Fatalf("first select: %+v", r)
+	}
+	if r := got.Results[6]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 12 {
+		t.Fatalf("second select: %+v", r)
+	}
+	// The address-only replacement succeeds and bumps the revision exactly once.
+	if r := got.Results[7]; !r.OK || !r.Changed || r.Revision != 2 {
+		t.Fatalf("address replacement: %+v", r)
+	}
+	// The new address of a has no observation yet, so it is skipped; the
+	// rotation continues just after b and lands on c, never on a's old address.
+	if r := got.Results[8]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 13 || r.Revision != 2 {
+		t.Fatalf("select after replacement should continue after b at c: %+v", r)
+	}
+	// Past the end the rotation wraps to the smallest eligible id (b), proving
+	// it did not restart from the smallest id because of the replacement.
+	if r := got.Results[9]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 12 || r.Revision != 2 {
+		t.Fatalf("select should wrap to smallest eligible id: %+v", r)
+	}
+	// Final state: a is unknown at sequence 0 with no leftover reason; the
+	// untouched instances keep their health, sequence and reason.
+	if len(got.Services) != 1 || got.Services[0].Revision != 2 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 4 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	if insts[0].ID != "a" || insts[0].Address != "h9:9" || insts[0].Health != "unknown" || insts[0].Sequence != 0 || insts[0].Reason != "" {
+		t.Fatalf("replaced instance should reset to unknown/0: %+v", insts[0])
+	}
+	if insts[1].ID != "b" || insts[1].Health != "healthy" || insts[1].Sequence != 12 {
+		t.Fatalf("b should keep its observation: %+v", insts[1])
+	}
+	if insts[2].ID != "c" || insts[2].Health != "healthy" || insts[2].Sequence != 13 {
+		t.Fatalf("c should keep its observation: %+v", insts[2])
+	}
+	if insts[3].ID != "d" || insts[3].Health != "unhealthy" || insts[3].Sequence != 14 || insts[3].Reason != "connection refused" {
+		t.Fatalf("d should keep its observation and reason: %+v", insts[3])
+	}
+}
+
+func TestSelectAddressReplacementNoHealthyThenRecovery(t *testing.T) {
+	// Replacing the only healthy instance's address leaves no healthy target:
+	// select reports no_healthy without moving the cursor, a health report
+	// against the old revision conflicts without healing the new address, and
+	// a fresh observation at the current revision (sequence only above the
+	// reset 0, not above the old accepted one) makes the new address eligible
+	// again.
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":20,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":21,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[{"id":"a","address":"h9:9"},{"id":"b","address":"h2:2"}]},
+		{"type":"select","service":"svc","expectedRevision":2},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":99,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":2},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":2,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":2,"sequence":22,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":2},
+		{"type":"select","service":"svc","expectedRevision":2}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 12 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// Cursor rests on a before the replacement.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 20 {
+		t.Fatalf("select before replacement: %+v", r)
+	}
+	if r := got.Results[4]; !r.OK || !r.Changed || r.Revision != 2 {
+		t.Fatalf("address replacement: %+v", r)
+	}
+	// No healthy instance remains: no_healthy states the reason and the current
+	// revision and fabricates neither an instance id nor an address.
+	if r := got.Results[5]; r.OK || r.Error != "no_healthy" || r.Reason == "" || r.Revision != 2 || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("no_healthy after replacement: %+v", r)
+	}
+	// A health report against the old revision conflicts even though its
+	// sequence (99) exceeds the old accepted one (20); it names both revisions.
+	if r := got.Results[6]; r.OK || r.Error != "conflict" || r.Reason == "" || r.ExpectedRevision != 1 || r.ActualRevision != 2 || r.Revision != 2 {
+		t.Fatalf("stale-revision health report: %+v", r)
+	}
+	// The conflicting report did not heal the new address: still no_healthy.
+	if r := got.Results[7]; r.OK || r.Error != "no_healthy" || r.Revision != 2 || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("new address must not regain eligibility from old revision: %+v", r)
+	}
+	// At the current revision a sequence just above the reset 0 suffices; it
+	// does not need to exceed the 20 accepted for the old address.
+	if r := got.Results[8]; !r.OK || !r.Changed || r.Revision != 2 || r.Sequence != 1 {
+		t.Fatalf("fresh observation at current revision: %+v", r)
+	}
+	if r := got.Results[9]; !r.OK || !r.Changed || r.Revision != 2 || r.Sequence != 22 {
+		t.Fatalf("b recovery: %+v", r)
+	}
+	// The failed selects and health report never moved the cursor off a, so
+	// the rotation continues at b rather than restarting at the smallest id.
+	if r := got.Results[10]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 22 || r.Revision != 2 {
+		t.Fatalf("rotation should resume after a at b: %+v", r)
+	}
+	// The new address rejoins selection carrying its new address and the new
+	// observation's sequence.
+	if r := got.Results[11]; !r.OK || r.InstanceID != "a" || r.Address != "h9:9" || r.Sequence != 1 || r.Revision != 2 {
+		t.Fatalf("new address should be selected with its new observation: %+v", r)
+	}
+	// The final list reflects only the committed changes.
+	if len(got.Services) != 1 || got.Services[0].Revision != 2 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 2 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	if insts[0].ID != "a" || insts[0].Address != "h9:9" || insts[0].Health != "healthy" || insts[0].Sequence != 1 || insts[0].Reason != "" {
+		t.Fatalf("a should be healthy at its new address: %+v", insts[0])
+	}
+	if insts[1].ID != "b" || insts[1].Address != "h2:2" || insts[1].Health != "healthy" || insts[1].Sequence != 22 || insts[1].Reason != "" {
+		t.Fatalf("b should be healthy again: %+v", insts[1])
+	}
+}
+
 func TestSelectDeterministic(t *testing.T) {
 	input := `{"requests":[
 		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"c","address":"h3:3"},{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
