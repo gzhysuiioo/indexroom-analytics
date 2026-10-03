@@ -28,6 +28,17 @@ var ErrInvalidArgument = errors.New("indexroom: invalid query argument")
 // restart from a first-page query.
 var ErrQueryChanged = errors.New("indexroom: query data changed")
 
+// queryTxsHookLocked is a test-only rendezvous invoked once per QueryTxs
+// call while index.mu is held: for a first page after the tip-bound height
+// has been resolved (for an explicit or implicit To) but before any block is
+// scanned, and for a continuation only after its pinned range has been
+// verified against the current chain. It is nil in production; reorg
+// regression tests park a query that has already pinned/verified its range
+// with the lock held, forcing a concurrent Reorg to wait and making the
+// "one complete main-chain view" observation deterministic instead of
+// relying on scheduling luck.
+var queryTxsHookLocked func()
+
 const (
 	// DefaultPageSize is the page length when TxQuery.PageSize is zero.
 	DefaultPageSize = 100
@@ -149,6 +160,9 @@ func (index *Index) firstQuery(query TxQuery, pageSize int) (TxPage, error) {
 		// Empty index or a start above the tip: a successful empty result.
 		return page, nil
 	}
+	if queryTxsHookLocked != nil {
+		queryTxsHookLocked()
+	}
 	hits, blocks := index.collectLocked(from, to, query.TxIDs)
 	return index.makePageLocked(query, from, to, hits, blocks, 0, pageSize), nil
 }
@@ -181,6 +195,9 @@ func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
 	}
 	if got := hex.EncodeToString(index.fingerprintLocked(payload.From, payload.To)); got != payload.FP {
 		return TxPage{}, fmt.Errorf("%w: blocks in the pinned range differ from the first page", ErrQueryChanged)
+	}
+	if queryTxsHookLocked != nil {
+		queryTxsHookLocked()
 	}
 	hits, blocks := index.collectLocked(payload.From, payload.To, query.TxIDs)
 	if payload.Off > int64(len(hits)) {
