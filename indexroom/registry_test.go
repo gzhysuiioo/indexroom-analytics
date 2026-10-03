@@ -1239,4 +1239,195 @@ func TestRegistrySelectSessionKeyValidation(t *testing.T) {
 	}
 }
 
+// TestRegistrySelectSessionAddressChangeRecoveredBeforeSelection covers the
+// counterpart of the immediate-fallback case: when the bound instance keeps its
+// id but moves to a new address, its health record resets to unknown — that
+// reset must not be mistaken for a reason to clear the session binding. If the
+// instance accepts a healthy observation at the new revision before the next
+// session selection, the same session keeps using it, reporting the new address
+// and the freshly accepted sequence (which may restart at 1 even though the old
+// address accepted a larger one). The reuse does not rotate, so a following
+// plain selection continues after the instance chosen earlier by a plain
+// selection, rather than jumping back to the bound id.
+func TestRegistrySelectSessionAddressChangeRecoveredBeforeSelection(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}, {ID: "c", Address: "h3:3"},
+	})
+	markHealth(t, r, "svc", "a", 1, 11, true, "")
+	markHealth(t, r, "svc", "b", 1, 12, true, "")
+	markHealth(t, r, "svc", "c", 1, 13, true, "")
+
+	// A session first binds a; an ordinary selection afterwards takes b, so
+	// the rotation cursor rests on b.
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "a" || out.Address != "h1:1" || out.Sequence != 11 {
+		t.Fatalf("bind: %+v", out)
+	}
+	if out := selected(t, r, "svc", 1); out.InstanceID != "b" || out.Address != "h2:2" || out.Sequence != 12 {
+		t.Fatalf("plain select: %+v", out)
+	}
+
+	// A replacement changes only a's address; b and c stay as they were, so
+	// their observations survive while a resets to unknown/0 and the revision
+	// advances to 2.
+	registerService(t, r, "svc", 1, []Instance{
+		{ID: "a", Address: "h9:9"}, {ID: "b", Address: "h2:2"}, {ID: "c", Address: "h3:3"},
+	})
+	if inst := instanceHealth(t, r, "svc", "a"); inst.Address != "h9:9" || inst.Health != HealthUnknown || inst.Sequence != 0 {
+		t.Fatalf("a should reset after the address change: %+v", inst)
+	}
+
+	// Before the next session selection, a accepts a healthy observation under
+	// the new revision. The sequence may restart at 1: it only has to beat the
+	// reset 0, not the 11 accepted for the old address.
+	markHealth(t, r, "svc", "a", 2, 1, true, "")
+
+	// The same session keeps using a with the new address and the new sequence;
+	// it must never report the old address or the old sequence.
+	if out := selectedWithSession(t, r, "svc", 2, "s"); out.InstanceID != "a" ||
+		out.Address != "h9:9" || out.Sequence != 1 || out.Revision != 2 {
+		t.Fatalf("session should reuse a at its new record: %+v", out)
+	}
+	// Reusing the binding moved no cursor: the ordinary rotation continues
+	// just after b and lands on c, not back on a.
+	if out := selected(t, r, "svc", 2); out.InstanceID != "c" ||
+		out.Address != "h3:3" || out.Sequence != 13 || out.Revision != 2 {
+		t.Fatalf("plain select should continue after b at c: %+v", out)
+	}
+}
+
+// TestRegistrySelectSessionAddressChangeSelectionBeforeRecovery covers the
+// distinction when the session selection happens while the moved instance is
+// still unknown: the request falls back to the ordinary rotation continuing
+// from the position an earlier plain selection established, chooses the next
+// healthy id and rebinds the session. A later recovery of the old bound
+// instance must not steal the binding back.
+func TestRegistrySelectSessionAddressChangeSelectionBeforeRecovery(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}, {ID: "c", Address: "h3:3"},
+	})
+	markHealth(t, r, "svc", "a", 1, 11, true, "")
+	markHealth(t, r, "svc", "b", 1, 12, true, "")
+	markHealth(t, r, "svc", "c", 1, 13, true, "")
+
+	// Session binds a; a following plain selection takes b, leaving the
+	// rotation cursor on b.
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "a" {
+		t.Fatalf("bind: %+v", out)
+	}
+	if out := selected(t, r, "svc", 1); out.InstanceID != "b" {
+		t.Fatalf("plain select: %+v", out)
+	}
+
+	// a moves to a new address and is unknown again; c is still healthy.
+	registerService(t, r, "svc", 1, []Instance{
+		{ID: "a", Address: "h9:9"}, {ID: "b", Address: "h2:2"}, {ID: "c", Address: "h3:3"},
+	})
+
+	// The selection happens before any recovery: the session cannot reuse a,
+	// so it rotates from just after b to c and rebinds there.
+	if out := selectedWithSession(t, r, "svc", 2, "s"); out.InstanceID != "c" ||
+		out.Address != "h3:3" || out.Sequence != 13 || out.Revision != 2 {
+		t.Fatalf("session should rotate from b to c while a is unknown: %+v", out)
+	}
+
+	// Even after a reports healthy at the new address, the session stays on c.
+	markHealth(t, r, "svc", "a", 2, 1, true, "")
+	if out := selectedWithSession(t, r, "svc", 2, "s"); out.InstanceID != "c" || out.Address != "h3:3" {
+		t.Fatalf("recovered a must not steal the binding back: %+v", out)
+	}
+}
+
+// TestRegistrySelectSessionAddressChangeNoHealthyKeepsBinding locks the failure
+// path while the moved instance is still unknown and every other instance is
+// unavailable too: the session selection reports no_healthy with the current
+// revision and a reason, fabricating neither an instance id nor an address, and
+// the failed selection neither clears the binding (which still points at the
+// moved id) nor advances the rotation. A health report carried by the old
+// revision conflicts even with a larger sequence and must not heal the new
+// address. Once a healthy observation is accepted at the new revision, the
+// original session reuses a at its new record; after the other instances
+// recover, ordinary selections continue from the pre-failure rotation
+// position.
+func TestRegistrySelectSessionAddressChangeNoHealthyKeepsBinding(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "a", Address: "h1:1"}, {ID: "b", Address: "h2:2"}, {ID: "c", Address: "h3:3"},
+	})
+	markHealth(t, r, "svc", "a", 1, 11, true, "")
+	markHealth(t, r, "svc", "b", 1, 12, true, "")
+	markHealth(t, r, "svc", "c", 1, 13, true, "")
+
+	// Session binds a; the following plain selection takes b, cursor rests on b.
+	if out := selectedWithSession(t, r, "svc", 1, "s"); out.InstanceID != "a" || out.Sequence != 11 {
+		t.Fatalf("bind: %+v", out)
+	}
+	if out := selected(t, r, "svc", 1); out.InstanceID != "b" || out.Sequence != 12 {
+		t.Fatalf("plain select: %+v", out)
+	}
+
+	// a moves and resets to unknown; b and c go unhealthy, so nothing is
+	// eligible.
+	registerService(t, r, "svc", 1, []Instance{
+		{ID: "a", Address: "h9:9"}, {ID: "b", Address: "h2:2"}, {ID: "c", Address: "h3:3"},
+	})
+	markHealth(t, r, "svc", "b", 2, 13, false, "down")
+	markHealth(t, r, "svc", "c", 2, 14, false, "down")
+
+	// The session selection fails: no_healthy with the current revision and a
+	// concrete reason, no target address.
+	sel, err := r.ValidateSelectionWithSession("svc", 2, strPtr("s"))
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	fail := r.Select(sel)
+	if fail.OK || fail.Kind != OutcomeNoHealthy || fail.Reason == "" ||
+		fail.Revision != 2 || fail.InstanceID != "" || fail.Address != "" {
+		t.Fatalf("all-unavailable session select: %+v", fail)
+	}
+
+	// An old-revision health report for the new address conflicts even with a
+	// sequence above the old accepted 11; the new address must not go healthy.
+	oldUpd, err := r.ValidateHealth("svc", "a", 1, 99, true, "")
+	if err != nil {
+		t.Fatalf("validate old-revision report: %v", err)
+	}
+	if out := r.ApplyHealth(oldUpd); out.OK || out.Kind != OutcomeConflict ||
+		out.Expected != 1 || out.Actual != 2 || out.Revision != 2 {
+		t.Fatalf("old-revision report: %+v", out)
+	}
+	if inst := instanceHealth(t, r, "svc", "a"); inst.Health != HealthUnknown || inst.Sequence != 0 {
+		t.Fatalf("new address must not be healed by the old revision: %+v", inst)
+	}
+
+	// Still nothing eligible: the failed requests rewrote no binding and moved
+	// no cursor, which the next success proves.
+	sel, err = r.ValidateSelectionWithSession("svc", 2, strPtr("s"))
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if fail := r.Select(sel); fail.OK || fail.Kind != OutcomeNoHealthy {
+		t.Fatalf("still no healthy instance: %+v", fail)
+	}
+
+	// a accepts a fresh healthy observation at the new revision; its sequence
+	// restarts at 1 regardless of the old address's 11. The original session
+	// reuses a with the new record.
+	markHealth(t, r, "svc", "a", 2, 1, true, "")
+	if out := selectedWithSession(t, r, "svc", 2, "s"); out.InstanceID != "a" ||
+		out.Address != "h9:9" || out.Sequence != 1 || out.Revision != 2 {
+		t.Fatalf("session should reuse a at the new address: %+v", out)
+	}
+
+	// After b and c recover, the ordinary rotation resumes from the position
+	// held before the failed selections (just after b): c is next, not a.
+	markHealth(t, r, "svc", "b", 2, 15, true, "")
+	markHealth(t, r, "svc", "c", 2, 16, true, "")
+	if out := selected(t, r, "svc", 2); out.InstanceID != "c" ||
+		out.Address != "h3:3" || out.Sequence != 16 {
+		t.Fatalf("plain rotation should resume after b at c: %+v", out)
+	}
+}
+
 func strPtr(s string) *string { return &s }
