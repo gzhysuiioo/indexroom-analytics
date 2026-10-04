@@ -204,16 +204,20 @@ func (index *Index) Restore(r io.Reader) error {
 // reader-reported io.ErrUnexpectedEOF — bare or wrapped — indistinguishable
 // from an honestly truncated stream, and can hide the fault altogether.
 //
-// snapshotReader therefore observes every underlying read: a normal io.EOF
-// passes through untouched, while any other error is remembered in fault and,
-// when it arrived together with bytes, withheld until the following read. The
-// decoder consumes the delivered bytes first and then receives the fault as a
-// separate error-only read, where it cannot be swallowed. The fault is sticky
-// afterwards, so a reader that oddly resumes after failing can never let the
-// snapshot be applied once a failure has already been reported.
+// snapshotReader therefore observes every underlying read: only the bare
+// io.EOF sentinel — the exact value, not anything that merely errors.Is-
+// matches it — passes through as the normal end of input. A wrapped io.EOF,
+// or a combined error such as errors.Join(io.EOF, fault), is a read failure
+// like any other error: it is remembered in fault and, when it arrived
+// together with bytes, withheld until the following read. The decoder
+// consumes the delivered bytes first and then receives the fault as a
+// separate error-only read, where it cannot be swallowed. The fault is
+// sticky afterwards, so a reader that oddly resumes after failing can never
+// let the snapshot be applied once a failure has been reported, and a later
+// clean io.EOF cannot erase a fault already received.
 type snapshotReader struct {
 	r       io.Reader
-	fault   error // first non-EOF error reported by r, if any
+	fault   error // first error other than the bare io.EOF reported by r, if any
 	pending bool  // fault is due on the next read
 }
 
@@ -226,7 +230,11 @@ func (s *snapshotReader) Read(p []byte) (int, error) {
 		return 0, s.fault
 	}
 	n, err := s.r.Read(p)
-	if err == nil || errors.Is(err, io.EOF) {
+	// Identity comparison on purpose: the JSON decoder treats only the bare
+	// io.EOF as the normal end of input the same way. A wrapped io.EOF, or a
+	// combined error carrying io.EOF alongside a storage fault, must reach
+	// the fault path instead of passing for a clean end.
+	if err == nil || err == io.EOF {
 		return n, err
 	}
 	if s.fault == nil {

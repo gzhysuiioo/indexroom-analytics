@@ -306,3 +306,217 @@ func TestRestoreReadFailureKeepsChainAndCursor(t *testing.T) {
 		t.Fatalf("hits after read failure=%v, want %v", all, want)
 	}
 }
+
+// eofWrapErr is an io.EOF carrying storage-side context: errors.Is matches
+// io.EOF, but it is not the bare sentinel the decoder takes for a normal end
+// of input.
+type eofWrapErr struct{ err error }
+
+func (e *eofWrapErr) Error() string { return "storage at EOF: " + e.err.Error() }
+func (e *eofWrapErr) Unwrap() error { return e.err }
+
+// oneBlockV1 is a complete, valid one-block version-1 snapshot; restored over
+// a multi-block index it would visibly shorten the chain if it were applied.
+const oneBlockV1 = `{"version":1,"tip":1,"blocks":[` +
+	`{"height":1,"hash":"g1","parent":"g","txs":[]}]}`
+
+// oneBlockV2 is the same snapshot in the version-2 layout.
+const oneBlockV2 = `{"version":2,"tip":1,"blocks":[` +
+	`{"height":1,"hash":"g1","parent":"g","txs":[],"timestamp":null}]}`
+
+// Only the bare io.EOF the reader returns directly marks the normal end of a
+// restore stream. An io.EOF carrying context, and a combined error joining
+// io.EOF with a storage fault (as errors.Join produces), are read failures
+// whether they arrive alone or together with usable bytes, and whether those
+// bytes already form a complete JSON object or only a prefix.
+func TestRestoreJoinedOrWrappedEOFIsReadFailure(t *testing.T) {
+	joined := errors.Join(io.EOF, errStorageOffline)
+	wrapped := &eofWrapErr{err: io.EOF}
+	cases := map[string]struct {
+		r         io.Reader
+		wantFault bool
+	}{
+		"joined EOF and fault with a complete snapshot": {
+			&oneShotReader{data: []byte(oneBlockV1), err: joined}, true,
+		},
+		"joined EOF and fault with a half snapshot": {
+			&oneShotReader{data: []byte(halfSnapshot), err: joined}, true,
+		},
+		"joined EOF and fault without bytes": {
+			&oneShotReader{err: joined}, true,
+		},
+		"wrapped EOF with a complete snapshot": {
+			&oneShotReader{data: []byte(oneBlockV1), err: wrapped}, false,
+		},
+		"wrapped EOF with a half snapshot": {
+			&oneShotReader{data: []byte(halfSnapshot), err: wrapped}, false,
+		},
+		"wrapped EOF without bytes": {
+			&oneShotReader{err: wrapped}, false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			index := txChain(t, []string{"a"}, []string{"b"})
+			blocks, byHash, tip := snapshot(index)
+			err := index.Restore(tc.r)
+			if err == nil {
+				t.Fatal("expected a read failure, got success")
+			}
+			if errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("err=%v, must not match ErrInvalidSnapshot", err)
+			}
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("err=%v, caller must still errors.Is the end marker", err)
+			}
+			if tc.wantFault && !errors.Is(err, errStorageOffline) {
+				t.Fatalf("err=%v, caller must errors.Is the storage fault", err)
+			}
+			if !strings.HasPrefix(err.Error(), "indexroom: read snapshot:") {
+				t.Fatalf("err=%q, want the read-snapshot prefix", err.Error())
+			}
+			requireUnchanged(t, index, blocks, byHash, tip)
+		})
+	}
+}
+
+// The scenario from the fault report: a three-block chain fed a valid
+// one-block snapshot whose final bytes arrive together with a combined
+// io.EOF+storage error must fail as a read failure with the whole chain
+// intact — never shorten the chain first and then error — and a cursor taken
+// before the attempt keeps paging the original transactions.
+func TestRestoreJoinedEOFReadFailureKeepsChainAndCursor(t *testing.T) {
+	index := txChain(t, []string{"a"}, []string{"b"}, []string{"c"})
+	first, err := index.QueryTxs(TxQuery{PageSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor := first.NextCursor
+	if cursor == "" {
+		t.Fatal("expected a continuation cursor")
+	}
+	blocks, byHash, tip := snapshot(index)
+
+	err = index.Restore(&oneShotReader{
+		data: []byte(oneBlockV1),
+		err:  errors.Join(io.EOF, errStorageOffline),
+	})
+	if err == nil {
+		t.Fatal("expected a read failure, got success")
+	}
+	if errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("err=%v, must not be ErrInvalidSnapshot", err)
+	}
+	if !errors.Is(err, io.EOF) || !errors.Is(err, errStorageOffline) {
+		t.Fatalf("err=%v, want errors.Is both io.EOF and the storage fault", err)
+	}
+	requireUnchanged(t, index, blocks, byHash, tip)
+
+	pages := collectPages(t, index, TxQuery{PageSize: 1, Cursor: cursor})
+	var all []TxHit
+	for _, page := range pages {
+		all = append(all, page.Hits...)
+	}
+	want := []TxHit{
+		{Height: 2, BlockHash: "h2", TxID: "b", Position: 0},
+		{Height: 3, BlockHash: "h3", TxID: "c", Position: 0},
+	}
+	if !reflect.DeepEqual(all, want) {
+		t.Fatalf("hits after read failure=%v, want %v", all, want)
+	}
+}
+
+// A fault already received is sticky: even if the underlying stream then
+// "recovers", delivers the bytes that complete the document, and ends with a
+// clean io.EOF, the failure cannot be erased and the snapshot is not applied.
+func TestRestoreFaultNotErasedByLaterCleanEOF(t *testing.T) {
+	index := txChain(t, []string{"a"}, []string{"b"})
+	blocks, byHash, tip := snapshot(index)
+	r := &scriptReader{chunks: []scriptChunk{
+		// The prefix arrives together with the combined fault.
+		{data: halfSnapshot, err: errors.Join(io.EOF, errStorageOffline)},
+		// The reader then oddly resumes with the rest of the document...
+		{data: `[]]}`},
+		// ...and finally signals a clean end.
+	}}
+	err := index.Restore(r)
+	if errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("err=%v, must not be ErrInvalidSnapshot", err)
+	}
+	if !errors.Is(err, io.EOF) || !errors.Is(err, errStorageOffline) {
+		t.Fatalf("err=%v, want the first fault preserved, not erased by the clean EOF", err)
+	}
+	requireUnchanged(t, index, blocks, byHash, tip)
+}
+
+// Fault/content precedence with combined EOF errors: a content error exposed
+// by the same batch of bytes that already carries a read fault yields the read
+// failure; a content error found while the reader has not yet reported any
+// fault rejects the snapshot as invalid immediately, without consuming the
+// joined EOF+fault that comes next.
+func TestRestoreJoinedEOFPrecedenceAndEarlyReject(t *testing.T) {
+	contentBad := `{"version":1,"tip":0,"blocks":[],"extra":0}`
+
+	t.Run("fault already reported outranks content error", func(t *testing.T) {
+		index := txChain(t, []string{"a"}, []string{"b"})
+		blocks, byHash, tip := snapshot(index)
+		err := index.Restore(&oneShotReader{
+			data: []byte(contentBad),
+			err:  errors.Join(io.EOF, errStorageOffline),
+		})
+		if errors.Is(err, ErrInvalidSnapshot) {
+			t.Fatalf("err=%v, must not match ErrInvalidSnapshot", err)
+		}
+		if !errors.Is(err, io.EOF) || !errors.Is(err, errStorageOffline) {
+			t.Fatalf("err=%v, want errors.Is io.EOF and the storage fault", err)
+		}
+		requireUnchanged(t, index, blocks, byHash, tip)
+	})
+
+	t.Run("content error first rejects without reading ahead", func(t *testing.T) {
+		index := txChain(t, []string{"a"}, []string{"b"})
+		blocks, byHash, tip := snapshot(index)
+		err := index.Restore(&scriptReader{chunks: []scriptChunk{
+			{data: contentBad},
+			{err: errors.Join(io.EOF, errStorageOffline)},
+		}})
+		if !errors.Is(err, ErrInvalidSnapshot) {
+			t.Fatalf("err=%v, want ErrInvalidSnapshot", err)
+		}
+		if errors.Is(err, errStorageOffline) || errors.Is(err, io.EOF) {
+			t.Fatalf("err=%v, must not consume the stream looking for a fault", err)
+		}
+		requireUnchanged(t, index, blocks, byHash, tip)
+	})
+}
+
+// Both supported snapshot versions keep the same EOF rule: a combined
+// io.EOF+fault ending is a read failure, while the same documents ending with
+// a bare, direct io.EOF still restore successfully.
+func TestRestoreJoinedEOFReadFailureBothVersions(t *testing.T) {
+	for name, doc := range map[string]string{"version 1": oneBlockV1, "version 2": oneBlockV2} {
+		t.Run(name, func(t *testing.T) {
+			index := txChain(t, []string{"a"}, []string{"b"})
+			blocks, byHash, tip := snapshot(index)
+			err := index.Restore(&oneShotReader{
+				data: []byte(doc),
+				err:  errors.Join(io.EOF, errStorageOffline),
+			})
+			if errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("fault: err=%v, must not be ErrInvalidSnapshot", err)
+			}
+			if !errors.Is(err, io.EOF) || !errors.Is(err, errStorageOffline) {
+				t.Fatalf("fault: err=%v, want errors.Is io.EOF and the storage fault", err)
+			}
+			requireUnchanged(t, index, blocks, byHash, tip)
+
+			// The identical document ending with a bare io.EOF still applies.
+			if err := index.Restore(strings.NewReader(doc)); err != nil {
+				t.Fatalf("clean EOF restore failed: %v", err)
+			}
+			if index.Tip != 1 || index.ByHash["g1"] != 1 {
+				t.Fatalf("clean restore did not apply the one-block chain: tip=%d byHash=%v", index.Tip, index.ByHash)
+			}
+		})
+	}
+}
