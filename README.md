@@ -18,7 +18,7 @@ go test ./...
 - `Index.Append` / `Index.Reorg`：摄取区块与重组，负时间整体拒绝且不改变已有链；哈希、父哈希或任一交易标识含非法 UTF-8 字节时同样整体拒绝，错误信息指出区块高度与字段（交易标识另指出从 0 开始的位置），保证快照可无损导出与恢复。
 - `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
 - `Index.QueryTimeStats`：按 `[Start, End)` 半开窗口与 `StepSeconds` 分段统计交易出现次数、不同标识数、含匹配交易的区块数，并给出整窗口去重汇总与缺失时间区块数；非法参数返回 `ErrInvalidArgument`。完整用法见下方[按时间窗口统计交易指南](#按时间窗口统计交易指南querytimestats)。
-- `Index.Export` / `Index.Restore`：快照版本 1（全无时间时保持原字节）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）。
+- `Index.Export` / `Index.Restore`：快照版本 1（全无时间时保持原字节）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）；`Restore` 用快照整体替换主链，非法快照与读取错误都不改变现有链。恢复到已有索引的完整用法见下方[快照恢复指南](#快照恢复指南export--restore)。
 
 ## 分页交易查询指南（QueryTxs）
 
@@ -536,6 +536,262 @@ From=100 超过链顶 7：err=<nil> 段数=4 解析后高度范围=[100, 7] 整�
 起点时间不小于终点：ErrInvalidArgument=true
 非正步长：ErrInvalidArgument=true
 分段超过一万段：ErrInvalidArgument=true
+```
+
+## 快照恢复指南（Export / Restore）
+
+`Index.Export(w io.Writer) error` 把当前主链写成一份 JSON 快照；`Index.Restore(r io.Reader) error` 读取一份快照并**整体替换**主链。两者都可与查询、摄取并发调用：导出看到的是某一完整链状态，恢复在读取与校验期间不阻塞索引，替换在校验全部通过后一次性生效。
+
+### 恢复是整体替换，不是合并
+
+- 恢复成功后，索引里**只有快照中的链**：链顶变为快照的 `tip`（即快照末尾区块的高度）。恢复一份较短的链时，链顶随之下降，旧链多出的区块全部消失。
+- 被替换掉的区块与交易**不再出现在任何查询结果中，也不会出现在再次导出的内容里**；再次导出得到的是新链的字节，与刚恢复的快照一致。
+- 替换是原子的：要么整条新链生效，要么现有链原样保留，不存在"部分导入"的中间状态。
+
+### 输入格式：一份完整的 JSON 快照
+
+- 输入必须是**恰好一份**快照对象，结尾允许跟随空白字符；拼接两份快照（或任何其他尾随数据）都会被拒绝。
+- 快照通常由 `Export` 的字节原样提供；校验覆盖版本、字段（缺失、多余、重复、为 null 都拒绝）、高度从 1 连续递增、哈希非空且唯一、父哈希链接等，任何一处不符都整体拒绝。
+
+### 两个版本的时间语义
+
+- 版本 1（所有区块都没有时间时的原始布局）没有 `timestamp` 字段，恢复出的区块**没有时间**（`Time` 为 `nil`）。
+- 版本 2 每个区块都有必填的 `timestamp`：`null` 表示缺失，`0` 表示真实时间为零。两者**不能互换**：把缺失写成 `0` 会让该块变成"有零时间"，把 `0` 写成 `null` 会丢失真实时间。
+- 旧版快照缺失的时间**不会**在恢复时自动补零——恢复后仍然是缺失。
+
+### 失败：非法快照与读取错误都不会改变现有链
+
+- **非法快照**（`ErrInvalidSnapshot`，用 `errors.Is` 识别，错误信息带具体原因）：JSON 畸形或截断、对象后还有尾随数据、版本未知、字段缺失/多余/重复/为 null、高度不连续、哈希为空或重复、父哈希链接断裂、版本 2 的 `timestamp` 缺失或为负、标识含非法 UTF-8 等。即使快照前面的区块全部合法、只有最后一个区块出错，也**整体拒绝**，前面的合法区块不会被部分导入。
+- **读取输入发生的错误**（如磁盘读取失败）：原样包装底层错误返回，`errors.Is` 仍能命中调用方自己的底层错误，且**不是** `ErrInvalidSnapshot`，借此可与非法快照区分。
+- 两种失败都完全不改变现有链：链顶、查询结果、再次导出的内容与失败前一致，可继续放心使用原来的数据。
+
+### 恢复与分页游标
+
+- 恢复**失败**前取得的分页游标不受影响，仍可用于原链继续翻页。
+- 恢复**成功**后，旧游标遵循既有固定范围规则：固定范围内的内容发生变化、或链顶低于固定上界时，续查返回 `ErrQueryChanged` 且没有可用页结果。此时应**从空游标重新开始查询**，不要把新结果拼接到旧结果后面。
+
+### 完整示例
+
+下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/restore/main.go`](examples/restore/main.go)：
+
+```bash
+go run ./examples/restore
+```
+
+场景：先用 `Export` 取得一份较短新链（3 个区块，含一个零时间区块和一个缺失时间区块）的快照，再把它 `Restore` 到预先准备的较长旧链（5 个区块）中，对照恢复前后的链顶、交易查询与再次导出；随后演示父哈希错误的非法快照、读取输入失败，以及恢复前后分页游标的行为。
+
+```go
+// 快照导出与恢复（Index.Export / Index.Restore）完整示例：用现有导出功能
+// 取得一份较短新链的快照（含缺失时间与零时间区块），整体替换预先准备的
+// 较长旧链，对照恢复前后的链顶、交易查询与再次导出；演示最后一个区块父
+// 哈希错误的非法快照与读取输入失败的区别（都不改变现有链），以及恢复
+// 失败前与成功后分页游标的行为。
+//
+// 运行：go run ./examples/restore
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/gzhysuiioo/indexroom-analytics/indexroom"
+)
+
+func mustAppend(index *indexroom.Index, block indexroom.Block) {
+	if err := index.Append(block); err != nil {
+		panic(err)
+	}
+}
+
+// unix 返回指向给定 Unix 秒的指针，用于设置区块时间。
+func unix(sec int64) *int64 { return &sec }
+
+// export 把当前主链导出为一份快照并返回其字节内容。
+func export(index *indexroom.Index) string {
+	var buf bytes.Buffer
+	if err := index.Export(&buf); err != nil {
+		panic(err)
+	}
+	return buf.String()
+}
+
+// printQuery 打印一次交易查询的命中情况（单页足够放下全部命中）。
+func printQuery(index *indexroom.Index, txID string) {
+	page, err := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{txID}, PageSize: 10})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("  查询 %q：命中 %d 条", txID, len(page.Hits))
+	for _, hit := range page.Hits {
+		fmt.Printf(" height=%d", hit.Height)
+	}
+	fmt.Println()
+}
+
+// errDisk 模拟读取输入时发生的底层错误。
+var errDisk = errors.New("disk read failed")
+
+// failingReader 的 Read 总是返回 errDisk，模拟损坏的输入来源。
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errDisk }
+
+func main() {
+	// 预先准备的较长旧链：5 个区块，都没有时间；标识 old-a 出现在高度 1、3、5。
+	old := indexroom.New()
+	mustAppend(old, indexroom.Block{Height: 1, Hash: "o1", Parent: "genesis", Txs: []string{"old-a"}})
+	mustAppend(old, indexroom.Block{Height: 2, Hash: "o2", Parent: "o1", Txs: []string{"old-b"}})
+	mustAppend(old, indexroom.Block{Height: 3, Hash: "o3", Parent: "o2", Txs: []string{"old-a"}})
+	mustAppend(old, indexroom.Block{Height: 4, Hash: "o4", Parent: "o3", Txs: []string{"old-c"}})
+	mustAppend(old, indexroom.Block{Height: 5, Hash: "o5", Parent: "o4", Txs: []string{"old-a"}})
+
+	fmt.Println("[1] 恢复前的旧链")
+	fmt.Printf("  链顶 tip=%d\n", old.Tip)
+	printQuery(old, "old-a")
+	beforeExport := export(old)
+	fmt.Printf("  导出（version=1，所有区块都没有时间）：%s\n", beforeExport)
+
+	// 在任何恢复之前取得一个分页游标：每页 2 条，第 1 页读到高度 1、3。
+	page1, err := old.QueryTxs(indexroom.TxQuery{TxIDs: []string{"old-a"}, PageSize: 2})
+	if err != nil {
+		panic(err)
+	}
+	cursor := page1.NextCursor
+	fmt.Printf("  翻页第 1 页命中 %d 条，取得续查游标（固定范围上界 ToHeight=%d）\n\n",
+		len(page1.Hits), page1.ToHeight)
+
+	// 较短的新链：3 个区块。高度 1 时间为 0（真实零时间），高度 2 没有时间，
+	// 高度 3 时间为 1700000000。任一块有时间即导出为版本 2，每块都带 timestamp。
+	fresh := indexroom.New()
+	mustAppend(fresh, indexroom.Block{Height: 1, Hash: "n1", Parent: "genesis", Txs: []string{"new-a"}, Time: unix(0)})
+	mustAppend(fresh, indexroom.Block{Height: 2, Hash: "n2", Parent: "n1", Txs: []string{"new-b"}})
+	mustAppend(fresh, indexroom.Block{Height: 3, Hash: "n3", Parent: "n2", Txs: []string{"new-a"}, Time: unix(1700000000)})
+	snapshot := export(fresh)
+	fmt.Println("[2] 用现有导出功能取得较短新链的快照")
+	fmt.Printf("  新链链顶 tip=%d\n", fresh.Tip)
+	fmt.Printf("  快照（version=2）：%s\n", snapshot)
+	fmt.Println("  高度 1 的 timestamp 为 0（真实零时间），高度 2 为 null（缺失），二者不能互换")
+	fmt.Println()
+
+	// 非法快照：把最后一个区块（高度 3）的父哈希改错。即使前两个区块完全
+	// 合法，恢复也被整体拒绝，前面的区块不会被部分导入。
+	bad := strings.Replace(snapshot, `"parent":"n2"`, `"parent":"nX"`, 1)
+	fmt.Println("[3] 恢复一份最后一个区块父哈希错误的快照（被拒绝）")
+	err = old.Restore(strings.NewReader(bad))
+	fmt.Printf("  Restore 返回：%v\n", err)
+	fmt.Printf("  errors.Is(err, ErrInvalidSnapshot)=%v\n", errors.Is(err, indexroom.ErrInvalidSnapshot))
+	fmt.Printf("  拒绝后链顶 tip=%d（不变）\n", old.Tip)
+	printQuery(old, "old-a")
+	fmt.Printf("  再次导出与恢复前一致：%v\n\n", export(old) == beforeExport)
+
+	// 恢复失败前取得的游标仍可用于原链，继续读到高度 5 的 old-a。
+	page2, err := old.QueryTxs(indexroom.TxQuery{TxIDs: []string{"old-a"}, PageSize: 2, Cursor: cursor})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("[4] 恢复失败前取得的游标仍可用于原链")
+	fmt.Printf("  续查第 2 页：err=%v 命中 %d 条", err, len(page2.Hits))
+	for _, hit := range page2.Hits {
+		fmt.Printf(" height=%d", hit.Height)
+	}
+	fmt.Println()
+	fmt.Println()
+
+	// 读取输入发生的错误与非法快照不同：原样保留底层错误，可用 errors.Is
+	// 命中调用方自己的错误；它同样不改变现有链。
+	fmt.Println("[5] 读取输入失败（不是非法快照）")
+	err = old.Restore(failingReader{})
+	fmt.Printf("  Restore 返回：%v\n", err)
+	fmt.Printf("  errors.Is(err, ErrInvalidSnapshot)=%v，errors.Is(err, errDisk)=%v\n",
+		errors.Is(err, indexroom.ErrInvalidSnapshot), errors.Is(err, errDisk))
+	fmt.Printf("  链仍未改变：tip=%d\n\n", old.Tip)
+
+	// 成功恢复：快照整体替换主链，链顶从 5 降到快照末尾高度 3。
+	fmt.Println("[6] 把新链快照恢复到旧链索引（成功）")
+	if err := old.Restore(strings.NewReader(snapshot)); err != nil {
+		panic(err)
+	}
+	fmt.Printf("  恢复后链顶 tip=%d（快照末尾高度，旧链多出的高度 4、5 已消失）\n", old.Tip)
+	printQuery(old, "old-a")
+	printQuery(old, "new-a")
+	fmt.Printf("  高度 1 时间=%d（真实零时间），高度 2 时间缺失=%v\n",
+		*old.Blocks[1].Time, old.Blocks[2].Time == nil)
+	afterExport := export(old)
+	fmt.Printf("  再次导出：%s\n", afterExport)
+	fmt.Printf("  再次导出与恢复的快照逐字节一致：%v\n\n", afterExport == snapshot)
+
+	// 恢复成功后，旧游标按固定范围规则失效：范围内数据已变，且链顶 3 低于
+	// 固定上界 5，续查返回 ErrQueryChanged，应从空游标重新开始。
+	fmt.Println("[7] 恢复成功后旧游标失效，应重新开始查询")
+	_, err = old.QueryTxs(indexroom.TxQuery{TxIDs: []string{"old-a"}, PageSize: 2, Cursor: cursor})
+	fmt.Printf("  旧游标续查：ErrQueryChanged=%v\n", errors.Is(err, indexroom.ErrQueryChanged))
+	restart, err := old.QueryTxs(indexroom.TxQuery{TxIDs: []string{"new-a"}, PageSize: 10})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("  从空游标重新开始查询 %q：命中 %d 条", "new-a", len(restart.Hits))
+	for _, hit := range restart.Hits {
+		fmt.Printf(" height=%d", hit.Height)
+	}
+	fmt.Println()
+	fmt.Println()
+
+	// 输入必须是恰好一份快照对象：结尾允许空白，拼接两份文档会被拒绝。
+	fmt.Println("[8] 输入必须是恰好一份完整快照")
+	err = old.Restore(strings.NewReader(snapshot + "  \n"))
+	fmt.Printf("  快照后跟随空白：err=%v（接受）\n", err)
+	err = old.Restore(strings.NewReader(snapshot + "\n" + snapshot))
+	fmt.Printf("  拼接两份快照：ErrInvalidSnapshot=%v，原因：%v\n",
+		errors.Is(err, indexroom.ErrInvalidSnapshot), err)
+}
+```
+
+对应输出：
+
+```text
+[1] 恢复前的旧链
+  链顶 tip=5
+  查询 "old-a"：命中 3 条 height=1 height=3 height=5
+  导出（version=1，所有区块都没有时间）：{"version":1,"tip":5,"blocks":[{"height":1,"hash":"o1","parent":"genesis","txs":["old-a"]},{"height":2,"hash":"o2","parent":"o1","txs":["old-b"]},{"height":3,"hash":"o3","parent":"o2","txs":["old-a"]},{"height":4,"hash":"o4","parent":"o3","txs":["old-c"]},{"height":5,"hash":"o5","parent":"o4","txs":["old-a"]}]}
+  翻页第 1 页命中 2 条，取得续查游标（固定范围上界 ToHeight=5）
+
+[2] 用现有导出功能取得较短新链的快照
+  新链链顶 tip=3
+  快照（version=2）：{"version":2,"tip":3,"blocks":[{"height":1,"hash":"n1","parent":"genesis","txs":["new-a"],"timestamp":0},{"height":2,"hash":"n2","parent":"n1","txs":["new-b"],"timestamp":null},{"height":3,"hash":"n3","parent":"n2","txs":["new-a"],"timestamp":1700000000}]}
+  高度 1 的 timestamp 为 0（真实零时间），高度 2 为 null（缺失），二者不能互换
+
+[3] 恢复一份最后一个区块父哈希错误的快照（被拒绝）
+  Restore 返回：indexroom: invalid snapshot: block at height 3 does not link to its parent
+  errors.Is(err, ErrInvalidSnapshot)=true
+  拒绝后链顶 tip=5（不变）
+  查询 "old-a"：命中 3 条 height=1 height=3 height=5
+  再次导出与恢复前一致：true
+
+[4] 恢复失败前取得的游标仍可用于原链
+  续查第 2 页：err=<nil> 命中 1 条 height=5
+
+[5] 读取输入失败（不是非法快照）
+  Restore 返回：indexroom: read snapshot: disk read failed
+  errors.Is(err, ErrInvalidSnapshot)=false，errors.Is(err, errDisk)=true
+  链仍未改变：tip=5
+
+[6] 把新链快照恢复到旧链索引（成功）
+  恢复后链顶 tip=3（快照末尾高度，旧链多出的高度 4、5 已消失）
+  查询 "old-a"：命中 0 条
+  查询 "new-a"：命中 2 条 height=1 height=3
+  高度 1 时间=0（真实零时间），高度 2 时间缺失=true
+  再次导出：{"version":2,"tip":3,"blocks":[{"height":1,"hash":"n1","parent":"genesis","txs":["new-a"],"timestamp":0},{"height":2,"hash":"n2","parent":"n1","txs":["new-b"],"timestamp":null},{"height":3,"hash":"n3","parent":"n2","txs":["new-a"],"timestamp":1700000000}]}
+  再次导出与恢复的快照逐字节一致：true
+
+[7] 恢复成功后旧游标失效，应重新开始查询
+  旧游标续查：ErrQueryChanged=true
+  从空游标重新开始查询 "new-a"：命中 2 条 height=1 height=3
+
+[8] 输入必须是恰好一份完整快照
+  快照后跟随空白：err=<nil>（接受）
+  拼接两份快照：ErrInvalidSnapshot=true，原因：indexroom: invalid snapshot: trailing data after the snapshot object
 ```
 
 ## 技术方向
