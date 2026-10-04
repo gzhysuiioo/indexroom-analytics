@@ -531,6 +531,211 @@ func TestRestoreReadFailureLeavesIndexUntouched(t *testing.T) {
 	requireUnchanged(t, index, blocks, byHash, tip)
 }
 
+// readStep scripts one scriptedSnapshotReader.Read: at most n bytes (all
+// remaining data when n < 0), delivered together with err exactly as a
+// failing transport may return usable bytes and an error in one call.
+type readStep struct {
+	n   int
+	err error
+}
+
+// scriptedSnapshotReader serves data following a per-read script. Once the
+// script is exhausted every further read returns io.EOF.
+type scriptedSnapshotReader struct {
+	data  []byte
+	off   int
+	steps []readStep
+}
+
+func (r *scriptedSnapshotReader) Read(p []byte) (int, error) {
+	n := len(r.data) - r.off
+	err := io.EOF
+	if len(r.steps) > 0 {
+		step := r.steps[0]
+		r.steps = r.steps[1:]
+		if step.n >= 0 && n > step.n {
+			n = step.n
+		}
+		err = step.err
+	}
+	if n > len(p) {
+		n = len(p)
+	}
+	copy(p, r.data[r.off:r.off+n])
+	r.off += n
+	return n, err
+}
+
+// A half snapshot that ends on a clean io.EOF is a truncated, invalid
+// snapshot; the same half bytes cut off by an abnormal read failure are a
+// read failure. The identical input bytes must yield different error
+// categories depending solely on how the stream ended.
+func TestRestoreTruncatedEOFVsReadFailureOnSameBytes(t *testing.T) {
+	half := `{"version":1,"tip":`
+
+	t.Run("clean EOF is ErrInvalidSnapshot", func(t *testing.T) {
+		index := txChain(t, []string{"a"}, []string{"b"})
+		blocks, byHash, tip := snapshot(index)
+		err := index.Restore(strings.NewReader(half))
+		if !errors.Is(err, ErrInvalidSnapshot) {
+			t.Fatalf("err=%v, want ErrInvalidSnapshot for a cleanly ended half snapshot", err)
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("clean truncation must not match io.ErrUnexpectedEOF: %v", err)
+		}
+		requireUnchanged(t, index, blocks, byHash, tip)
+	})
+
+	cases := map[string][]readStep{
+		"fault on the next read": {
+			{-1, nil},
+			{0, io.ErrUnexpectedEOF},
+			{0, io.ErrUnexpectedEOF},
+		},
+		"bytes and fault in one read": {
+			{len(half), io.ErrUnexpectedEOF},
+			{0, io.ErrUnexpectedEOF},
+		},
+		"wrapped fault on the next read": {
+			{-1, nil},
+			{0, fmt.Errorf("storage layer: %w", io.ErrUnexpectedEOF)},
+			{0, fmt.Errorf("storage layer: %w", io.ErrUnexpectedEOF)},
+		},
+		"fault then a later clean EOF": {
+			{len(half), io.ErrUnexpectedEOF},
+			{0, io.EOF},
+		},
+	}
+	for name, steps := range cases {
+		t.Run(name, func(t *testing.T) {
+			index := txChain(t, []string{"a"}, []string{"b"})
+			blocks, byHash, tip := snapshot(index)
+			err := index.Restore(&scriptedSnapshotReader{data: []byte(half), steps: steps})
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("err=%v, want errors.Is io.ErrUnexpectedEOF", err)
+			}
+			if errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("a reader-reported failure must not match ErrInvalidSnapshot: %v", err)
+			}
+			if !strings.HasPrefix(err.Error(), "indexroom: read snapshot:") {
+				t.Fatalf("err=%v, want the read snapshot prefix", err)
+			}
+			requireUnchanged(t, index, blocks, byHash, tip)
+		})
+	}
+}
+
+// Empty or whitespace-only input cut off by an abnormal read failure is a
+// read failure too, not an empty/half document.
+func TestRestoreUnexpectedEOFOnEmptyInputIsReadFailure(t *testing.T) {
+	for name, input := range map[string]string{"empty": ``, "whitespace": "  \n"} {
+		t.Run(name, func(t *testing.T) {
+			index := txChain(t, []string{"a"})
+			blocks, byHash, tip := snapshot(index)
+			err := index.Restore(&scriptedSnapshotReader{
+				data:  []byte(input),
+				steps: []readStep{{len(input), io.ErrUnexpectedEOF}, {0, io.ErrUnexpectedEOF}},
+			})
+			if !errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("err=%v, want a read failure matching io.ErrUnexpectedEOF", err)
+			}
+			requireUnchanged(t, index, blocks, byHash, tip)
+
+			// The same bytes with a clean EOF stay an invalid snapshot.
+			err = index.Restore(strings.NewReader(input))
+			if !errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("cleanly ended %q input: err=%v, want ErrInvalidSnapshot", name, err)
+			}
+		})
+	}
+}
+
+// A read fault after some complete, valid blocks have been delivered neither
+// applies those blocks nor changes the error category because the tail is
+// missing.
+func TestRestoreReadFailureAfterValidBlocksAppliesNothing(t *testing.T) {
+	prefix := `{"version":1,"tip":2,"blocks":[` +
+		`{"height":1,"hash":"x1","parent":"g","txs":["t1"]},` +
+		`{"height":2,"hash":"x2"`
+	index := txChain(t, []string{"a"}, []string{"b"}, []string{"c"})
+	blocks, byHash, tip := snapshot(index)
+	before := exportString(t, index)
+
+	err := index.Restore(&scriptedSnapshotReader{
+		data:  []byte(prefix),
+		steps: []readStep{{len(prefix), io.ErrUnexpectedEOF}, {0, io.ErrUnexpectedEOF}},
+	})
+	if !errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("err=%v, want the read failure", err)
+	}
+	requireUnchanged(t, index, blocks, byHash, tip)
+	for _, leaked := range []string{"x1", "x2"} {
+		if _, ok := index.ByHash[leaked]; ok {
+			t.Fatalf("snapshot hash %q was applied before the read failure", leaked)
+		}
+	}
+	if after := exportString(t, index); after != before {
+		t.Fatalf("chain changed despite the read failure:\n%s\n%s", before, after)
+	}
+}
+
+// A genuine content defect in the delivered bytes is an invalid snapshot
+// even when the same read also reports a transport fault.
+func TestRestoreContentErrorWithSimultaneousReadFaultIsInvalid(t *testing.T) {
+	// 'x' where the blocks array must start: a hard syntax error in hand.
+	input := `{"version":1,"tip":0,"blocks":x`
+	index := txChain(t, []string{"a"}, []string{"b"})
+	blocks, byHash, tip := snapshot(index)
+	boom := errors.New("connection reset")
+	err := index.Restore(&scriptedSnapshotReader{
+		data:  []byte(input),
+		steps: []readStep{{len(input), boom}, {0, boom}},
+	})
+	if !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("err=%v, want ErrInvalidSnapshot for malformed delivered bytes", err)
+	}
+	if errors.Is(err, boom) {
+		t.Fatalf("content errors must not be swallowed into the read failure: %v", err)
+	}
+	requireUnchanged(t, index, blocks, byHash, tip)
+}
+
+// A read failure, like a rejected snapshot, leaves previously issued cursors
+// paging over the old chain; it must not surface as ErrQueryChanged.
+func TestRestoreReadFailureKeepsCursorsAlive(t *testing.T) {
+	index := txChain(t, []string{"a"}, []string{"b"}, []string{"c"})
+	first, err := index.QueryTxs(TxQuery{PageSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.NextCursor == "" {
+		t.Fatal("expected a continuation cursor")
+	}
+	half := `{"version":1,"tip":3,"blocks":[` +
+		`{"height":1,"hash":"x1","parent":"g","txs":[]},`
+	if err := index.Restore(&scriptedSnapshotReader{
+		data: []byte(half),
+		steps: []readStep{
+			{len(half), io.ErrUnexpectedEOF},
+			{0, io.ErrUnexpectedEOF},
+		},
+	}); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("restore err=%v, want the read failure", err)
+	}
+	pages := collectPages(t, index, TxQuery{PageSize: 1, Cursor: first.NextCursor})
+	var all []TxHit
+	for _, page := range pages {
+		all = append(all, page.Hits...)
+	}
+	want := []TxHit{
+		{Height: 2, BlockHash: "h2", TxID: "b", Position: 0},
+		{Height: 3, BlockHash: "h3", TxID: "c", Position: 0},
+	}
+	if !reflect.DeepEqual(all, want) {
+		t.Fatalf("cursor after read failure hits=%v, want %v", all, want)
+	}
+}
+
 func TestRestoreFailureKeepsCursorsAlive(t *testing.T) {
 	index := txChain(t,
 		[]string{"a"},

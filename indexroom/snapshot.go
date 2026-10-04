@@ -197,10 +197,19 @@ func (index *Index) Restore(r io.Reader) error {
 // parseSnapshot reads and fully validates one snapshot document. It returns
 // the tip height and the validated blocks in ascending height order.
 func parseSnapshot(r io.Reader) (int64, []Block, error) {
-	dec := json.NewDecoder(r)
+	// Observe every fault reported by the underlying reader so it can be
+	// distinguished from the decoder's own end-of-input handling: json reads
+	// ahead and turns a clean io.EOF on a half document into a truncation
+	// signal, and an error delivered together with usable bytes can be
+	// consumed and hidden by the buffered tokenizer. A fault the reader
+	// itself reported before the document was complete is a read failure, not
+	// an invalid snapshot, even when it is io.ErrUnexpectedEOF or arrives
+	// wrapped in transport context.
+	src := &snapshotReadFaultReader{r: r}
+	dec := json.NewDecoder(src)
 	tok, err := dec.Token()
 	if err != nil {
-		return 0, nil, classifySnapshotErr(err)
+		return 0, nil, classifySnapshotErr(err, src)
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
 		return 0, nil, invalidSnapshot("snapshot must be a single JSON object")
@@ -217,7 +226,7 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		seen                 = map[string]bool{}
 	)
 	for dec.More() {
-		key, err := snapshotKey(dec)
+		key, err := snapshotKey(dec, src)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -228,17 +237,17 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		switch key {
 		case "version":
 			if err := dec.Decode(&rawVersion); err != nil {
-				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err), src)
 			}
 			haveVersion = true
 		case "tip":
 			if err := dec.Decode(&rawTip); err != nil {
-				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err), src)
 			}
 			haveTip = true
 		case "blocks":
 			if err := dec.Decode(&rawBlocks); err != nil {
-				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err), src)
 			}
 			haveBlocks = true
 		default:
@@ -246,14 +255,14 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		}
 	}
 	if _, err := dec.Token(); err != nil { // closing '}'
-		return 0, nil, classifySnapshotErr(err)
+		return 0, nil, classifySnapshotErr(err, src)
 	}
 	// Only whitespace may follow the snapshot object.
 	if _, err := dec.Token(); err != io.EOF {
 		if err == nil {
 			return 0, nil, invalidSnapshot("trailing data after the snapshot object")
 		}
-		return 0, nil, classifySnapshotErr(err)
+		return 0, nil, classifySnapshotErr(err, src)
 	}
 
 	if !haveVersion {
@@ -286,7 +295,7 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		if err == nil {
 			return 0, nil, invalidSnapshot("trailing data after the blocks array")
 		}
-		return 0, nil, classifySnapshotErr(err)
+		return 0, nil, classifySnapshotErr(err, nil)
 	}
 
 	lastHeight := int64(0)
@@ -300,11 +309,13 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 }
 
 // parseSnapshotBlocks reads the blocks array value, validating heights,
-// hashes, parent links, and (for version 2) timestamps as it goes.
+// hashes, parent links, and (for version 2) timestamps as it goes. It runs
+// over the blocks raw value already buffered out of the stream, so it can
+// only fail on the snapshot's own content, never on a read fault.
 func parseSnapshotBlocks(dec *json.Decoder, version int64) ([]Block, error) {
 	tok, err := dec.Token()
 	if err != nil {
-		return nil, classifySnapshotErr(err)
+		return nil, classifySnapshotErr(err, nil)
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '[' {
 		return nil, invalidSnapshot("field %q must be an array", "blocks")
@@ -340,7 +351,7 @@ func parseSnapshotBlocks(dec *json.Decoder, version int64) ([]Block, error) {
 		blocks = append(blocks, block)
 	}
 	if _, err := dec.Token(); err != nil { // closing ']'
-		return nil, classifySnapshotErr(err)
+		return nil, classifySnapshotErr(err, nil)
 	}
 	return blocks, nil
 }
@@ -383,18 +394,19 @@ func parseSnapshotBlockV2(dec *json.Decoder) (Block, error) {
 // readSnapshotBlockObject reads one block object and captures each known
 // field's raw value. Fields are decoded only after the whole object is read,
 // so a null can be rejected per field and a txs element error can name the
-// block's height whatever order the fields arrive in.
+// block's height whatever order the fields arrive in. The decoder runs over
+// buffered raw bytes, so every failure here is a content error.
 func readSnapshotBlockObject(dec *json.Decoder, known ...string) (map[string]json.RawMessage, error) {
 	tok, err := dec.Token()
 	if err != nil {
-		return nil, classifySnapshotErr(err)
+		return nil, classifySnapshotErr(err, nil)
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
 		return nil, invalidSnapshot("block must be a JSON object")
 	}
 	fields := map[string]json.RawMessage{}
 	for dec.More() {
-		key, err := snapshotKey(dec)
+		key, err := snapshotKey(dec, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -406,12 +418,12 @@ func readSnapshotBlockObject(dec *json.Decoder, known ...string) (map[string]jso
 		}
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
-			return nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			return nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err), nil)
 		}
 		fields[key] = raw
 	}
 	if _, err := dec.Token(); err != nil { // closing '}'
-		return nil, classifySnapshotErr(err)
+		return nil, classifySnapshotErr(err, nil)
 	}
 	return fields, nil
 }
@@ -451,7 +463,7 @@ func snapshotInt64(raw json.RawMessage, field string) (int64, error) {
 	}
 	var v int64
 	if err := json.Unmarshal(raw, &v); err != nil {
-		return 0, classifySnapshotErr(fmt.Errorf("field %q: %w", field, err))
+		return 0, classifySnapshotErr(fmt.Errorf("field %q: %w", field, err), nil)
 	}
 	return v, nil
 }
@@ -467,7 +479,7 @@ func snapshotString(raw json.RawMessage, field string, height int64) (string, er
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", classifySnapshotErr(fmt.Errorf("field %q: %w", field, err))
+		return "", classifySnapshotErr(fmt.Errorf("field %q: %w", field, err), nil)
 	}
 	if !validSnapshotString(raw) {
 		return "", invalidSnapshot("block at height %d: field %q has invalid UTF-8 or unpaired surrogate escapes", height, field)
@@ -567,7 +579,7 @@ func snapshotHex4(b []byte, i int) (rune, bool) {
 func parseSnapshotTimestamp(raw json.RawMessage) (*int64, error) {
 	var t *int64
 	if err := json.Unmarshal(raw, &t); err != nil {
-		return nil, classifySnapshotErr(fmt.Errorf("field %q: %w", "timestamp", err))
+		return nil, classifySnapshotErr(fmt.Errorf("field %q: %w", "timestamp", err), nil)
 	}
 	if t != nil && *t < 0 {
 		return nil, invalidSnapshot("timestamp must not be negative")
@@ -583,7 +595,7 @@ func parseSnapshotTimestamp(raw json.RawMessage) (*int64, error) {
 func parseSnapshotTxs(dec *json.Decoder, height int64) ([]string, error) {
 	tok, err := dec.Token()
 	if err != nil {
-		return nil, classifySnapshotErr(err)
+		return nil, classifySnapshotErr(err, nil)
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '[' {
 		return nil, invalidSnapshot("field %q must be an array of strings", "txs")
@@ -592,14 +604,14 @@ func parseSnapshotTxs(dec *json.Decoder, height int64) ([]string, error) {
 	for dec.More() {
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
-			return nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err))
+			return nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err), nil)
 		}
 		if isSnapshotNull(raw) {
 			return nil, invalidSnapshot("block at height %d: txs element %d must not be null", height, len(txs))
 		}
 		var tx string
 		if err := json.Unmarshal(raw, &tx); err != nil {
-			return nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err))
+			return nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err), nil)
 		}
 		if !validSnapshotString(raw) {
 			return nil, invalidSnapshot("block at height %d: field %q element %d has invalid UTF-8 or unpaired surrogate escapes", height, "txs", len(txs))
@@ -607,16 +619,17 @@ func parseSnapshotTxs(dec *json.Decoder, height int64) ([]string, error) {
 		txs = append(txs, tx)
 	}
 	if _, err := dec.Token(); err != nil { // closing ']'
-		return nil, classifySnapshotErr(err)
+		return nil, classifySnapshotErr(err, nil)
 	}
 	return txs, nil
 }
 
-// snapshotKey reads the next object key.
-func snapshotKey(dec *json.Decoder) (string, error) {
+// snapshotKey reads the next object key. src, when non-nil, is the observer
+// over the live input stream used to attribute read faults.
+func snapshotKey(dec *json.Decoder, src *snapshotReadFaultReader) (string, error) {
 	tok, err := dec.Token()
 	if err != nil {
-		return "", classifySnapshotErr(err)
+		return "", classifySnapshotErr(err, src)
 	}
 	key, ok := tok.(string)
 	if !ok {
@@ -625,23 +638,83 @@ func snapshotKey(dec *json.Decoder) (string, error) {
 	return key, nil
 }
 
+// snapshotReadFaultReader wraps the snapshot input and tracks faults the
+// underlying reader reports before the document is complete. io.EOF is a
+// normal, clean stream end; every other error — io.ErrUnexpectedEOF
+// included, whether bare or wrapped in transport context — is an input
+// delivery failure. Tracking it independently of the json decoder matters
+// because the decoder may consume such an error while turning the buffered
+// prefix into an end-of-input signal, or hide an error delivered together
+// with usable bytes: even a later clean io.EOF must not erase a fault
+// reported while the bytes in hand were still short of the document, so a
+// fault stays recorded across EOFs. A subsequent read that succeeds, by
+// contrast, means the stream recovered after delivering its earlier bytes
+// and the decoder carried on; the stale fault is dropped.
+type snapshotReadFaultReader struct {
+	r     io.Reader
+	fault error
+}
+
+func (s *snapshotReadFaultReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	switch {
+	case err == nil && n > 0:
+		// The stream delivered more data after the fault; the decoder
+		// carried on, so the stale fault is no longer the end of the story.
+		s.fault = nil
+	case err != nil && err != io.EOF:
+		// Sticky even if a later read returns io.EOF: the half document was
+		// delivered together with an abnormal failure, which a clean EOF
+		// afterwards cannot turn into ordinary truncation.
+		s.fault = err
+	}
+	return n, err
+}
+
 // invalidSnapshot builds an ErrInvalidSnapshot error with a specific reason.
 func invalidSnapshot(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrInvalidSnapshot, fmt.Sprintf(format, args...))
 }
 
-// classifySnapshotErr maps decoder failures onto the snapshot error model:
-// malformed JSON, wrong value types, and truncation are snapshot errors,
-// while anything else is an underlying read failure reported as-is.
-func classifySnapshotErr(err error) error {
+// classifySnapshotErr maps a decoder failure onto the snapshot error model.
+//
+// A genuine JSON syntax or value-type error is decided by the bytes already
+// delivered: the scanner reports it while scanning buffered content, before
+// any delayed read fault, and no continuation could repair it. Such an error
+// is an invalid snapshot even when the delivering read also carried a
+// transport fault.
+//
+// Otherwise, a fault observed on the underlying input stream wins over the
+// end-of-input reading the decoder infers from the buffered prefix: the
+// document is incomplete, so a reader-reported failure is a read error, not
+// a truncated snapshot, even when the decoder rephrased the situation as
+// io.ErrUnexpectedEOF. The fault is wrapped with the
+// "indexroom: read snapshot:" prefix and stays reachable through errors.Is.
+//
+// With no reader fault, malformed JSON and wrong value types are invalid
+// snapshots, and a clean end of input before the document is complete
+// (io.EOF, or an io.ErrUnexpectedEOF the decoder synthesized from a clean
+// io.EOF) is a truncated snapshot. src is nil for the in-memory re-parses of
+// already-buffered raw field values, which cannot hit the stream.
+func classifySnapshotErr(err error, src *snapshotReadFaultReader) error {
 	var syntaxErr *json.SyntaxError
 	var typeErr *json.UnmarshalTypeError
-	switch {
-	case errors.As(err, &syntaxErr), errors.As(err, &typeErr):
+	if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
 		return fmt.Errorf("%w: %v", ErrInvalidSnapshot, err)
-	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
-		return fmt.Errorf("%w: unexpected end of input", ErrInvalidSnapshot)
-	default:
-		return fmt.Errorf("indexroom: read snapshot: %w", err)
 	}
+	if src != nil && src.fault != nil {
+		// Keep the decoder's own context when it propagated the fault (for
+		// example which field was being read). The buffered tokenizer can
+		// also lose the fault altogether and report an inferred end of input
+		// after a read that carried usable bytes and the fault together;
+		// anchor the result on the observed cause in that case.
+		if errors.Is(err, src.fault) {
+			return fmt.Errorf("indexroom: read snapshot: %w", err)
+		}
+		return fmt.Errorf("indexroom: read snapshot: %w", src.fault)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("%w: unexpected end of input", ErrInvalidSnapshot)
+	}
+	return fmt.Errorf("indexroom: read snapshot: %w", err)
 }
