@@ -239,6 +239,18 @@ func (s *snapshotReader) Read(p []byte) (int, error) {
 	return 0, err
 }
 
+// snapshotReadFault reports a fault already observed by the underlying reader
+// as a read-snapshot error, or nil if the stream has not failed. Content
+// checks call it before rejecting bytes the same read delivered, so a read
+// failure never masquerades as ErrInvalidSnapshot; it never reads further
+// ahead, so an undiscovered fault keeps the normal content-error rule.
+func snapshotReadFault(reader *snapshotReader) error {
+	if reader.fault == nil {
+		return nil
+	}
+	return fmt.Errorf("indexroom: read snapshot: %w", reader.fault)
+}
+
 // parseSnapshot reads and fully validates one snapshot document. It returns
 // the tip height and the validated blocks in ascending height order.
 func parseSnapshot(r io.Reader) (int64, []Block, error) {
@@ -270,6 +282,12 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		return 0, nil, classify(err)
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		// A wrong top-level value is a content error, but a fault delivered
+		// together with its bytes is already recorded by snapshotReader, so
+		// the read failure wins without reading further ahead.
+		if err := snapshotReadFault(reader); err != nil {
+			return 0, nil, err
+		}
 		return 0, nil, invalidSnapshot("snapshot must be a single JSON object")
 	}
 
@@ -289,6 +307,9 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 			return 0, nil, classify(err)
 		}
 		if seen[key] {
+			if err := snapshotReadFault(reader); err != nil {
+				return 0, nil, err
+			}
 			return 0, nil, invalidSnapshot("duplicate field %q", key)
 		}
 		seen[key] = true
@@ -309,6 +330,9 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 			}
 			haveBlocks = true
 		default:
+			if err := snapshotReadFault(reader); err != nil {
+				return 0, nil, err
+			}
 			return 0, nil, invalidSnapshot("unknown field %q", key)
 		}
 	}
@@ -320,12 +344,17 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 	// snapshotReader and surfaces here, ahead of any content validation below:
 	// once the stream failed, the document cannot be known to be complete, so
 	// the read failure takes precedence even when the buffered bytes already
-	// contain trailing data or a complete object.
+	// contain trailing data or a complete object. The fault is also rechecked
+	// after the token succeeds, since a complete trailing value can be decoded
+	// from bytes delivered in the very same read that reports the fault.
 	if reader.fault != nil {
 		return 0, nil, fmt.Errorf("indexroom: read snapshot: %w", reader.fault)
 	}
 	if _, err := dec.Token(); err != io.EOF {
 		if err == nil {
+			if ferr := snapshotReadFault(reader); ferr != nil {
+				return 0, nil, ferr
+			}
 			return 0, nil, invalidSnapshot("trailing data after the snapshot object")
 		}
 		return 0, nil, classify(err)
