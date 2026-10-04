@@ -1865,3 +1865,332 @@ func TestSelectSessionKeyPerService(t *testing.T) {
 		t.Fatalf("s2 reuse: %+v", r)
 	}
 }
+
+// TestSelectTwoSessionKeysInterleaveInOneService is the batch-level guard for
+// two distinct keys sharing one service's rotation. The keys' first successes
+// consume the same rotation in input order (a then b) and each remembers its
+// own instance; an existing binding never selects the target for the new key.
+// Interleaved reuses return each session's own instance id, address and
+// latest accepted sequence without moving the rotation, and plain selects
+// continue from the last real rotation — a reuse must neither rewind it nor
+// skip a healthy instance. Every request succeeds, so the exit status is 0 and
+// the final service list reflects only the accepted health records.
+func TestSelectTwoSessionKeysInterleaveInOneService(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":3,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":10,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":20,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("all requests succeed, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 15 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 4: x's first success rotates to the smallest id and binds x -> a.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 1 {
+		t.Fatalf("x first select: %+v", r)
+	}
+	// 5: y is a different session; x's binding must not pick its target. y's
+	// first success continues the same rotation after a and binds y -> b.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("y first select should rotate to b, not reuse x binding: %+v", r)
+	}
+	// 6-7: interleaved reuses answer each session's own binding with its own
+	// address and sequence — never the other session's data.
+	if r := got.Results[6]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 1 {
+		t.Fatalf("x reuse: %+v", r)
+	}
+	if r := got.Results[7]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("y reuse: %+v", r)
+	}
+	// 8: the plain select continues just after the last rotated id (b) to c;
+	// neither reuse advanced the rotation.
+	if r := got.Results[8]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 3 {
+		t.Fatalf("plain select should continue after b at c: %+v", r)
+	}
+	// 11-12: after newer observations the reuses report each bound instance's
+	// own latest accepted sequence (a=10 for x, b=20 for y), still without
+	// rotating.
+	if r := got.Results[11]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 10 {
+		t.Fatalf("x reuse latest sequence: %+v", r)
+	}
+	if r := got.Results[12]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 20 {
+		t.Fatalf("y reuse latest sequence: %+v", r)
+	}
+	// 13-14: plain rotation resumes after c (reusing the older binding did not
+	// rewind it), wraps to a with its latest sequence, then continues to b.
+	if r := got.Results[13]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 10 {
+		t.Fatalf("plain select should wrap to a: %+v", r)
+	}
+	if r := got.Results[14]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 20 {
+		t.Fatalf("plain select should continue to b: %+v", r)
+	}
+	// Selections changed neither the revision nor accepted health records.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	wantInsts := []registerInstance{
+		{ID: "a", Address: "h1:1", Health: "healthy", Sequence: 10},
+		{ID: "b", Address: "h2:2", Health: "healthy", Sequence: 20},
+		{ID: "c", Address: "h3:3", Health: "healthy", Sequence: 3},
+	}
+	for i, want := range wantInsts {
+		if got.Services[0].Instances[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, got.Services[0].Instances[i], want)
+		}
+	}
+}
+
+// TestSelectTwoSessionKeysRebindIsolationAndSharing drives one session's bound
+// instance unhealthy while the other session's instance stays healthy: only
+// the affected session falls back to the rotation and rewrites its own
+// binding. The two sessions are then allowed to converge on the same instance
+// (not a conflict, and neither steals the other's binding); the original
+// instance recovering does not pull the rebound session back; and the plain
+// rotation continues from the successful reselection's position. Every
+// request succeeds, so the exit status is 0.
+func TestSelectTwoSessionKeysRebindIsolationAndSharing(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":3,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":4,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":5,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":6,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("all requests succeed, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 19 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 4-5: x -> a, y -> b; the cursor rests on b.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 1 {
+		t.Fatalf("x bind: %+v", r)
+	}
+	if r := got.Results[5]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("y bind: %+v", r)
+	}
+	// 7: a (x's binding) is unhealthy: x alone falls back to the rotation just
+	// after b and rebinds to c, returning c's own address and sequence.
+	if r := got.Results[7]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 3 {
+		t.Fatalf("x fallback should reselect c: %+v", r)
+	}
+	// 8: y is isolated from x's rebind and keeps its own b.
+	if r := got.Results[8]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("y must keep its own b binding: %+v", r)
+	}
+	// 9: x now answers c, proving only its own binding was rewritten.
+	if r := got.Results[9]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 3 {
+		t.Fatalf("x should reuse c: %+v", r)
+	}
+	// 11: c turns unhealthy too, so with only b healthy x's fallback wraps to b.
+	if r := got.Results[11]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("x should rebind to b through the rotation: %+v", r)
+	}
+	// 12-13: two sessions sharing one instance is allowed: both keep returning
+	// b and neither request displaces the other session.
+	if r := got.Results[12]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("y still b: %+v", r)
+	}
+	if r := got.Results[13]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("x still b: %+v", r)
+	}
+	// 15-16: a recovers, but the moved session stays on b; recovery steals no
+	// binding, and the other session keeps b as well.
+	if r := got.Results[15]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("x must keep b after a recovers: %+v", r)
+	}
+	if r := got.Results[16]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("y must keep b: %+v", r)
+	}
+	// 17: the plain rotation continues from x's successful reselection
+	// position (cursor on b), wraps to the recovered a and reports a's latest
+	// sequence, not its pre-failure record.
+	if r := got.Results[17]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 6 {
+		t.Fatalf("plain select should resume from the rebind position and wrap to a: %+v", r)
+	}
+	// 18: the rotation then continues to b.
+	if r := got.Results[18]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("plain select should continue to b: %+v", r)
+	}
+	// Final list: a recovered healthy at 6, b healthy at 2, c unhealthy at 5
+	// with its reason; revision untouched.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 3 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	wantInsts := []registerInstance{
+		{ID: "a", Address: "h1:1", Health: "healthy", Sequence: 6},
+		{ID: "b", Address: "h2:2", Health: "healthy", Sequence: 2},
+		{ID: "c", Address: "h3:3", Health: "unhealthy", Sequence: 5, Reason: "down"},
+	}
+	for i, want := range wantInsts {
+		if insts[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, insts[i], want)
+		}
+	}
+}
+
+// TestSelectTwoSessionKeysNoHealthyIsolation is the batch-level failure
+// guard. Once every instance is unhealthy, keyed and plain selections all
+// return no_healthy with the current revision and a reason but no fabricated
+// instance id, address or sequence; the failed items keep their result slots
+// while later valid items still apply, and the batch exits non-zero. The
+// failures preserve both sessions' bindings and the rotation position: an
+// unbound instance (c) recovers first so a surviving binding is distinguishable
+// from a fresh rotation, then each session's own bound instance recovers and is
+// reused directly with its latest sequence (a request that had lost its binding
+// would rotate from the parked cursor onto c instead). The plain rotation then
+// resumes exactly where the last real rotation stopped.
+func TestSelectTwoSessionKeysNoHealthyIsolation(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":3,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":4,"healthy":false,"reason":"down"},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":5,"healthy":false,"reason":"down"},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":6,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":7,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":8,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":9,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains no_healthy failures, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	// One result per request, in input order; the three failures keep slots
+	// 9-11 and later legal items still land in their own positions.
+	if len(got.Results) != 23 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 4-5: x -> a, y -> b; the last real rotation parks the cursor on b.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 1 {
+		t.Fatalf("x bind: %+v", r)
+	}
+	if r := got.Results[5]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("y bind: %+v", r)
+	}
+	// 9-11: keyed and plain requests are all no_healthy at revision 1 with a
+	// reason, fabricating neither an instance id nor an address.
+	for _, i := range []int{9, 10, 11} {
+		r := got.Results[i]
+		if r.OK || r.Error != "no_healthy" || r.Revision != 1 || r.Reason == "" {
+			t.Fatalf("result %d should be no_healthy with revision and reason: %+v", i, r)
+		}
+		if r.InstanceID != "" || r.Address != "" {
+			t.Fatalf("result %d must fabricate no target: %+v", i, r)
+		}
+	}
+	// 14: c is healthy but x is bound to a; with a recovered and the cursor on
+	// b, reusing the preserved binding returns a. Had the failure erased it,
+	// this request would rotate to c instead — so a/8 distinguishes reuse from
+	// a fresh rotation and carries a's latest sequence.
+	if r := got.Results[14]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 8 {
+		t.Fatalf("x should directly reuse recovered a: %+v", r)
+	}
+	// 16-17: y likewise reuses its recovered b directly (a fresh rotation from
+	// b would return c), and x keeps a.
+	if r := got.Results[16]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 9 {
+		t.Fatalf("y should directly reuse recovered b: %+v", r)
+	}
+	if r := got.Results[17]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 8 {
+		t.Fatalf("x should keep a: %+v", r)
+	}
+	// 18-20: the failures and direct reuses left the cursor on b, so the plain
+	// rotation continues to c, wraps to a, then continues to b with each
+	// instance's recovered sequence.
+	if r := got.Results[18]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 7 {
+		t.Fatalf("plain select should resume after b at c: %+v", r)
+	}
+	if r := got.Results[19]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 8 {
+		t.Fatalf("plain select should wrap to a: %+v", r)
+	}
+	if r := got.Results[20]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 9 {
+		t.Fatalf("plain select should continue to b: %+v", r)
+	}
+	// 21-22: the plain rotation rewrote no binding; each session still answers
+	// its own target.
+	if r := got.Results[21]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 8 {
+		t.Fatalf("x binding intact after plain rotation: %+v", r)
+	}
+	if r := got.Results[22]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 9 {
+		t.Fatalf("y binding intact after plain rotation: %+v", r)
+	}
+	// The selections changed no revision and no accepted health record; the
+	// final list shows only the recovered states with reasons cleared.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 3 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	wantInsts := []registerInstance{
+		{ID: "a", Address: "h1:1", Health: "healthy", Sequence: 8},
+		{ID: "b", Address: "h2:2", Health: "healthy", Sequence: 9},
+		{ID: "c", Address: "h3:3", Health: "healthy", Sequence: 7},
+	}
+	for i, want := range wantInsts {
+		if insts[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, insts[i], want)
+		}
+	}
+}
