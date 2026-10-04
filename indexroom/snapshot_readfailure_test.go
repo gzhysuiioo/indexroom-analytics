@@ -273,6 +273,83 @@ func TestRestoreContentErrorBeforeFaultStaysInvalid(t *testing.T) {
 	requireUnchanged(t, index, blocks, byHash, tip)
 }
 
+// Only an io.EOF returned directly by the reader ends the stream normally.
+// An io.EOF wrapped with extra detail, or joined together with a storage
+// fault, is a read failure — whether it arrives on its own, together with a
+// complete valid snapshot, or together with half of one.
+func TestRestoreJoinedOrWrappedEOFIsReadFailure(t *testing.T) {
+	src := txChain(t, []string{"x"})
+	raw := exportString(t, src)
+	joined := errors.Join(io.EOF, errStorageOffline)
+	cases := map[string]struct {
+		r       io.Reader
+		wantErr []error
+	}{
+		"complete snapshot with joined EOF and fault": {
+			r:       &oneShotReader{data: []byte(raw), err: joined},
+			wantErr: []error{io.EOF, errStorageOffline},
+		},
+		"half snapshot with joined EOF and fault": {
+			r:       &oneShotReader{data: []byte(halfSnapshot), err: joined},
+			wantErr: []error{io.EOF, errStorageOffline},
+		},
+		"joined EOF and fault with no bytes": {
+			r:       &oneShotReader{err: joined},
+			wantErr: []error{io.EOF, errStorageOffline},
+		},
+		"complete snapshot with wrapped EOF": {
+			r:       &oneShotReader{data: []byte(raw), err: fmt.Errorf("storage cut: %w", io.EOF)},
+			wantErr: []error{io.EOF},
+		},
+		"fault followed by a clean EOF stays a failure": {
+			r: &scriptReader{chunks: []scriptChunk{
+				{data: raw, err: joined},
+			}},
+			wantErr: []error{io.EOF, errStorageOffline},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			index := txChain(t, []string{"a"}, []string{"b"})
+			blocks, byHash, tip := snapshot(index)
+			err := index.Restore(tc.r)
+			if errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("err=%v, must not match ErrInvalidSnapshot", err)
+			}
+			for _, want := range tc.wantErr {
+				if !errors.Is(err, want) {
+					t.Fatalf("err=%v, want errors.Is %v", err, want)
+				}
+			}
+			if !strings.HasPrefix(err.Error(), "indexroom: read snapshot:") {
+				t.Fatalf("err=%q, want the read-snapshot prefix", err.Error())
+			}
+			requireUnchanged(t, index, blocks, byHash, tip)
+		})
+	}
+}
+
+// A failed restore never shortens the chain first: a one-block snapshot whose
+// final bytes arrive with a joined read fault leaves the three-block chain
+// exactly as it was.
+func TestRestoreJoinedFaultDoesNotShortenChain(t *testing.T) {
+	index := txChain(t, []string{"a"}, []string{"b"}, []string{"c"})
+	blocks, byHash, tip := snapshot(index)
+	one := txChain(t, []string{"z"})
+	raw := exportString(t, one)
+	err := index.Restore(&oneShotReader{
+		data: []byte(raw),
+		err:  errors.Join(io.EOF, errStorageOffline),
+	})
+	if !errors.Is(err, errStorageOffline) || errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("err=%v, want a read failure distinct from ErrInvalidSnapshot", err)
+	}
+	requireUnchanged(t, index, blocks, byHash, tip)
+	if index.Tip != 3 {
+		t.Fatalf("tip=%d, want the original 3", index.Tip)
+	}
+}
+
 func TestRestoreReadFailureKeepsChainAndCursor(t *testing.T) {
 	index := txChain(t, []string{"a"}, []string{"b"}, []string{"c"})
 	first, err := index.QueryTxs(TxQuery{PageSize: 1})

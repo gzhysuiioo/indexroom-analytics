@@ -204,13 +204,16 @@ func (index *Index) Restore(r io.Reader) error {
 // reader-reported io.ErrUnexpectedEOF — bare or wrapped — indistinguishable
 // from an honestly truncated stream, and can hide the fault altogether.
 //
-// snapshotReader therefore observes every underlying read: a normal io.EOF
-// passes through untouched, while any other error is remembered in fault and,
-// when it arrived together with bytes, withheld until the following read. The
-// decoder consumes the delivered bytes first and then receives the fault as a
-// separate error-only read, where it cannot be swallowed. The fault is sticky
-// afterwards, so a reader that oddly resumes after failing can never let the
-// snapshot be applied once a failure has already been reported.
+// snapshotReader therefore observes every underlying read: only an io.EOF
+// returned directly by the reader is a normal end and passes through
+// untouched. Any other error — including an io.EOF wrapped with extra detail
+// or joined together with a storage fault — is a read failure: it is
+// remembered in fault and, when it arrived together with bytes, withheld
+// until the following read. The decoder consumes the delivered bytes first
+// and then receives the fault as a separate error-only read, where it cannot
+// be swallowed. The fault is sticky afterwards, so a reader that oddly
+// resumes after failing can never let the snapshot be applied once a failure
+// has already been reported.
 type snapshotReader struct {
 	r       io.Reader
 	fault   error // first non-EOF error reported by r, if any
@@ -226,7 +229,7 @@ func (s *snapshotReader) Read(p []byte) (int, error) {
 		return 0, s.fault
 	}
 	n, err := s.r.Read(p)
-	if err == nil || errors.Is(err, io.EOF) {
+	if err == nil || err == io.EOF {
 		return n, err
 	}
 	if s.fault == nil {
