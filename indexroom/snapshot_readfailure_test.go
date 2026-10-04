@@ -157,6 +157,122 @@ func TestRestoreCompleteDocArrivingWithFaultIsReadFailure(t *testing.T) {
 	requireUnchanged(t, index, blocks, byHash, tip)
 }
 
+// scriptReader delivers each chunk in order, one Read per chunk, pairing the
+// chunk's bytes with its error exactly as an underlying stream might; once
+// the chunks run out it ends normally.
+type scriptReader struct {
+	chunks []scriptChunk
+}
+
+type scriptChunk struct {
+	data string
+	err  error
+}
+
+func (r *scriptReader) Read(p []byte) (int, error) {
+	if len(r.chunks) == 0 {
+		return 0, io.EOF
+	}
+	chunk := r.chunks[0]
+	r.chunks = r.chunks[1:]
+	n := copy(p, chunk.data)
+	return n, chunk.err
+}
+
+// A content error found in bytes that arrived together with a read fault is
+// still a read failure: the stream failed, so the bytes cannot be trusted to
+// be the whole document. The same bytes read to a clean end stay content
+// errors.
+func TestRestoreContentErrorWithFaultIsReadFailure(t *testing.T) {
+	cases := map[string]string{
+		"unknown top-level field":   `{"version":1,"tip":0,"blocks":[],"extra":0}`,
+		"duplicate top-level field": `{"version":1,"version":1,"tip":0,"blocks":[]}`,
+		"top level not an object":   `["version",1]`,
+	}
+	for name, doc := range cases {
+		t.Run(name, func(t *testing.T) {
+			index := txChain(t, []string{"a"}, []string{"b"})
+			blocks, byHash, tip := snapshot(index)
+			err := index.Restore(&oneShotReader{data: []byte(doc), err: errStorageOffline})
+			if errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("err=%v, must not match ErrInvalidSnapshot", err)
+			}
+			if !errors.Is(err, errStorageOffline) {
+				t.Fatalf("err=%v, want errors.Is errStorageOffline", err)
+			}
+			if !strings.HasPrefix(err.Error(), "indexroom: read snapshot:") {
+				t.Fatalf("err=%q, want the read-snapshot prefix", err.Error())
+			}
+			requireUnchanged(t, index, blocks, byHash, tip)
+
+			// The same bytes delivered to a clean end report the content
+			// error instead.
+			index = txChain(t, []string{"a"}, []string{"b"})
+			err = index.Restore(strings.NewReader(doc))
+			if !errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("clean EOF: err=%v, want ErrInvalidSnapshot", err)
+			}
+		})
+	}
+}
+
+// Trailing data after the object is a read failure when the read that fetched
+// those bytes already reported the fault, whether the fault arrived with the
+// object's final bytes or only with the trailing ones.
+func TestRestoreTrailingDataWithFaultIsReadFailure(t *testing.T) {
+	index := txChain(t, []string{"a"}, []string{"b"})
+	raw := exportString(t, index)
+	cases := map[string]io.Reader{
+		"fault with the trailing bytes": &scriptReader{chunks: []scriptChunk{
+			{data: raw},
+			{data: " 2", err: io.ErrUnexpectedEOF},
+		}},
+		"fault with the whole stream": &oneShotReader{
+			data: []byte(raw + " 2"),
+			err:  errStorageOffline,
+		},
+	}
+	for name, r := range cases {
+		t.Run(name, func(t *testing.T) {
+			index := txChain(t, []string{"a"}, []string{"b"})
+			blocks, byHash, tip := snapshot(index)
+			err := index.Restore(r)
+			if errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("err=%v, must not match ErrInvalidSnapshot", err)
+			}
+			if !strings.HasPrefix(err.Error(), "indexroom: read snapshot:") {
+				t.Fatalf("err=%q, want the read-snapshot prefix", err.Error())
+			}
+			requireUnchanged(t, index, blocks, byHash, tip)
+		})
+	}
+
+	// The same trailing bytes read to a clean end stay a content error.
+	index = txChain(t, []string{"a"}, []string{"b"})
+	if err := index.Restore(strings.NewReader(raw + " 2")); !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("clean EOF: err=%v, want ErrInvalidSnapshot", err)
+	}
+}
+
+// Only a fault already received wins. A content error found before the reader
+// has reported any failure rejects the snapshot as invalid right away, without
+// reading ahead to look for a fault.
+func TestRestoreContentErrorBeforeFaultStaysInvalid(t *testing.T) {
+	index := txChain(t, []string{"a"}, []string{"b"})
+	blocks, byHash, tip := snapshot(index)
+	err := index.Restore(&scriptReader{chunks: []scriptChunk{
+		{data: `{"version":1,"extra":0,"tip":0,"blocks":[]}`},
+		{err: errStorageOffline},
+	}})
+	if !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("err=%v, want ErrInvalidSnapshot", err)
+	}
+	if errors.Is(err, errStorageOffline) {
+		t.Fatalf("err=%v, must not read ahead into the fault", err)
+	}
+	requireUnchanged(t, index, blocks, byHash, tip)
+}
+
 func TestRestoreReadFailureKeepsChainAndCursor(t *testing.T) {
 	index := txChain(t, []string{"a"}, []string{"b"}, []string{"c"})
 	first, err := index.QueryTxs(TxQuery{PageSize: 1})

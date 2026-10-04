@@ -265,12 +265,25 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		}
 		return fmt.Errorf("indexroom: read snapshot: %w", err)
 	}
+	// reject reports a content error found in bytes already decoded, unless
+	// the underlying reader has already reported a fault: a stream that
+	// failed cannot be known to be complete, so the read failure takes
+	// precedence over any content error the same batch of bytes exposed —
+	// even over a complete, otherwise valid snapshot. Only a fault already
+	// observed wins; content errors found before the reader has failed are
+	// reported as-is, without reading ahead to look for one.
+	reject := func(err error) error {
+		if reader.fault != nil {
+			return fmt.Errorf("indexroom: read snapshot: %w", reader.fault)
+		}
+		return err
+	}
 	tok, err := dec.Token()
 	if err != nil {
 		return 0, nil, classify(err)
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return 0, nil, invalidSnapshot("snapshot must be a single JSON object")
+		return 0, nil, reject(invalidSnapshot("snapshot must be a single JSON object"))
 	}
 
 	// Top-level fields are captured raw so blocks can be parsed with the
@@ -289,7 +302,7 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 			return 0, nil, classify(err)
 		}
 		if seen[key] {
-			return 0, nil, invalidSnapshot("duplicate field %q", key)
+			return 0, nil, reject(invalidSnapshot("duplicate field %q", key))
 		}
 		seen[key] = true
 		switch key {
@@ -309,7 +322,7 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 			}
 			haveBlocks = true
 		default:
-			return 0, nil, invalidSnapshot("unknown field %q", key)
+			return 0, nil, reject(invalidSnapshot("unknown field %q", key))
 		}
 	}
 	if _, err := dec.Token(); err != nil { // closing '}'
@@ -326,7 +339,9 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 	}
 	if _, err := dec.Token(); err != io.EOF {
 		if err == nil {
-			return 0, nil, invalidSnapshot("trailing data after the snapshot object")
+			// The read that fetched the trailing bytes may itself have
+			// reported a fault; that failure still outranks the extra data.
+			return 0, nil, reject(invalidSnapshot("trailing data after the snapshot object"))
 		}
 		return 0, nil, classify(err)
 	}
