@@ -1240,3 +1240,242 @@ func TestRegistrySelectSessionKeyValidation(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// failingSessionSelect runs one select carrying a session key and asserts it
+// fails with the given kind, carrying no fabricated instance data.
+func failingSessionSelect(t *testing.T, r *Registry, service string, revision int, key string, want OutcomeKind) SelectOutcome {
+	t.Helper()
+	sel, err := r.ValidateSelectionWithSession(service, revision, &key)
+	if err != nil {
+		t.Fatalf("validate select %s key %q: %v", service, key, err)
+	}
+	out := r.Select(sel)
+	if out.OK || out.Kind != want {
+		t.Fatalf("select %s key %q: want failure %s, got %+v", service, key, want, out)
+	}
+	return out
+}
+
+// TestRegistrySelectTwoSessionsInterleaveShareRotation is the regression guard
+// for two different session keys interleaved against one service. Their first
+// successful selections do not start independent rotations: the second key
+// enters at the shared rotation position and its target is chosen by that
+// position, never by the other key's existing binding. Afterwards each reuse
+// returns its own bound instance (id, address and the instance's own accepted
+// sequence), reuses neither roll the cursor back nor skip a healthy instance,
+// and a plain selection continues just after the last real rotation.
+func TestRegistrySelectTwoSessionsInterleaveShareRotation(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "i1", Address: "h1:1"}, {ID: "i2", Address: "h2:2"}, {ID: "i3", Address: "h3:3"},
+	})
+	markHealth(t, r, "svc", "i1", 1, 10, true, "")
+	markHealth(t, r, "svc", "i2", 1, 20, true, "")
+	markHealth(t, r, "svc", "i3", 1, 30, true, "")
+
+	// sA's first success rotates to the smallest id, i1; the shared cursor
+	// rests on i1.
+	if out := selectedWithSession(t, r, "svc", 1, "sA"); out.InstanceID != "i1" ||
+		out.Address != "h1:1" || out.Sequence != 10 {
+		t.Fatalf("sA first select: %+v", out)
+	}
+	// sB's first success shares that rotation position: it continues just after
+	// i1 and takes i2. sA's existing binding never decides sB's target.
+	if out := selectedWithSession(t, r, "svc", 1, "sB"); out.InstanceID != "i2" ||
+		out.Address != "h2:2" || out.Sequence != 20 {
+		t.Fatalf("sB first select should rotate after sA's position: %+v", out)
+	}
+
+	// Interleaved reuses return each session's own current binding and its own
+	// instance data; neither answer leaks the other session's id or address.
+	if out := selectedWithSession(t, r, "svc", 1, "sB"); out.InstanceID != "i2" ||
+		out.Address != "h2:2" || out.Sequence != 20 {
+		t.Fatalf("sB reuse: %+v", out)
+	}
+	if out := selectedWithSession(t, r, "svc", 1, "sA"); out.InstanceID != "i1" ||
+		out.Address != "h1:1" || out.Sequence != 10 {
+		t.Fatalf("sA reuse must not cross into sB's bound instance: %+v", out)
+	}
+
+	// Reusing the earlier binding reports that instance's latest accepted
+	// sequence but still moves no cursor.
+	markHealth(t, r, "svc", "i1", 1, 11, true, "")
+	if out := selectedWithSession(t, r, "svc", 1, "sA"); out.InstanceID != "i1" ||
+		out.Address != "h1:1" || out.Sequence != 11 {
+		t.Fatalf("sA reuse should carry i1's latest accepted sequence: %+v", out)
+	}
+
+	// The last real rotation landed on i2 (sB's first success); neither reuse
+	// rolled it back, so a plain select continues at i3.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "i3" ||
+		out.Address != "h3:3" || out.Sequence != 30 {
+		t.Fatalf("plain select after interleaved reuses should continue at i3: %+v", out)
+	}
+	// sB's reuse also skipped no healthy instance: the next plain rotation
+	// wraps to i1 carrying its current sequence 11.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "i1" ||
+		out.Address != "h1:1" || out.Sequence != 11 {
+		t.Fatalf("plain rotation should wrap to i1 without a skipped instance: %+v", out)
+	}
+
+	// Plain rotations leave both session bindings intact.
+	if out := selectedWithSession(t, r, "svc", 1, "sA"); out.InstanceID != "i1" || out.Sequence != 11 {
+		t.Fatalf("sA binding after plain selects: %+v", out)
+	}
+	if out := selectedWithSession(t, r, "svc", 1, "sB"); out.InstanceID != "i2" || out.Sequence != 20 {
+		t.Fatalf("sB binding after plain selects: %+v", out)
+	}
+}
+
+// TestRegistrySelectTwoSessionsFallbackRebindsOnlyOwnKey is the regression guard
+// for one session's bound instance receiving a newer unhealthy observation
+// while another session's instance stays healthy. The unhealthy session
+// reselects from the then-current rotation position and rewrites ONLY its own
+// binding; with the other healthy instance sitting at the rotation point the
+// reselect wraps onto it, so two distinct sessions legitimately bind the same
+// instance — that is not a conflict and must not steal the original session's
+// binding. The old instance later recovering does not pull the moved session
+// back, and the plain rotation continues from the reselection position.
+func TestRegistrySelectTwoSessionsFallbackRebindsOnlyOwnKey(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "i1", Address: "h1:1"}, {ID: "i2", Address: "h2:2"},
+	})
+	markHealth(t, r, "svc", "i1", 1, 10, true, "")
+	markHealth(t, r, "svc", "i2", 1, 20, true, "")
+
+	// sA binds i1 (shared cursor -> i1); sB then binds i2 (cursor -> i2).
+	if out := selectedWithSession(t, r, "svc", 1, "sA"); out.InstanceID != "i1" {
+		t.Fatalf("sA bind: %+v", out)
+	}
+	if out := selectedWithSession(t, r, "svc", 1, "sB"); out.InstanceID != "i2" {
+		t.Fatalf("sB bind: %+v", out)
+	}
+
+	// sA's instance receives a newer unhealthy observation; sB's stays healthy.
+	markHealth(t, r, "svc", "i1", 1, 11, false, "down")
+
+	// sA reselects from the rotation position resting on i2: i1 is skipped and
+	// the wrap lands on i2, carrying i2's OWN address and sequence — never i1's
+	// stale data. Only sA's binding is rewritten.
+	if out := selectedWithSession(t, r, "svc", 1, "sA"); out.InstanceID != "i2" ||
+		out.Address != "h2:2" || out.Sequence != 20 {
+		t.Fatalf("sA fallback should wrap onto the only healthy i2 with i2's data: %+v", out)
+	}
+	// Both sessions now bind i2: sB keeps its own binding, it was not stolen.
+	if out := selectedWithSession(t, r, "svc", 1, "sB"); out.InstanceID != "i2" ||
+		out.Address != "h2:2" || out.Sequence != 20 {
+		t.Fatalf("sB must keep its own binding to i2: %+v", out)
+	}
+	if out := selectedWithSession(t, r, "svc", 1, "sA"); out.InstanceID != "i2" || out.Sequence != 20 {
+		t.Fatalf("sA must stay on the rebound i2: %+v", out)
+	}
+
+	// The original instance recovers under a newer observation.
+	markHealth(t, r, "svc", "i1", 1, 12, true, "")
+
+	// The session that already moved keeps the new binding...
+	if out := selectedWithSession(t, r, "svc", 1, "sA"); out.InstanceID != "i2" ||
+		out.Address != "h2:2" || out.Sequence != 20 {
+		t.Fatalf("sA must not be pulled back to the recovered i1: %+v", out)
+	}
+	// ...and the other session keeps its own.
+	if out := selectedWithSession(t, r, "svc", 1, "sB"); out.InstanceID != "i2" || out.Sequence != 20 {
+		t.Fatalf("sB keeps its binding after i1 recovers: %+v", out)
+	}
+
+	// The successful reselection left the rotation position on i2 (the shared
+	// binding reuse moved nothing), so a plain select wraps to the recovered i1.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "i1" ||
+		out.Address != "h1:1" || out.Sequence != 12 {
+		t.Fatalf("plain select should continue from the reselection position to i1: %+v", out)
+	}
+	// Selections changed neither the revision nor any accepted health record.
+	if rev := r.RevisionOf("svc"); rev != 1 {
+		t.Fatalf("selection must not change the registration revision: %d", rev)
+	}
+	if inst := instanceHealth(t, r, "svc", "i1"); inst.Health != HealthHealthy || inst.Sequence != 12 {
+		t.Fatalf("i1 final health: %+v", inst)
+	}
+	if inst := instanceHealth(t, r, "svc", "i2"); inst.Health != HealthHealthy || inst.Sequence != 20 {
+		t.Fatalf("i2 final health: %+v", inst)
+	}
+}
+
+// TestRegistrySelectTwoSessionsNoHealthyKeepsBindingsAndCursor is the regression
+// guard for reselection failure isolation across two sessions. When every
+// instance is unhealthy, each session request fails with no_healthy — current
+// revision, a reason, and no fabricated instance id, address or sequence — and
+// the failure preserves BOTH sessions' prior bindings and the shared rotation
+// position. Once each session's previously bound instance accepts a newer
+// healthy observation, the corresponding session reuses it directly with the
+// latest sequence; a plain selection then resumes from the preserved position.
+func TestRegistrySelectTwoSessionsNoHealthyKeepsBindingsAndCursor(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "i1", Address: "h1:1"}, {ID: "i2", Address: "h2:2"},
+	})
+	markHealth(t, r, "svc", "i1", 1, 10, true, "")
+	markHealth(t, r, "svc", "i2", 1, 20, true, "")
+	// sA -> i1, sB -> i2; the shared cursor rests on i2.
+	if out := selectedWithSession(t, r, "svc", 1, "sA"); out.InstanceID != "i1" {
+		t.Fatalf("sA bind: %+v", out)
+	}
+	if out := selectedWithSession(t, r, "svc", 1, "sB"); out.InstanceID != "i2" {
+		t.Fatalf("sB bind: %+v", out)
+	}
+
+	// Newer unhealthy observations make every instance unavailable.
+	markHealth(t, r, "svc", "i1", 1, 11, false, "down")
+	markHealth(t, r, "svc", "i2", 1, 21, false, "down")
+
+	// Both session requests fail no_healthy: current revision, explicit reason,
+	// and no invented target data.
+	for _, key := range []string{"sA", "sB"} {
+		out := failingSessionSelect(t, r, "svc", 1, key, OutcomeNoHealthy)
+		if out.Reason == "" || out.Revision != 1 || out.InstanceID != "" ||
+			out.Address != "" || out.Sequence != 0 {
+			t.Fatalf("no_healthy for %s must not fabricate a target: %+v", key, out)
+		}
+	}
+	// A plain request at the same moment fails identically and moves nothing.
+	sel, err := r.ValidateSelection("svc", 1)
+	if err != nil {
+		t.Fatalf("validate plain select: %v", err)
+	}
+	if out := r.Select(sel); out.OK || out.Kind != OutcomeNoHealthy || out.Revision != 1 {
+		t.Fatalf("plain no_healthy: %+v", out)
+	}
+
+	// sA's previously bound instance recovers: the binding survived the failed
+	// request and is reused directly with the latest accepted sequence.
+	markHealth(t, r, "svc", "i1", 1, 12, true, "")
+	if out := selectedWithSession(t, r, "svc", 1, "sA"); out.InstanceID != "i1" ||
+		out.Address != "h1:1" || out.Sequence != 12 {
+		t.Fatalf("sA should reuse its surviving binding after i1 recovers: %+v", out)
+	}
+	// sB's binding survived too even though sA just rotated nowhere: once i2
+	// recovers, sB reuses it directly with the new sequence.
+	markHealth(t, r, "svc", "i2", 1, 22, true, "")
+	if out := selectedWithSession(t, r, "svc", 1, "sB"); out.InstanceID != "i2" ||
+		out.Address != "h2:2" || out.Sequence != 22 {
+		t.Fatalf("sB should reuse its surviving binding after i2 recovers: %+v", out)
+	}
+
+	// The failed selections froze the cursor on i2 and the reuses never moved
+	// it, so the plain rotation continues just after i2 and wraps to i1.
+	if out := selected(t, r, "svc", 1); out.InstanceID != "i1" ||
+		out.Address != "h1:1" || out.Sequence != 12 {
+		t.Fatalf("plain select should resume from the preserved position at i2: %+v", out)
+	}
+	// Revision and the accepted health records reflect only health operations.
+	if rev := r.RevisionOf("svc"); rev != 1 {
+		t.Fatalf("failures and selections must not change the revision: %d", rev)
+	}
+	if inst := instanceHealth(t, r, "svc", "i1"); inst.Health != HealthHealthy || inst.Sequence != 12 {
+		t.Fatalf("i1 final health: %+v", inst)
+	}
+	if inst := instanceHealth(t, r, "svc", "i2"); inst.Health != HealthHealthy || inst.Sequence != 22 {
+		t.Fatalf("i2 final health: %+v", inst)
+	}
+}

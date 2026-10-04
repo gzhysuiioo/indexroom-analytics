@@ -1865,3 +1865,295 @@ func TestSelectSessionKeyPerService(t *testing.T) {
 		t.Fatalf("s2 reuse: %+v", r)
 	}
 }
+
+// TestSelectTwoSessionKeysInterleaveOneService is the end-to-end regression
+// guard for two different session keys interleaved against one service. The
+// key's first successful selections share the service's single rotation
+// position: the second key's target is chosen by that position (i2), never by
+// the first key's existing binding. Afterwards interleaved reuses return each
+// session's own current binding with that instance's own address and latest
+// accepted sequence; reusing the earlier binding never rolls the plain
+// rotation backwards, and the other session's reuse never skips a healthy
+// instance. Every request succeeds, so the exit status is 0, and the final
+// service list reflects the one newer health observation.
+func TestSelectTwoSessionKeysInterleaveOneService(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"h1:1"},{"id":"i2","address":"h2:2"},{"id":"i3","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":10,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":20,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"i3","expectedRevision":1,"sequence":30,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"alpha"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"beta"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"beta"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"alpha"},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"alpha"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"alpha"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"beta"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 14 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 4: alpha's first success rotates to the smallest id and binds alpha -> i1.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:1" || r.Sequence != 10 {
+		t.Fatalf("alpha first select: %+v", r)
+	}
+	// 5: beta's first success enters at the same rotation position and continues
+	// just after i1: alpha's existing binding never decides beta's target.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "i2" || r.Address != "h2:2" || r.Sequence != 20 {
+		t.Fatalf("beta first select should rotate from the shared position: %+v", r)
+	}
+	// 6-7: interleaved reuses answer each session with its OWN instance data;
+	// no answer carries the other session's id, address or sequence.
+	if r := got.Results[6]; !r.OK || r.InstanceID != "i2" || r.Address != "h2:2" || r.Sequence != 20 {
+		t.Fatalf("beta reuse: %+v", r)
+	}
+	if r := got.Results[7]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:1" || r.Sequence != 10 {
+		t.Fatalf("alpha reuse must not cross into beta's binding: %+v", r)
+	}
+	// 8: a newer healthy observation for the earlier-bound instance is accepted
+	// without a revision bump.
+	if r := got.Results[8]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 11 {
+		t.Fatalf("newer i1 observation: %+v", r)
+	}
+	// 9: reusing the earlier binding reports i1's current address and the LATEST
+	// accepted sequence 11 while still moving no cursor.
+	if r := got.Results[9]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:1" || r.Sequence != 11 {
+		t.Fatalf("alpha reuse should carry the latest sequence: %+v", r)
+	}
+	// 10: the last real rotation (beta's first success) parked the cursor on i2;
+	// the reuses never rolled it back, so the plain select continues at i3.
+	if r := got.Results[10]; !r.OK || r.InstanceID != "i3" || r.Address != "h3:3" || r.Sequence != 30 {
+		t.Fatalf("plain select after interleaved reuses should continue at i3: %+v", r)
+	}
+	// 11: beta's reuse skipped no healthy instance either: the rotation wraps to
+	// i1 carrying its current sequence 11.
+	if r := got.Results[11]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:1" || r.Sequence != 11 {
+		t.Fatalf("plain rotation should wrap to i1 without skipping: %+v", r)
+	}
+	// 12-13: the plain rotations leave both session bindings intact.
+	if r := got.Results[12]; !r.OK || r.InstanceID != "i1" || r.Sequence != 11 {
+		t.Fatalf("alpha binding after plain selects: %+v", r)
+	}
+	if r := got.Results[13]; !r.OK || r.InstanceID != "i2" || r.Sequence != 20 {
+		t.Fatalf("beta binding after plain selects: %+v", r)
+	}
+	// The final list shows the real health state: revision unchanged at 1, i1 at
+	// the newer sequence 11, i2 and i3 untouched.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	wantInsts := []registerInstance{
+		{ID: "i1", Address: "h1:1", Health: "healthy", Sequence: 11},
+		{ID: "i2", Address: "h2:2", Health: "healthy", Sequence: 20},
+		{ID: "i3", Address: "h3:3", Health: "healthy", Sequence: 30},
+	}
+	for i, want := range wantInsts {
+		if got.Services[0].Instances[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, got.Services[0].Instances[i], want)
+		}
+	}
+}
+
+// TestSelectTwoSessionKeysFallbackRewritesOnlyOwnBinding is the end-to-end
+// regression guard for one session's bound instance receiving a newer
+// unhealthy observation while another session's instance stays healthy. The
+// unhealthy session reselects from the rotation position resting on the other
+// instance and wraps onto it, carrying THAT instance's address and sequence;
+// only its own binding is rewritten. Two distinct sessions binding the same
+// healthy instance is legitimate, not a conflict, and cannot steal the other
+// session's binding. When the original instance recovers the moved session
+// keeps its new binding, the other session keeps its own, and the plain
+// rotation continues from the successful reselection position. Every request
+// succeeds, so the exit status is 0.
+func TestSelectTwoSessionKeysFallbackRewritesOnlyOwnBinding(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"h1:1"},{"id":"i2","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":10,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":20,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"alpha"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"beta"},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":11,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"alpha"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"beta"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"alpha"},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":12,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"alpha"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"beta"},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 13 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 3-4: alpha binds i1, beta then binds i2 via the shared rotation.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:1" || r.Sequence != 10 {
+		t.Fatalf("alpha bind: %+v", r)
+	}
+	if r := got.Results[4]; !r.OK || r.InstanceID != "i2" || r.Address != "h2:2" || r.Sequence != 20 {
+		t.Fatalf("beta bind: %+v", r)
+	}
+	// 5: alpha's instance is the one receiving the newer unhealthy observation.
+	if r := got.Results[5]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 11 {
+		t.Fatalf("i1 unhealthy observation: %+v", r)
+	}
+	// 6: alpha reselects from the position resting on i2; i1 is skipped and the
+	// wrap lands on i2, carrying i2's OWN address and sequence — never i1's.
+	if r := got.Results[6]; !r.OK || r.InstanceID != "i2" || r.Address != "h2:2" || r.Sequence != 20 {
+		t.Fatalf("alpha fallback must wrap onto i2 with i2's own data: %+v", r)
+	}
+	// 7-8: both sessions now answer i2; beta's binding was not stolen and alpha
+	// answers from its own rewritten binding.
+	if r := got.Results[7]; !r.OK || r.InstanceID != "i2" || r.Address != "h2:2" || r.Sequence != 20 {
+		t.Fatalf("beta must keep its own binding to i2: %+v", r)
+	}
+	if r := got.Results[8]; !r.OK || r.InstanceID != "i2" || r.Sequence != 20 {
+		t.Fatalf("alpha stays on the rebound i2: %+v", r)
+	}
+	// 9: the original instance accepts a newer healthy observation.
+	if r := got.Results[9]; !r.OK || !r.Changed || r.Sequence != 12 {
+		t.Fatalf("i1 recovery observation: %+v", r)
+	}
+	// 10-11: the moved session is not pulled back to i1; beta keeps its binding.
+	if r := got.Results[10]; !r.OK || r.InstanceID != "i2" || r.Address != "h2:2" || r.Sequence != 20 {
+		t.Fatalf("alpha must keep the new binding after i1 recovers: %+v", r)
+	}
+	if r := got.Results[11]; !r.OK || r.InstanceID != "i2" || r.Sequence != 20 {
+		t.Fatalf("beta keeps its own binding: %+v", r)
+	}
+	// 12: the successful reselection parked the rotation on i2 and the binding
+	// reuses moved nothing, so the plain selection wraps to the recovered i1 with
+	// its current address and latest sequence.
+	if r := got.Results[12]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:1" || r.Sequence != 12 || r.Revision != 1 {
+		t.Fatalf("plain select should continue from the reselection position to i1: %+v", r)
+	}
+	// Selections and binding changes modified neither the revision nor any
+	// accepted health record.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	wantInsts := []registerInstance{
+		{ID: "i1", Address: "h1:1", Health: "healthy", Sequence: 12},
+		{ID: "i2", Address: "h2:2", Health: "healthy", Sequence: 20},
+	}
+	for i, want := range wantInsts {
+		if got.Services[0].Instances[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, got.Services[0].Instances[i], want)
+		}
+	}
+}
+
+// TestSelectTwoSessionKeysNoHealthyIsolation is the end-to-end regression guard
+// for reselection failure isolation across two sessions of one service. With
+// every instance unhealthy, each keyed request (and a plain one) fails at its
+// own result slot with no_healthy: the current revision, a readable reason, and
+// no fabricated instance id or address. Those failures preserve both sessions'
+// prior bindings and the shared rotation position; later legal requests keep
+// processing, and once each previously bound instance accepts a newer healthy
+// observation the matching session reuses it directly with the latest
+// sequence. The plain rotation then resumes from the preserved position. The
+// batch contains failures, so the exit status is 1, and the final service list
+// reflects only the accepted health state at the unchanged revision.
+func TestSelectTwoSessionKeysNoHealthyIsolation(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"h1:1"},{"id":"i2","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":10,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":20,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"alpha"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"beta"},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":11,"healthy":false,"reason":"down"},
+		{"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":21,"healthy":false,"reason":"down"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"alpha"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"beta"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":12,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"alpha"},
+		{"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":22,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"beta"},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains failures, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	// One result per request; the failed selections keep their own slots and the
+	// later legal requests still process.
+	if len(got.Results) != 15 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 3-4: alpha -> i1, beta -> i2; the shared cursor rests on i2.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:1" || r.Sequence != 10 {
+		t.Fatalf("alpha bind: %+v", r)
+	}
+	if r := got.Results[4]; !r.OK || r.InstanceID != "i2" || r.Address != "h2:2" || r.Sequence != 20 {
+		t.Fatalf("beta bind: %+v", r)
+	}
+	// 7-9: every selection fails no_healthy in its own slot with the current
+	// revision and an explicit reason, fabricating neither a target id nor an
+	// address.
+	for _, idx := range []int{7, 8, 9} {
+		if r := got.Results[idx]; r.OK || r.Error != "no_healthy" || r.Reason == "" ||
+			r.Revision != 1 || r.InstanceID != "" || r.Address != "" {
+			t.Fatalf("result %d should be no_healthy without a fabricated target: %+v", idx, r)
+		}
+	}
+	// 10: a later legal request still processes: i1 accepts the newer recovery.
+	if r := got.Results[10]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 12 {
+		t.Fatalf("i1 recovery after failures: %+v", r)
+	}
+	// 11: alpha's binding survived the no_healthy failure, so i1 is reused
+	// directly with its current address and latest accepted sequence.
+	if r := got.Results[11]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:1" || r.Sequence != 12 {
+		t.Fatalf("alpha should reuse its surviving binding: %+v", r)
+	}
+	// 12-13: beta's binding survived independently and reuses i2 once it
+	// recovers, reporting the latest sequence 22.
+	if r := got.Results[12]; !r.OK || !r.Changed || r.Sequence != 22 {
+		t.Fatalf("i2 recovery: %+v", r)
+	}
+	if r := got.Results[13]; !r.OK || r.InstanceID != "i2" || r.Address != "h2:2" || r.Sequence != 22 {
+		t.Fatalf("beta should reuse its surviving binding: %+v", r)
+	}
+	// 14: the failed selections froze the rotation on i2 and the reuses never
+	// moved it, so the plain selection wraps to i1 instead of restarting
+	// anywhere unexpected.
+	if r := got.Results[14]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:1" || r.Sequence != 12 || r.Revision != 1 {
+		t.Fatalf("plain select should resume from the preserved position: %+v", r)
+	}
+	// The failures and selections changed neither the revision nor any accepted
+	// record: the final list shows both instances healthy at their recovery
+	// sequences with no leftover reason.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	wantInsts := []registerInstance{
+		{ID: "i1", Address: "h1:1", Health: "healthy", Sequence: 12},
+		{ID: "i2", Address: "h2:2", Health: "healthy", Sequence: 22},
+	}
+	for i, want := range wantInsts {
+		if got.Services[0].Instances[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, got.Services[0].Instances[i], want)
+		}
+	}
+}
