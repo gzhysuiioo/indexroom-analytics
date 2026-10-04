@@ -163,8 +163,8 @@ func (index *Index) firstQuery(query TxQuery, pageSize int) (TxPage, error) {
 	if queryTxsHookLocked != nil {
 		queryTxsHookLocked(from, to, false)
 	}
-	hits, blocks := index.collectLocked(from, to, query.TxIDs)
-	return index.makePageLocked(query, from, to, hits, blocks, 0, pageSize), nil
+	hits, total, blocks := index.scanPageLocked(from, to, query.TxIDs, 0, pageSize)
+	return index.buildPageLocked(query, from, to, hits, total, blocks, 0, pageSize), nil
 }
 
 func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
@@ -199,28 +199,27 @@ func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
 	if queryTxsHookLocked != nil {
 		queryTxsHookLocked(payload.From, payload.To, true)
 	}
-	hits, blocks := index.collectLocked(payload.From, payload.To, query.TxIDs)
-	if payload.Off > int64(len(hits)) {
+	// Re-scan the still-identical pinned range: the cursor records the
+	// absolute offset, but no full match list is kept between pages.
+	hits, total, blocks := index.scanPageLocked(payload.From, payload.To, query.TxIDs, payload.Off, pageSize)
+	if payload.Off > total {
 		return TxPage{}, fmt.Errorf("%w: cursor offset is beyond the pinned results", ErrQueryChanged)
 	}
-	return index.makePageLocked(query, payload.From, payload.To, hits, blocks, payload.Off, pageSize), nil
+	return index.buildPageLocked(query, payload.From, payload.To, hits, total, blocks, payload.Off, pageSize), nil
 }
 
-// makePageLocked slices one page out of the full match list and mints the
-// continuation cursor when matches remain. The caller must hold index.mu.
-func (index *Index) makePageLocked(query TxQuery, from, to int64, hits []TxHit, blocks int64, offset int64, pageSize int) TxPage {
+// buildPageLocked assembles one page from a page-sized scan and mints the
+// continuation cursor when matches remain. total and blocks describe the
+// whole pinned range; hits holds only the window [offset, offset+pageSize).
+// The caller must hold index.mu.
+func (index *Index) buildPageLocked(query TxQuery, from, to int64, hits []TxHit, total, blocks, offset int64, pageSize int) TxPage {
 	page := TxPage{
-		TotalMatches:  int64(len(hits)),
+		Hits:          hits,
+		TotalMatches:  total,
 		MatchedBlocks: blocks,
 		ToHeight:      to,
 	}
-	rest := hits[int(offset):]
-	end := pageSize
-	if end > len(rest) {
-		end = len(rest)
-	}
-	page.Hits = append([]TxHit{}, rest[:end]...)
-	if end < len(rest) {
+	if offset+int64(len(hits)) < total {
 		page.NextCursor = index.encodeCursor(cursorPayload{
 			V:     1,
 			From:  from,
@@ -228,16 +227,18 @@ func (index *Index) makePageLocked(query TxQuery, from, to int64, hits []TxHit, 
 			To:    to,
 			Set:   hex.EncodeToString(hashTxSet(query.TxIDs)),
 			FP:    hex.EncodeToString(index.fingerprintLocked(from, to)),
-			Off:   offset + int64(end),
+			Off:   offset + int64(len(hits)),
 		})
 	}
 	return page
 }
 
-// collectLocked gathers every matching occurrence in [from, to], ordered by
-// height and position, plus the number of blocks holding at least one match.
-// The caller must hold index.mu.
-func (index *Index) collectLocked(from, to int64, txIDs []string) (hits []TxHit, blocks int64) {
+// scanPageLocked walks the whole pinned range once in height/position order,
+// counting every matching occurrence and every block holding one, while
+// retaining only the page window [offset, offset+pageSize) in a pre-sized
+// slice: at most pageSize TxHit records, independent of how many matches the
+// whole range holds. The caller must hold index.mu.
+func (index *Index) scanPageLocked(from, to int64, txIDs []string, offset int64, pageSize int) (hits []TxHit, total, blocks int64) {
 	var filter map[string]struct{}
 	if len(txIDs) > 0 {
 		filter = make(map[string]struct{}, len(txIDs))
@@ -245,7 +246,7 @@ func (index *Index) collectLocked(from, to int64, txIDs []string) (hits []TxHit,
 			filter[id] = struct{}{}
 		}
 	}
-	hits = []TxHit{}
+	hits = make([]TxHit, 0, pageSize)
 	for height := from; height <= to; height++ {
 		block := index.Blocks[height]
 		matched := false
@@ -255,14 +256,17 @@ func (index *Index) collectLocked(from, to int64, txIDs []string) (hits []TxHit,
 					continue
 				}
 			}
-			hits = append(hits, TxHit{Height: height, BlockHash: block.Hash, TxID: tx, Position: position})
+			if total >= offset && int64(len(hits)) < int64(pageSize) {
+				hits = append(hits, TxHit{Height: height, BlockHash: block.Hash, TxID: tx, Position: position})
+			}
+			total++
 			matched = true
 		}
 		if matched {
 			blocks++
 		}
 	}
-	return hits, blocks
+	return hits, total, blocks
 }
 
 // fingerprintLocked hashes the exact content of every block in [from, to]:
