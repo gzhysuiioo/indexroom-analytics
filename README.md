@@ -545,7 +545,7 @@ From=100 超过链顶 7：err=<nil> 段数=4 解析后高度范围=[100, 7] 整�
 ### Restore 是整体替换，不是合并
 
 - 恢复成功后，索引中**恰好**是快照里的链：高度从 1 连续到快照最后一个区块，旧链的任何高度、哈希都不残留。
-- 用较短的快照恢复后，链顶直接降到快照的末尾高度：旧链多出的区块被删除，被替换高度上的旧交易也一并消失，它们**不再出现在 `QueryTxs`/`QueryTimeStats` 的结果中，也不再出现在再次 `Export` 的内容里**。随后对恢复后的索引再次导出，得到与输入快照逐字节一致的文档。
+- 用较短的快照恢复后，链顶直接降到快照的末尾高度：旧链多出的区块被删除，被替换高度上的旧交易也一并消失，它们**不再出现在 `QueryTxs`/`QueryTimeStats` 的结果中，也不再出现在再次 `Export` 的内容里**。恢复普遍保证的是**数据一致**：再次导出的文档与输入快照描述同一条链（按解码后的值比较）；**逐字节一致只在输入是未经修改的本功能导出内容、且恢复后链内容未再改动时成立**，手写或重新排版过的快照不享受这个保证，详见下文[数据一致不等于文本一致](#数据一致不等于文本一致)。
 - 快照第一个区块的 `parent` 只命名链起点，不需要在索引中存在；其余每个区块必须指向前一区块。
 
 ### 输入必须是一份完整快照
@@ -554,9 +554,19 @@ From=100 超过链顶 7：err=<nil> 段数=4 解析后高度范围=[100, 7] 整�
 - 在一个对象后面拼接第二份文档（或任何其他非空白内容）会被拒绝，不能把两份快照当作一次输入。
 - 全部区块在应用之前整体校验：高度从 1 连续递增、哈希非空且不重复、父链接依次相连等。即使错误出现在**最后一个区块**，前面的合法区块也不会被部分导入。
 
+### 数据一致不等于文本一致
+
+恢复按**解码后的 JSON 值**重建主链。合法快照可以自由选择不改变值的文本写法：对象字段的书写顺序、对象与数组内外的排版空白、字符串的等价转义写法（如把“甲”写成 `\u7532`）都不影响恢复结果；但区块顺序与交易列表顺序不是可自由排版的部分，始终按输入中的原序保留。再次 `Export` 输出的是唯一的**规范文本**（固定字段顺序、无多余空白、字符串采用统一转义写法），不会原样保留输入的文本形式。因此要区分两种一致性：
+
+- **数据一致（普遍保证）**：恢复后再导出，区块高度、哈希、父链接、每笔交易标识（含空标识）、块内位置、重复出现、交易顺序，以及缺失时间与实际时间，都与输入快照**解码后的值**精确一致；`QueryTxs`/`QueryTimeStats` 同样按解码后的原值精确匹配。
+- **文本一致（有条件的保证）**：只有输入是**未经修改的本功能导出内容**、且恢复后链内容没有再被改动时，再次导出才与输入逐字节一致——同一条链无论经历过什么恢复、重组历史，导出的字节永远相同。对手写或重新排版过的快照，应比较解码后的数据而不是字节。
+- **允许换写法不等于放松校验**：字段仍必须合法且不得重复（同一对象内出现两个 `hash` 照样拒绝），未知字段仍被拒绝；一份输入仍只能是恰好一份快照，对象后追加第二份文档会以 `ErrInvalidSnapshot` 拒绝。任何拒绝都不改变已有主链。
+
+下文的[文本写法示例](#文本写法示例不同字段顺序排版与转义)用一份交易列表为 `[甲, "", 甲]` 的单区块快照具体展示这些区别。
+
 ### 版本与时间语义：缺失时间不是 0
 
-- **版本 1**：区块没有 `timestamp` 字段。恢复后这些区块的 `Block.Time` 为 `nil`，即**没有时间**；这不是"自动补 0"，再导出时仍是版本 1 原字节。
+- **版本 1**：区块没有 `timestamp` 字段。恢复后这些区块的 `Block.Time` 为 `nil`，即**没有时间**；这不是"自动补 0"，再导出时仍是不带 `timestamp` 的版本 1（输入若为未经修改的本功能导出内容，则同时逐字节一致，见上节）。
 - **版本 2**：每个区块都必须带 `timestamp`：`null` 表示**缺失时间**（恢复为 `nil`），数字 `0` 表示**实际时间为零**（Unix 秒 0，恢复为指向 0 的非空指针）。`null` 与 `0` 不能互换，二者在查询指纹中也被严格区分。
 - 导出自动选版：所有区块都没有时间时保持版本 1；**只要任一区块带时间（包括时间为 0）**，整份文档就是版本 2，每个区块都输出 `timestamp`，缺失处为 `null`。
 
@@ -571,9 +581,9 @@ From=100 超过链顶 7：err=<nil> 段数=4 解析后高度范围=[100, 7] 整�
 - **恢复失败**（快照被拒或读取出错）：链没有变化，失败前取得的游标仍可用于原链，按[分页查询的既有规则](#游标失效区分-errquerychanged-与-errinvalidargument)继续翻页。
 - **恢复成功**：旧游标不是整体作废，而是遵循同一套固定范围规则继续校验——固定范围内的区块内容变了（即使只是时间变化），或链顶降到该查询固定上界以下，续查返回 `ErrQueryChanged` 且没有可用页结果；此时应**从空游标重新开始查询**，不要把新页拼到旧结果后面。若恢复后的链在固定范围内与首页完全相同且链顶仍覆盖该范围，游标仍可正常续查。
 
-### 完整示例
+### 完整示例：整体替换、拒绝情形与游标
 
-下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/restore/main.go`](examples/restore/main.go)：
+下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/restore/main.go`](examples/restore/main.go)；字段顺序、排版与转义等文本写法问题见其后的[文本写法示例](#文本写法示例不同字段顺序排版与转义)：
 
 ```bash
 go run ./examples/restore
@@ -805,6 +815,246 @@ func main() {
   旧游标续查：errors.Is(err, ErrQueryChanged)=true errors.Is(err, ErrInvalidArgument)=false
   从空游标重新开始：ToHeight=2 命中：1/alpha 2/beta 有后续游标=false
 ```
+
+### 文本写法示例：不同字段顺序、排版与转义
+
+下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/restoreshape/main.go`](examples/restoreshape/main.go)：
+
+```bash
+go run ./examples/restoreshape
+```
+
+场景：同一个单区块、交易列表为 `[甲, "", 甲]` 的版本 2 快照，分别以 `timestamp` 为 `null` 和数字 `0` 的两份**手写输入**恢复。两份输入都打乱了顶层与区块对象的字段顺序、加入排版空白，并把块内位置 0 的“甲”写成等价的 Unicode 转义 `\u7532`（位置 2 仍写字面“甲”）。程序依次展示：输入文本、恢复后的查询结果与再次导出文本；在同一个包含零秒的窗口 `[0, 60)` 上对比缺失时间与零秒的统计区别；再用本功能自己导出的规范字节演示逐字节一致保证成立的条件；最后演示重复字段、对象后追加第二份文档仍被 `ErrInvalidSnapshot` 拒绝且已有主链保持原状。
+
+```go
+// 快照文本写法示例（Index.Restore / Export / QueryTxs / QueryTimeStats）：
+// 同一份单区块快照在输入里换用不同的对象字段顺序、排版空白与 Unicode 转义，
+// 恢复后数据（交易标识、空标识、重复出现、块内位置、顺序）按解码后的值精确
+// 保留，但再次导出的是规范文本，不与输入逐字节一致；再用 timestamp 分别为
+// null 与 0 的两份输入演示版本随“区块是否带时间”变化，以及同一时间窗口下
+// 缺失时间区块与零秒区块的统计区别。最后演示等价写法不等于放松校验：重复
+// 字段、在对象后追加第二份文档仍被 ErrInvalidSnapshot 拒绝，已有主链保持原状。
+//
+// 运行：go run ./examples/restoreshape
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/gzhysuiioo/indexroom-analytics/indexroom"
+)
+
+// inputMissing 是手写的版本 2 快照：顶层字段与区块字段都打乱了顺序，
+// 排版加入了空格与换行，第一笔“甲”写成等价的 Unicode 转义（\u7532，
+// 即 U+7532），第三笔“甲”仍是字面字符；交易列表为 [甲, "", 甲]（中间是空标识）。
+// timestamp 为 null：表示这个区块缺失时间。
+const inputMissing = `{
+  "version" : 2 ,
+  "tip" : 1,
+  "blocks" : [
+    {
+      "txs" : [ "\u7532",  "" , "甲" ],
+      "parent" : "genesis",
+      "timestamp" : null,
+      "hash" : "b1",
+      "height" : 1
+    }
+  ]
+}`
+
+// inputZero 描述同一条链、同一批交易，但排版紧凑、字段顺序再次不同，
+// 唯一的语义差别是 timestamp 为数字 0：真实的零秒时间，而不是缺失时间。
+const inputZero = `{"blocks":[{"timestamp":0,"txs":["甲","","甲"],"height":1,"hash":"b1","parent":"genesis"}],"version":2,"tip":1}`
+
+func exportString(index *indexroom.Index) string {
+	var buf bytes.Buffer
+	if err := index.Export(&buf); err != nil {
+		panic(err)
+	}
+	return buf.String()
+}
+
+// dumpRestored 展示恢复后的链顶、区块时间、交易查询结果与再次导出文本。
+func dumpRestored(index *indexroom.Index) {
+	block := index.Blocks[1]
+	fmt.Printf("  链顶 tip=%d；高度 1 区块 hash=%s parent=%s\n", index.Tip, block.Hash, block.Parent)
+	if block.Time == nil {
+		fmt.Println("  区块时间：缺失（Block.Time 为 nil）")
+	} else {
+		fmt.Printf("  区块时间：真实时间戳 %d 秒（Block.Time 非空，指向 %d）\n", *block.Time, *block.Time)
+	}
+
+	// 不筛选：块内三笔交易全部按位置升序返回，空标识与重复出现都保留。
+	all, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 1})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("  不筛选查询高度 1（TotalMatches=%d）：\n", all.TotalMatches)
+	for _, hit := range all.Hits {
+		fmt.Printf("    position=%d tx=%q\n", hit.Position, hit.TxID)
+	}
+
+	// 精确筛选“甲”：转义写法在解码后与字面“甲”是同一个字符串，
+	// 两次出现分别位于块内位置 0 和 2；空标识不匹配。
+	jia, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 1, TxIDs: []string{"甲"}})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("  精确筛选 %q：TotalMatches=%d MatchedBlocks=%d，位置", "甲", jia.TotalMatches, jia.MatchedBlocks)
+	for _, hit := range jia.Hits {
+		fmt.Printf(" %d", hit.Position)
+	}
+	fmt.Println()
+
+	fmt.Printf("  再次导出：%s\n", exportString(index))
+}
+
+// printWindowStats 在同一个包含零秒的窗口 [0, 60) 上打印统计，
+// 便于对比缺失时间区块与零秒区块的区别。
+func printWindowStats(index *indexroom.Index) {
+	stats, err := index.QueryTimeStats(indexroom.TimeStatsQuery{Start: 0, End: 60, StepSeconds: 60})
+	if err != nil {
+		panic(err)
+	}
+	b := stats.Buckets[0]
+	fmt.Printf("  同一窗口 [0, 60)：段 [0, 60) 交易出现=%d 不同标识=%d 含交易区块=%d；"+
+		"整窗口汇总 交易出现=%d 不同标识=%d 区块=%d；缺失时间区块=%d\n",
+		b.TxCount, b.DistinctTxIDs, b.Blocks,
+		stats.Totals.TxCount, stats.Totals.DistinctTxIDs, stats.Totals.Blocks,
+		stats.MissingTimeBlocks)
+}
+
+func main() {
+	// 1. 恢复 timestamp 为 null 的手写快照：恢复得到缺失时间。
+	fmt.Println("输入 1（版本 2，timestamp 为 null；字段乱序、带排版空白、含 \\u7532 转义）：")
+	fmt.Println(inputMissing)
+	idx := indexroom.New()
+	if err := idx.Restore(strings.NewReader(inputMissing)); err != nil {
+		panic(err)
+	}
+	canonicalV1 := exportString(idx)
+	fmt.Println("恢复 1 成功（err=<nil>）后的查询与再次导出：")
+	dumpRestored(idx)
+	fmt.Printf("  再次导出与输入文本逐字节相等：%v（文本形式不同，但数据一致）\n", canonicalV1 == inputMissing)
+	// 所有区块都缺失时间：导出自动选为版本 1，区块不含 timestamp 字段。
+	// 这不是“丢失了时间”——输入的 null 本来就表示没有时间。
+	printWindowStats(idx)
+	fmt.Println("  （缺失时间区块不进入任何时间段，只计入缺失时间区块数）")
+	fmt.Println()
+
+	// 2. 恢复同链但 timestamp 为 0 的快照：恢复得到真实的零秒时间。
+	fmt.Println("输入 2（版本 2，timestamp 为 0；紧凑排版、字段顺序再次不同）：")
+	fmt.Println(inputZero)
+	if err := idx.Restore(strings.NewReader(inputZero)); err != nil {
+		panic(err)
+	}
+	canonicalV2 := exportString(idx)
+	fmt.Println("恢复 2 成功（err=<nil>）后的查询与再次导出：")
+	dumpRestored(idx)
+	fmt.Printf("  再次导出与输入文本逐字节相等：%v（排版与转义被规范化，数据不变）\n", canonicalV2 == inputZero)
+	fmt.Println("  版本随区块是否带时间变化：输入 1 的 null 恢复为缺失时间，再导出是不带 timestamp 的版本 1；")
+	fmt.Println("  输入 2 的 0 恢复为真实零秒，再导出仍是版本 2 且 timestamp 仍为 0。null 与 0 不可互换。")
+	printWindowStats(idx)
+	fmt.Println("  （零秒是真实时间戳，区块落入段 [0, 60)，三笔交易出现全部计入）")
+	fmt.Println()
+
+	// 3. 逐字节一致保证的范围：只有未经修改的本功能导出内容，在链内容不变时
+	//    恢复后再次导出才逐字节一致。把手写输入换成自己导出的规范字节演示一次。
+	if err := idx.Restore(strings.NewReader(canonicalV2)); err != nil {
+		panic(err)
+	}
+	fmt.Printf("用本功能自己导出的字节恢复，链内容不变时再次导出逐字节一致：%v\n\n",
+		exportString(idx) == canonicalV2)
+
+	// 4. 允许换文本写法，不等于放松校验：字段仍须合法且不得重复。
+	//    下面的区块对象写了两个 hash 字段（其余内容合法），仍被整体拒绝。
+	duplicateField := `{"version":2,"tip":1,"blocks":[` +
+		`{"height":1,"hash":"b1","parent":"genesis","txs":["甲","","甲"],"timestamp":0,"hash":"b1"}]}`
+	err := idx.Restore(strings.NewReader(duplicateField))
+	fmt.Printf("区块对象内重复 hash 字段后 Restore：err=%v\n", err)
+	fmt.Printf("  errors.Is(err, ErrInvalidSnapshot)=%v\n", errors.Is(err, indexroom.ErrInvalidSnapshot))
+	fmt.Printf("  已有主链保持原状：tip=%d，再次导出仍为版本 2 规范文本：%v\n\n",
+		idx.Tip, exportString(idx) == canonicalV2)
+
+	// 5. 一份输入只能是恰好一份快照：对象后追加第二份文档（中间可有空白）
+	//    会以 ErrInvalidSnapshot 拒绝，已恢复的主链不受影响。
+	twoDocs := inputZero + "   " + inputMissing
+	err = idx.Restore(strings.NewReader(twoDocs))
+	fmt.Printf("对象后追加第二份文档后 Restore：err=%v\n", err)
+	fmt.Printf("  errors.Is(err, ErrInvalidSnapshot)=%v\n", errors.Is(err, indexroom.ErrInvalidSnapshot))
+	fmt.Printf("  已有主链保持原状：tip=%d，零秒区块仍在，再次导出未改变：%v\n",
+		idx.Tip, exportString(idx) == canonicalV2)
+}
+```
+
+对应输出（`go run ./examples/restoreshape` 的实际输出，每次运行逐字一致）：
+
+```text
+输入 1（版本 2，timestamp 为 null；字段乱序、带排版空白、含 \u7532 转义）：
+{
+  "version" : 2 ,
+  "tip" : 1,
+  "blocks" : [
+    {
+      "txs" : [ "\u7532",  "" , "甲" ],
+      "parent" : "genesis",
+      "timestamp" : null,
+      "hash" : "b1",
+      "height" : 1
+    }
+  ]
+}
+恢复 1 成功（err=<nil>）后的查询与再次导出：
+  链顶 tip=1；高度 1 区块 hash=b1 parent=genesis
+  区块时间：缺失（Block.Time 为 nil）
+  不筛选查询高度 1（TotalMatches=3）：
+    position=0 tx="甲"
+    position=1 tx=""
+    position=2 tx="甲"
+  精确筛选 "甲"：TotalMatches=2 MatchedBlocks=1，位置 0 2
+  再次导出：{"version":1,"tip":1,"blocks":[{"height":1,"hash":"b1","parent":"genesis","txs":["甲","","甲"]}]}
+  再次导出与输入文本逐字节相等：false（文本形式不同，但数据一致）
+  同一窗口 [0, 60)：段 [0, 60) 交易出现=0 不同标识=0 含交易区块=0；整窗口汇总 交易出现=0 不同标识=0 区块=0；缺失时间区块=1
+  （缺失时间区块不进入任何时间段，只计入缺失时间区块数）
+
+输入 2（版本 2，timestamp 为 0；紧凑排版、字段顺序再次不同）：
+{"blocks":[{"timestamp":0,"txs":["甲","","甲"],"height":1,"hash":"b1","parent":"genesis"}],"version":2,"tip":1}
+恢复 2 成功（err=<nil>）后的查询与再次导出：
+  链顶 tip=1；高度 1 区块 hash=b1 parent=genesis
+  区块时间：真实时间戳 0 秒（Block.Time 非空，指向 0）
+  不筛选查询高度 1（TotalMatches=3）：
+    position=0 tx="甲"
+    position=1 tx=""
+    position=2 tx="甲"
+  精确筛选 "甲"：TotalMatches=2 MatchedBlocks=1，位置 0 2
+  再次导出：{"version":2,"tip":1,"blocks":[{"height":1,"hash":"b1","parent":"genesis","txs":["甲","","甲"],"timestamp":0}]}
+  再次导出与输入文本逐字节相等：false（排版与转义被规范化，数据不变）
+  版本随区块是否带时间变化：输入 1 的 null 恢复为缺失时间，再导出是不带 timestamp 的版本 1；
+  输入 2 的 0 恢复为真实零秒，再导出仍是版本 2 且 timestamp 仍为 0。null 与 0 不可互换。
+  同一窗口 [0, 60)：段 [0, 60) 交易出现=3 不同标识=2 含交易区块=1；整窗口汇总 交易出现=3 不同标识=2 区块=1；缺失时间区块=0
+  （零秒是真实时间戳，区块落入段 [0, 60)，三笔交易出现全部计入）
+
+用本功能自己导出的字节恢复，链内容不变时再次导出逐字节一致：true
+
+区块对象内重复 hash 字段后 Restore：err=indexroom: invalid snapshot: duplicate block field "hash"
+  errors.Is(err, ErrInvalidSnapshot)=true
+  已有主链保持原状：tip=1，再次导出仍为版本 2 规范文本：true
+
+对象后追加第二份文档后 Restore：err=indexroom: invalid snapshot: trailing data after the snapshot object
+  errors.Is(err, ErrInvalidSnapshot)=true
+  已有主链保持原状：tip=1，零秒区块仍在，再次导出未改变：true
+```
+
+输出要点：
+
+- **文本变了，数据没变**：两份手写输入恢复后，不筛选查询都按块内位置 0、1、2 返回 `[甲, "", 甲]`——空标识、两次“甲”的重复出现与交易顺序全部保留；精确筛选“甲”命中位置 0 和 2 共 2 次，说明匹配按**解码后的原值**进行，转义写法与字面写法是同一个标识。对象字段可以换顺序，但区块与交易列表始终按原序保留。
+- **版本由区块是否带时间决定，版本变化不是丢失时间**：`null` 恢复为缺失时间（`Block.Time == nil`），链上没有任何带时间的区块，再导出自动选为**版本 1**、区块不含 `timestamp`；`0` 恢复为真实的零秒时间（非空指针，指向 0），再导出仍是**版本 2** 且 `timestamp` 仍为 `0`。`null` 与 `0` 不是可互换的表示，版本 1 只是如实记录“整条链都没有时间”，并非时间被丢失。
+- **同一窗口 `[0, 60)` 下的统计区别**：缺失时间区块不进入任何时间段（段内与整窗口计数全为 0），但计入 `缺失时间区块=1`；零秒区块真实落入段 `[0, 60)`，三笔交易出现贡献 `交易出现=3`、不同标识 2（“甲”去重后与空标识）、含交易区块 1，`缺失时间区块=0`。
+- **逐字节一致的边界**：两份手写输入再次导出都与输入字节不同（比较结果为 `false`）；改用本功能自己导出的规范字节恢复、链内容不变时，再次导出逐字节一致（`true`）。
+- **校验不放松**：区块对象内重复 `hash` 字段、对象后拼接第二份文档都返回 `ErrInvalidSnapshot`；拒绝后链顶仍为 1、零秒区块仍在，再次导出与拒绝前完全相同，已有主链保持原状。
 
 ## 技术方向
 
