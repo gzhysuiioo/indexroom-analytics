@@ -194,13 +194,80 @@ func (index *Index) Restore(r io.Reader) error {
 	return nil
 }
 
+// snapshotReader mediates between the snapshot's io.Reader and the JSON
+// decoder so a fault the reader reports mid-document cannot be mistaken for a
+// truncated document.
+//
+// json.Decoder turns a clean io.EOF after a partial JSON value into
+// io.ErrUnexpectedEOF, and its token/peek path also drops any error that
+// arrives together with the final bytes of a chunk. Either behavior makes a
+// reader-reported io.ErrUnexpectedEOF — bare or wrapped — indistinguishable
+// from an honestly truncated stream, and can hide the fault altogether.
+//
+// snapshotReader therefore observes every underlying read: a normal io.EOF
+// passes through untouched, while any other error is remembered in fault and,
+// when it arrived together with bytes, withheld until the following read. The
+// decoder consumes the delivered bytes first and then receives the fault as a
+// separate error-only read, where it cannot be swallowed. The fault is sticky
+// afterwards, so a reader that oddly resumes after failing can never let the
+// snapshot be applied once a failure has already been reported.
+type snapshotReader struct {
+	r       io.Reader
+	fault   error // first non-EOF error reported by r, if any
+	pending bool  // fault is due on the next read
+}
+
+func (s *snapshotReader) Read(p []byte) (int, error) {
+	if s.pending {
+		s.pending = false
+		return 0, s.fault
+	}
+	if s.fault != nil {
+		return 0, s.fault
+	}
+	n, err := s.r.Read(p)
+	if err == nil || errors.Is(err, io.EOF) {
+		return n, err
+	}
+	if s.fault == nil {
+		s.fault = err
+	}
+	if n > 0 {
+		s.pending = true
+		return n, nil
+	}
+	return 0, err
+}
+
 // parseSnapshot reads and fully validates one snapshot document. It returns
 // the tip height and the validated blocks in ascending height order.
 func parseSnapshot(r io.Reader) (int64, []Block, error) {
-	dec := json.NewDecoder(r)
+	// A fault the underlying reader reports mid-document — including one
+	// delivered together with usable bytes — is observed via snapshotReader
+	// rather than inferred from the JSON decoder, which would conflate it with
+	// a clean io.EOF on truncated input.
+	reader := &snapshotReader{r: r}
+	dec := json.NewDecoder(reader)
+	// classify maps a decoder failure onto the snapshot error model, but a
+	// fault observed on the underlying reader always wins: the decoder turns a
+	// clean io.EOF after truncated input into io.ErrUnexpectedEOF, so the
+	// presence of a real reader fault is the only reliable way to tell a read
+	// failure from an honestly truncated document. Field context carried by
+	// err (for example which field was being read) is preserved, and the
+	// recorded fault stays in the chain even when the decoder reports a
+	// separate content error from bytes already buffered.
+	classify := func(err error) error {
+		if reader.fault == nil {
+			return classifySnapshotErr(err)
+		}
+		if !errors.Is(err, reader.fault) {
+			err = fmt.Errorf("%w: %v", reader.fault, err)
+		}
+		return fmt.Errorf("indexroom: read snapshot: %w", err)
+	}
 	tok, err := dec.Token()
 	if err != nil {
-		return 0, nil, classifySnapshotErr(err)
+		return 0, nil, classify(err)
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
 		return 0, nil, invalidSnapshot("snapshot must be a single JSON object")
@@ -219,7 +286,7 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 	for dec.More() {
 		key, err := snapshotKey(dec)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, classify(err)
 		}
 		if seen[key] {
 			return 0, nil, invalidSnapshot("duplicate field %q", key)
@@ -228,17 +295,17 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		switch key {
 		case "version":
 			if err := dec.Decode(&rawVersion); err != nil {
-				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+				return 0, nil, classify(fmt.Errorf("field %q: %w", key, err))
 			}
 			haveVersion = true
 		case "tip":
 			if err := dec.Decode(&rawTip); err != nil {
-				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+				return 0, nil, classify(fmt.Errorf("field %q: %w", key, err))
 			}
 			haveTip = true
 		case "blocks":
 			if err := dec.Decode(&rawBlocks); err != nil {
-				return 0, nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+				return 0, nil, classify(fmt.Errorf("field %q: %w", key, err))
 			}
 			haveBlocks = true
 		default:
@@ -246,14 +313,22 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		}
 	}
 	if _, err := dec.Token(); err != nil { // closing '}'
-		return 0, nil, classifySnapshotErr(err)
+		return 0, nil, classify(err)
 	}
-	// Only whitespace may follow the snapshot object.
+	// Only whitespace may follow the snapshot object. A reader fault that
+	// arrived together with the document's final bytes is held back by
+	// snapshotReader and surfaces here, ahead of any content validation below:
+	// once the stream failed, the document cannot be known to be complete, so
+	// the read failure takes precedence even when the buffered bytes already
+	// contain trailing data or a complete object.
+	if reader.fault != nil {
+		return 0, nil, fmt.Errorf("indexroom: read snapshot: %w", reader.fault)
+	}
 	if _, err := dec.Token(); err != io.EOF {
 		if err == nil {
 			return 0, nil, invalidSnapshot("trailing data after the snapshot object")
 		}
-		return 0, nil, classifySnapshotErr(err)
+		return 0, nil, classify(err)
 	}
 
 	if !haveVersion {
@@ -396,7 +471,7 @@ func readSnapshotBlockObject(dec *json.Decoder, known ...string) (map[string]jso
 	for dec.More() {
 		key, err := snapshotKey(dec)
 		if err != nil {
-			return nil, err
+			return nil, classifySnapshotErr(err)
 		}
 		if _, dup := fields[key]; dup {
 			return nil, invalidSnapshot("duplicate block field %q", key)
@@ -612,11 +687,12 @@ func parseSnapshotTxs(dec *json.Decoder, height int64) ([]string, error) {
 	return txs, nil
 }
 
-// snapshotKey reads the next object key.
+// snapshotKey reads the next object key and returns the decoder's error
+// unwrapped so each caller can classify it against its own input source.
 func snapshotKey(dec *json.Decoder) (string, error) {
 	tok, err := dec.Token()
 	if err != nil {
-		return "", classifySnapshotErr(err)
+		return "", err
 	}
 	key, ok := tok.(string)
 	if !ok {
