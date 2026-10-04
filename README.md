@@ -18,7 +18,7 @@ go test ./...
 - `Index.Append` / `Index.Reorg`：摄取区块与重组，负时间整体拒绝且不改变已有链；哈希、父哈希或任一交易标识含非法 UTF-8 字节时同样整体拒绝，错误信息指出区块高度与字段（交易标识另指出从 0 开始的位置），保证快照可无损导出与恢复。
 - `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
 - `Index.QueryTimeStats`：按 `[Start, End)` 半开窗口与 `StepSeconds` 分段统计交易出现次数、不同标识数、含匹配交易的区块数，并给出整窗口去重汇总与缺失时间区块数；非法参数返回 `ErrInvalidArgument`。完整用法见下方[按时间窗口统计交易指南](#按时间窗口统计交易指南querytimestats)。
-- `Index.Export` / `Index.Restore`：快照版本 1（全无时间时保持原字节）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）。
+- `Index.Export` / `Index.Restore`：快照版本 1（全无时间时保持原字节）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）。`Restore` 用一份完整快照整体替换主链，非法输入返回 `ErrInvalidSnapshot` 且不改变现有链。完整用法见下方[快照导出与恢复指南（Export/Restore）](#快照导出与恢复指南exportrestore)。
 
 ## 分页交易查询指南（QueryTxs）
 
@@ -536,6 +536,274 @@ From=100 超过链顶 7：err=<nil> 段数=4 解析后高度范围=[100, 7] 整�
 起点时间不小于终点：ErrInvalidArgument=true
 非正步长：ErrInvalidArgument=true
 分段超过一万段：ErrInvalidArgument=true
+```
+
+## 快照导出与恢复指南（Export/Restore）
+
+`Index.Export(w)` 把当前主链写成一份 JSON 快照（`version`、`tip`、按高度升序的 `blocks`）；`Index.Restore(r)` 读取一份快照并用它**整体替换主链**。两个接口都只看到一个完整的链状态，且与查询、摄取可并发使用：恢复在读取和校验阶段不持锁，索引全程可查询、可追加。
+
+### Restore 是整体替换，不是合并
+
+- 恢复成功后，索引中**恰好**是快照里的链：高度从 1 连续到快照最后一个区块，旧链的任何高度、哈希都不残留。
+- 用较短的快照恢复后，链顶直接降到快照的末尾高度：旧链多出的区块被删除，被替换高度上的旧交易也一并消失，它们**不再出现在 `QueryTxs`/`QueryTimeStats` 的结果中，也不再出现在再次 `Export` 的内容里**。随后对恢复后的索引再次导出，得到与输入快照逐字节一致的文档。
+- 快照第一个区块的 `parent` 只命名链起点，不需要在索引中存在；其余每个区块必须指向前一区块。
+
+### 输入必须是一份完整快照
+
+- `Restore` 的输入必须是**恰好一份**完整的 JSON 快照对象；对象结尾之后允许有空白（空格、制表符、换行）。
+- 在一个对象后面拼接第二份文档（或任何其他非空白内容）会被拒绝，不能把两份快照当作一次输入。
+- 全部区块在应用之前整体校验：高度从 1 连续递增、哈希非空且不重复、父链接依次相连等。即使错误出现在**最后一个区块**，前面的合法区块也不会被部分导入。
+
+### 版本与时间语义：缺失时间不是 0
+
+- **版本 1**：区块没有 `timestamp` 字段。恢复后这些区块的 `Block.Time` 为 `nil`，即**没有时间**；这不是"自动补 0"，再导出时仍是版本 1 原字节。
+- **版本 2**：每个区块都必须带 `timestamp`：`null` 表示**缺失时间**（恢复为 `nil`），数字 `0` 表示**实际时间为零**（Unix 秒 0，恢复为指向 0 的非空指针）。`null` 与 `0` 不能互换，二者在查询指纹中也被严格区分。
+- 导出自动选版：所有区块都没有时间时保持版本 1；**只要任一区块带时间（包括时间为 0）**，整份文档就是版本 2，每个区块都输出 `timestamp`，缺失处为 `null`。
+
+### 区分非法快照与读取输入的错误
+
+- **快照非法**：JSON 损坏或截断、对象后有多余数据、版本未知、字段缺失/类型错误/未知/重复、高度不连续、哈希为空或重复、父链接断裂、版本 2 时间戳缺失或既非 `null` 也非非负整数等，统一返回可用 `errors.Is(err, indexroom.ErrInvalidSnapshot)` 识别的错误，具体原因附在错误信息中（例如指出断裂发生在哪个高度）。
+- **读取输入失败**：底层 `io.Reader` 在读到完整文档前返回的错误（网络中断、存储故障等）**不是** `ErrInvalidSnapshot`，而是包装为 `indexroom: read snapshot: ...` 返回，**原始读取错误仍可用 `errors.Is` 识别**。
+- 两种失败都不会改变现有链：链顶、区块、哈希以及此前发出的分页游标全部保持原状，可以继续使用恢复前那份数据。
+
+### 恢复与分页游标
+
+- **恢复失败**（快照被拒或读取出错）：链没有变化，失败前取得的游标仍可用于原链，按[分页查询的既有规则](#游标失效区分-errquerychanged-与-errinvalidargument)继续翻页。
+- **恢复成功**：旧游标不是整体作废，而是遵循同一套固定范围规则继续校验——固定范围内的区块内容变了（即使只是时间变化），或链顶降到该查询固定上界以下，续查返回 `ErrQueryChanged` 且没有可用页结果；此时应**从空游标重新开始查询**，不要把新页拼到旧结果后面。若恢复后的链在固定范围内与首页完全相同且链顶仍覆盖该范围，游标仍可正常续查。
+
+### 完整示例
+
+下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/restore/main.go`](examples/restore/main.go)：
+
+```bash
+go run ./examples/restore
+```
+
+场景：先准备一条 4 个区块的较长旧链（全部无时间，导出为版本 1）；再用 `Export` 从另一条 2 个区块的较短新链取得版本 2 快照——高度 1 时间为 0、高度 2 缺失时间（`timestamp` 分别为 `0` 和 `null`）。程序先展示拼接两份文档与**最后一个区块父哈希错误**两种输入被 `ErrInvalidSnapshot` 拒绝、链与游标保持原状（并演示读取途中故障保留原始读取错误）；再用合法快照恢复，输出恢复前后的链顶、交易查询与再次导出内容，可以直接看到旧链多出的高度 3、4 和被替换的交易已经消失，最后演示成功恢复后旧游标返回 `ErrQueryChanged`。
+
+```go
+// 快照恢复（Index.Export / Index.Restore）完整示例：用导出的较短新链快照
+// 整体替换较长旧链，展示替换前后的链顶、交易查询与再次导出；再展示最后一个
+// 区块父哈希错误的快照被整体拒绝（ErrInvalidSnapshot）、链与游标保持原状，
+// 以及读取输入失败与非法快照的区分、恢复成功后旧游标返回 ErrQueryChanged。
+//
+// 运行：go run ./examples/restore
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/gzhysuiioo/indexroom-analytics/indexroom"
+)
+
+func mustAppend(index *indexroom.Index, block indexroom.Block) {
+	if err := index.Append(block); err != nil {
+		panic(err)
+	}
+}
+
+// unix 返回指向给定 Unix 秒的指针，用于设置区块时间。
+func unix(sec int64) *int64 { return &sec }
+
+// querySet 同时包含旧链独有标识、新链独有标识与两链共有的标识，
+// 让一次查询就能看出哪些交易被替换。
+var querySet = []string{"alpha", "OLD-4", "beta"}
+
+func exportString(index *indexroom.Index) string {
+	var buf bytes.Buffer
+	if err := index.Export(&buf); err != nil {
+		panic(err)
+	}
+	return buf.String()
+}
+
+// dumpState 打印当前链顶、固定筛选下的交易查询首页和再次导出内容，
+// 每次调用都看到一个完整的链状态。
+func dumpState(index *indexroom.Index) {
+	fmt.Printf("  链顶 tip=%d\n", index.Tip)
+	page, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 4, TxIDs: querySet})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("  查询高度 [1, 4] 内标识 %v（空游标首页，ToHeight=%d）：TotalMatches=%d MatchedBlocks=%d\n",
+		querySet, page.ToHeight, page.TotalMatches, page.MatchedBlocks)
+	for _, hit := range page.Hits {
+		fmt.Printf("    命中 height=%d block=%s tx=%q position=%d\n",
+			hit.Height, hit.BlockHash, hit.TxID, hit.Position)
+	}
+	fmt.Printf("  再次导出：%s\n", exportString(index))
+}
+
+// failAfterReader 先送出 data，随后始终返回 err，模拟读取快照途中存储故障。
+type failAfterReader struct {
+	data []byte
+	err  error
+}
+
+func (r *failAfterReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func main() {
+	// 1. 预先准备一条较长的旧链（4 个区块，全部没有时间，导出为版本 1）。
+	target := indexroom.New()
+	mustAppend(target, indexroom.Block{Height: 1, Hash: "s1", Parent: "genesis", Txs: []string{"alpha", "OLD-1"}})
+	mustAppend(target, indexroom.Block{Height: 2, Hash: "s2", Parent: "s1", Txs: []string{"alpha"}})
+	mustAppend(target, indexroom.Block{Height: 3, Hash: "s3", Parent: "s2", Txs: []string{"OLD-3"}})
+	mustAppend(target, indexroom.Block{Height: 4, Hash: "s4", Parent: "s3", Txs: []string{"OLD-4", "alpha"}})
+	fmt.Println("操作 1：准备较长旧链（4 个区块）后的状态")
+	oldExport := exportString(target)
+	dumpState(target)
+	fmt.Println()
+
+	// 2. 用现有导出功能从另一条较短的新链取得快照（2 个区块）。
+	//    高度 1 时间为 0（真实时间戳），高度 2 没有时间；只要有一个区块带时间，
+	//    导出即为版本 2，每块都带 timestamp：0 与 null 同时出现。
+	source := indexroom.New()
+	mustAppend(source, indexroom.Block{Height: 1, Hash: "n1", Parent: "genesis", Txs: []string{"alpha"}, Time: unix(0)})
+	mustAppend(source, indexroom.Block{Height: 2, Hash: "n2", Parent: "n1", Txs: []string{"beta"}})
+	snapshot := exportString(source)
+	fmt.Printf("操作 2：从较短新链（2 个区块）Export 出快照\n  %s\n\n", snapshot)
+
+	// 3. 在旧链上取得两个分页游标（同一固定范围 [1, 4]、同一筛选，每页 2 条），
+	//    分别留给“恢复被拒绝”和“恢复成功”之后续查。
+	query := indexroom.TxQuery{From: 1, To: 4, TxIDs: querySet, PageSize: 2}
+	firstA, err := target.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	firstB, err := target.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	cursorAfterReject := firstA.NextCursor
+	cursorAfterRestore := firstB.NextCursor
+	fmt.Printf("操作 3：旧链固定范围 [1, 4] 首页（每页 2 条）命中：")
+	for _, hit := range firstA.Hits {
+		fmt.Printf("%d/%s ", hit.Height, hit.TxID)
+	}
+	fmt.Printf("剩余记录由游标续查（游标不透明，不展示内容）\n\n")
+
+	// 4a. 拒绝情形之一：把两份快照文档拼在一起不是合法输入，
+	//     只允许一份完整 JSON 文档（结尾可以有空白）。
+	err = target.Restore(strings.NewReader(snapshot + snapshot))
+	fmt.Printf("操作 4a：拼接两份文档后 Restore：err=%v\n", err)
+	fmt.Printf("  errors.Is(err, ErrInvalidSnapshot)=%v，链顶仍为 tip=%d\n\n",
+		errors.Is(err, indexroom.ErrInvalidSnapshot), target.Tip)
+
+	// 4b. 拒绝情形之二：最后一个区块的父哈希被改错。前一个区块完全合法，
+	//     但整份快照必须在应用前全部校验通过，因此不会有任何部分导入。
+	broken := strings.Replace(snapshot, `"parent":"n1"`, `"parent":"WRONG-PARENT"`, 1)
+	err = target.Restore(strings.NewReader(broken))
+	fmt.Printf("操作 4b：最后一个区块父哈希错误后 Restore：err=%v\n", err)
+	fmt.Printf("  errors.Is(err, ErrInvalidSnapshot)=%v（具体原因已在错误信息中指出）\n",
+		errors.Is(err, indexroom.ErrInvalidSnapshot))
+	fmt.Println("拒绝后的状态（应与操作 1 完全一致，不能出现新链区块）：")
+	dumpState(target)
+	fmt.Printf("  导出内容与恢复前逐字节一致：%v\n", exportString(target) == oldExport)
+	// 恢复失败前取得的游标仍可用于原链，继续读出旧链高度 4 的两条记录。
+	cont, err := target.QueryTxs(indexroom.TxQuery{
+		From: 1, To: 4, TxIDs: querySet, PageSize: 2, Cursor: cursorAfterReject,
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("  旧游标续查成功（err=%v），本页命中：", err)
+	for _, hit := range cont.Hits {
+		fmt.Printf("%d/%s ", hit.Height, hit.TxID)
+	}
+	fmt.Println()
+	fmt.Println()
+
+	// 4c. 区分读取输入发生的错误：读到一半底层 reader 故障。
+	//     原始读取错误仍可用 errors.Is 识别，它不是 ErrInvalidSnapshot；
+	//     这种情况同样不改变现有链。
+	readProblem := errors.New("simulated storage read failure")
+	err = target.Restore(&failAfterReader{data: []byte(snapshot[:len(snapshot)/2]), err: readProblem})
+	fmt.Printf("操作 4c：读取途中故障后 Restore：err=%v\n", err)
+	fmt.Printf("  errors.Is(err, 读取错误)=%v errors.Is(err, ErrInvalidSnapshot)=%v 链顶仍为 tip=%d\n\n",
+		errors.Is(err, readProblem), errors.Is(err, indexroom.ErrInvalidSnapshot), target.Tip)
+
+	// 5. 成功恢复：输入是一份完整 JSON 快照，结尾允许空白（这里追加一个换行）。
+	//    Restore 用快照整体替换主链，不与旧链合并。
+	err = target.Restore(strings.NewReader(snapshot + "\n"))
+	fmt.Printf("操作 5：用合法短链快照（结尾带换行）Restore：err=%v\n", err)
+	fmt.Println("成功恢复后的状态（旧链多出的高度 3、4 与被替换的交易应全部消失）：")
+	dumpState(target)
+	fmt.Printf("  再次导出与操作 2 的快照逐字节一致：%v\n", exportString(target) == snapshot)
+	// 旧游标遵循既有固定范围规则：固定上界为 4，链顶已降到 2，续查返回
+	// ErrQueryChanged 而不是部分数据；应从空游标重新开始查询。
+	_, err = target.QueryTxs(indexroom.TxQuery{
+		From: 1, To: 4, TxIDs: querySet, PageSize: 2, Cursor: cursorAfterRestore,
+	})
+	fmt.Printf("  旧游标续查：errors.Is(err, ErrQueryChanged)=%v errors.Is(err, ErrInvalidArgument)=%v\n",
+		errors.Is(err, indexroom.ErrQueryChanged), errors.Is(err, indexroom.ErrInvalidArgument))
+	restart, err := target.QueryTxs(indexroom.TxQuery{From: 1, To: 4, TxIDs: querySet, PageSize: 2})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("  从空游标重新开始：ToHeight=%d 命中：", restart.ToHeight)
+	for _, hit := range restart.Hits {
+		fmt.Printf("%d/%s ", hit.Height, hit.TxID)
+	}
+	fmt.Printf("有后续游标=%v\n", restart.NextCursor != "")
+}
+```
+
+对应输出（`go run ./examples/restore` 的实际输出，每次运行逐字一致）：
+
+```text
+操作 1：准备较长旧链（4 个区块）后的状态
+  链顶 tip=4
+  查询高度 [1, 4] 内标识 [alpha OLD-4 beta]（空游标首页，ToHeight=4）：TotalMatches=4 MatchedBlocks=3
+    命中 height=1 block=s1 tx="alpha" position=0
+    命中 height=2 block=s2 tx="alpha" position=0
+    命中 height=4 block=s4 tx="OLD-4" position=0
+    命中 height=4 block=s4 tx="alpha" position=1
+  再次导出：{"version":1,"tip":4,"blocks":[{"height":1,"hash":"s1","parent":"genesis","txs":["alpha","OLD-1"]},{"height":2,"hash":"s2","parent":"s1","txs":["alpha"]},{"height":3,"hash":"s3","parent":"s2","txs":["OLD-3"]},{"height":4,"hash":"s4","parent":"s3","txs":["OLD-4","alpha"]}]}
+
+操作 2：从较短新链（2 个区块）Export 出快照
+  {"version":2,"tip":2,"blocks":[{"height":1,"hash":"n1","parent":"genesis","txs":["alpha"],"timestamp":0},{"height":2,"hash":"n2","parent":"n1","txs":["beta"],"timestamp":null}]}
+
+操作 3：旧链固定范围 [1, 4] 首页（每页 2 条）命中：1/alpha 2/alpha 剩余记录由游标续查（游标不透明，不展示内容）
+
+操作 4a：拼接两份文档后 Restore：err=indexroom: invalid snapshot: trailing data after the snapshot object
+  errors.Is(err, ErrInvalidSnapshot)=true，链顶仍为 tip=4
+
+操作 4b：最后一个区块父哈希错误后 Restore：err=indexroom: invalid snapshot: block at height 2 does not link to its parent
+  errors.Is(err, ErrInvalidSnapshot)=true（具体原因已在错误信息中指出）
+拒绝后的状态（应与操作 1 完全一致，不能出现新链区块）：
+  链顶 tip=4
+  查询高度 [1, 4] 内标识 [alpha OLD-4 beta]（空游标首页，ToHeight=4）：TotalMatches=4 MatchedBlocks=3
+    命中 height=1 block=s1 tx="alpha" position=0
+    命中 height=2 block=s2 tx="alpha" position=0
+    命中 height=4 block=s4 tx="OLD-4" position=0
+    命中 height=4 block=s4 tx="alpha" position=1
+  再次导出：{"version":1,"tip":4,"blocks":[{"height":1,"hash":"s1","parent":"genesis","txs":["alpha","OLD-1"]},{"height":2,"hash":"s2","parent":"s1","txs":["alpha"]},{"height":3,"hash":"s3","parent":"s2","txs":["OLD-3"]},{"height":4,"hash":"s4","parent":"s3","txs":["OLD-4","alpha"]}]}
+  导出内容与恢复前逐字节一致：true
+  旧游标续查成功（err=<nil>），本页命中：4/OLD-4 4/alpha 
+
+操作 4c：读取途中故障后 Restore：err=indexroom: read snapshot: field "blocks": simulated storage read failure
+  errors.Is(err, 读取错误)=true errors.Is(err, ErrInvalidSnapshot)=false 链顶仍为 tip=4
+
+操作 5：用合法短链快照（结尾带换行）Restore：err=<nil>
+成功恢复后的状态（旧链多出的高度 3、4 与被替换的交易应全部消失）：
+  链顶 tip=2
+  查询高度 [1, 4] 内标识 [alpha OLD-4 beta]（空游标首页，ToHeight=2）：TotalMatches=2 MatchedBlocks=2
+    命中 height=1 block=n1 tx="alpha" position=0
+    命中 height=2 block=n2 tx="beta" position=0
+  再次导出：{"version":2,"tip":2,"blocks":[{"height":1,"hash":"n1","parent":"genesis","txs":["alpha"],"timestamp":0},{"height":2,"hash":"n2","parent":"n1","txs":["beta"],"timestamp":null}]}
+  再次导出与操作 2 的快照逐字节一致：true
+  旧游标续查：errors.Is(err, ErrQueryChanged)=true errors.Is(err, ErrInvalidArgument)=false
+  从空游标重新开始：ToHeight=2 命中：1/alpha 2/beta 有后续游标=false
 ```
 
 ## 技术方向
