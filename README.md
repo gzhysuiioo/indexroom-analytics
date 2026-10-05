@@ -321,6 +321,82 @@ echo '{"requests":[
 - 会话键先去除两端空白，整理后相同的键视为同一会话；显式提供 `null`、非字符串或纯空白字符串时返回 `invalid`，原因中指明 `sessionKey` 问题。字段检查仍先于修订号判断。
 - 失败项（`invalid`、`conflict`、`not_found`、`no_healthy`）不创建或改写绑定，也不移动轮询位置；批次中后续请求照常处理。会话选择不改变注册修订号或健康记录。
 
+### 完整示例
+
+**每次调用 `register` 命令都从空注册表开始**，会话绑定只存在于本次进程的内存中。因此下面的注册、健康上报与全部选择必须放在同一份 `requests` 数组里按顺序提交；不能把“建立会话”和“后续选择”拆成多次命令调用，还声称绑定会保留。
+
+下面只用一个服务 `svc` 和两个健康实例（`i1`/`h1:8080`、`i2`/`h2:8080`），交错展示会话键 `user-42` 的选择与不带会话键的普通选择，并穿插绑定实例变不健康、恢复健康，以及一次纯空白会话键失败：
+
+```bash
+echo '{"requests":[
+  {"type":"register","service":"svc","expectedRevision":0,"instances":[
+    {"id":"i1","address":"h1:8080"},
+    {"id":"i2","address":"h2:8080"}
+  ]},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"user-42"},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"  user-42  "},
+  {"type":"select","service":"svc","expectedRevision":1},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"user-42"},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":2,"healthy":false,"reason":"心跳超时"},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"user-42"},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":3,"healthy":true},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"user-42"},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"   "},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"user-42"},
+  {"type":"select","service":"svc","expectedRevision":1}
+]}' | go run ./cmd/indexroom register
+```
+
+输出（逐项说明见后）：
+
+```json
+{
+  "results": [
+    {"service":"svc","ok":true,"changed":true,"revision":1},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i1","address":"h1:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i1","address":"h1:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i2","address":"h2:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i1","address":"h1:8080"},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":2},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i2","address":"h2:8080"},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":3},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i2","address":"h2:8080"},
+    {"service":"svc","ok":false,"revision":1,"error":"invalid","reason":"sessionKey must not be empty"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i2","address":"h2:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":3,"instanceId":"i1","address":"h1:8080"}
+  ],
+  "services": [
+    {"service":"svc","revision":1,"instances":[
+      {"id":"i1","address":"h1:8080","health":"healthy","sequence":3},
+      {"id":"i2","address":"h2:8080","health":"healthy","sequence":1}
+    ]}
+  ]
+}
+```
+
+逐项说明：
+
+1. 注册 `svc`，含两个实例 `i1`（`h1:8080`）和 `i2`（`h2:8080`），`changed:true`，修订号为 1；两个实例初始都是 `unknown`、序号 0。
+2. `i1` 序号 1 的健康观察被接受（`changed:true`）；健康上报不增加修订号，修订号仍为 1。
+3. `i2` 序号 1 的健康观察被接受；至此两个实例都健康、序号均为 1。
+4. 第一次携带会话键 `user-42` 的选择：该会话尚无绑定，**参与正常轮询**。尚无轮询选中记录时取标识最小的健康实例，选中 `i1`，返回地址 `h1:8080` 和最新健康序号 1；轮询位置推进到 `i1`，并记住绑定 `user-42 → i1`。
+5. 携带带两端空白的键 `"  user-42  "`：去除两端空白后与第 4 项的键完全相同，属于**同一会话**，直接复用绑定，仍返回 `i1`/`h1:8080`/序号 1；复用绑定不推进轮询位置，轮询位置仍停在 `i1`。
+6. 不带 `sessionKey` 的普通选择：从最近一次实际轮询选中的实例（第 4 项的 `i1`）之后继续，选中 `i2`，返回 `h2:8080` 和序号 1，轮询位置推进到 `i2`。
+7. 再次使用 `user-42`：复用绑定返回 `i1`（此时仍健康），轮询位置不动、仍为 `i2`。可见普通选择穿插进来并不会改掉会话绑定，会话复用也不会替普通选择推动轮询。
+8. `i1` 序号 2 的不健康观察被接受：序号比当前的 1 更大，原因为非空的 `心跳超时`（输出中只存储原因，不随选择结果返回）；修订号仍为 1，`i1` 变为 `unhealthy`、序号 2。
+9. 同一 `user-42` 再选：绑定的 `i1` 当前为 `unhealthy`，绑定不可用，回退到正常轮询。当前健康集合只剩 `i2`，从轮询位置 `i2` 之后环绕后仍选中 `i2`，返回 `h2:8080` 和序号 1，轮询位置为 `i2`，并在成功后把绑定**改写**为 `user-42 → i2`。
+10. `i1` 序号 3 的恢复健康观察被接受（`changed:true`），原因清空，`i1` 重新成为 `healthy`、序号 3；修订号仍为 1。
+11. 同一 `user-42` 再选：绑定已改指向健康的 `i2`，继续返回 `i2` 和序号 1；**`i1` 恢复健康后会话不会自动迁回**，只有绑定实例不可用时才会重新轮询。
+12. 提交纯空白会话键 `"   "`：整理后为空，返回 `invalid`，原因 `sessionKey must not be empty` 明确指出是 `sessionKey` 的问题；该结果**没有** `instanceId`、`address`、`sequence` 等目标实例字段。失败不创建或改写绑定，也不移动轮询位置，批次后续请求继续执行。
+13. 再用 `user-42`：仍返回 `i2` 和序号 1，印证第 12 项失败既没有清空或改写绑定，恢复健康的 `i1` 也不会让会话自动迁回。
+14. 再做一次不带会话键的普通选择：它从最近一次**实际轮询**选中的实例（第 9 项的 `i2`）之后继续——第 11、13 项是绑定复用、第 12 项失败，都没有移动轮询位置。从 `i2` 之后环绕到最小的健康实例 `i1`，返回 `h1:8080` 和它的最新健康序号 3。
+
+末尾的 `services` 列表与各次选择对得上：选择和健康上报都不改变注册修订号，`svc` 修订号仍为 1；`i1` 为 `healthy`、序号 3（第 10 项），`i2` 为 `healthy`、序号 1（第 3 项），第 14 项返回的序号 3 正来自 `i1` 的最新健康记录。输出只包含程序公开的 `results` 与 `services` 字段，会话绑定和轮询位置不单独对外暴露，只能从后续选择返回的实例推断。成功的选择结果没有 `changed` 字段；失败项没有目标实例字段。本批次含失败项（第 12 项），进程退出状态为 1，即使其后的第 13、14 项选择成功也一样。
+
 ## 技术方向
 
 blockchain-indexer, tx-indexer, onchain-analytics, tx-decoder, data-indexer, metrics, block-explorer
