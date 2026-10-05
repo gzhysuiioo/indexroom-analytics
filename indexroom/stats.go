@@ -112,13 +112,9 @@ func (index *Index) QueryTimeStats(query TimeStatsQuery) (TimeStats, error) {
 			ErrInvalidArgument, count, MaxTimeBuckets)
 	}
 
-	var filter map[string]struct{}
-	if len(query.TxIDs) > 0 {
-		filter = make(map[string]struct{}, len(query.TxIDs))
-		for _, id := range query.TxIDs {
-			filter[id] = struct{}{}
-		}
-	}
+	// One canonical filter backs the statistics scan, so matching and the
+	// empty-list-vs-{""} distinction behave exactly as in QueryTxs.
+	filter := newTxFilter(query.TxIDs)
 
 	stats := TimeStats{Buckets: make([]TimeBucket, count)}
 	for i := range stats.Buckets {
@@ -165,10 +161,8 @@ func (index *Index) QueryTimeStats(query TimeStatsQuery) (TimeStats, error) {
 		bucket := (t - query.Start) / query.StepSeconds
 		matched := false
 		for _, tx := range block.Txs {
-			if filter != nil {
-				if _, ok := filter[tx]; !ok {
-					continue
-				}
+			if !filter.matches(tx) {
+				continue
 			}
 			stats.Buckets[bucket].TxCount++
 			stats.Totals.TxCount++
