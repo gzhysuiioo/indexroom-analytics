@@ -2757,6 +2757,302 @@ func TestInvalidAddressWhitespaceOrControlRejectedAtomically(t *testing.T) {
 	}
 }
 
+// TestReleaseSessionRejoinsRotation is the headline end-to-end flow: the key
+// first binds i1, a plain select parks the cursor on i2, release_session drops
+// the binding (changed), a second release of the same key succeeds unchanged,
+// and the key's next selection joins the rotation after i2 to land on i3. The
+// release chooses no target and changes no revision or health record.
+func TestReleaseSessionRejoinsRotation(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"h1:1"},{"id":"i2","address":"h2:2"},{"id":"i3","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"i3","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"  k  "},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"release_session","service":"  svc  ","expectedRevision":1,"sessionKey":"  k  "},
+		{"type":"release_session","service":"svc","expectedRevision":1,"sessionKey":"k"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"k"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"k"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 10 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 4: first use of the key rotates to i1 and binds k -> i1.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "i1" || r.Address != "h1:1" || r.Sequence != 1 {
+		t.Fatalf("first session select: %+v", r)
+	}
+	// 5: a plain select parks the cursor on i2.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "i2" {
+		t.Fatalf("plain select: %+v", r)
+	}
+	// 6: releasing the bound key reports changed with no target fields.
+	if r := got.Results[6]; !r.OK || !r.Changed || r.Revision != 1 ||
+		r.InstanceID != "" || r.Address != "" || r.Sequence != 0 {
+		t.Fatalf("first release: %+v", r)
+	}
+	// 7: the binding is already gone, so the release still succeeds but
+	// changed must be absent.
+	if r := got.Results[7]; !r.OK || r.Changed || r.Revision != 1 ||
+		r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("second release should succeed unchanged: %+v", r)
+	}
+	// 8: the released key rejoins the rotation just after i2 and gets i3.
+	if r := got.Results[8]; !r.OK || r.InstanceID != "i3" || r.Address != "h3:3" || r.Sequence != 1 || r.Revision != 1 {
+		t.Fatalf("released key should rotate to i3: %+v", r)
+	}
+	// 9: the fresh success rebound the key, so it reuses i3.
+	if r := got.Results[9]; !r.OK || r.InstanceID != "i3" {
+		t.Fatalf("rebound key should reuse i3: %+v", r)
+	}
+	// The release changed no revision or health record.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 || len(got.Services[0].Instances) != 3 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	for _, inst := range got.Services[0].Instances {
+		if inst.Health != "healthy" || inst.Sequence != 1 {
+			t.Fatalf("health record changed by release: %+v", inst)
+		}
+	}
+}
+
+// TestReleaseSessionIsolation keeps two sessions in one service and the same
+// key in another service, then proves the release removes only the named
+// binding and moves no cursor.
+func TestReleaseSessionIsolation(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":3,"healthy":true},
+		{"type":"register","service":"other","expectedRevision":0,"instances":[{"id":"a","address":"o1:1"}]},
+		{"type":"health","service":"other","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"select","service":"other","expectedRevision":1,"sessionKey":"x"},
+		{"type":"release_session","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"},
+		{"type":"select","service":"other","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"x"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"y"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 14 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 6-8: svc binds x -> a, y -> b; other binds x -> a.
+	if r := got.Results[6]; !r.OK || r.InstanceID != "a" {
+		t.Fatalf("svc x bind: %+v", r)
+	}
+	if r := got.Results[7]; !r.OK || r.InstanceID != "b" {
+		t.Fatalf("svc y bind: %+v", r)
+	}
+	if r := got.Results[8]; !r.OK || r.InstanceID != "a" || r.Address != "o1:1" {
+		t.Fatalf("other x bind: %+v", r)
+	}
+	// 9: release only svc x.
+	if r := got.Results[9]; !r.OK || !r.Changed || r.Revision != 1 || r.InstanceID != "" {
+		t.Fatalf("release svc x: %+v", r)
+	}
+	// 10: svc y keeps its own binding to b.
+	if r := got.Results[10]; !r.OK || r.InstanceID != "b" {
+		t.Fatalf("svc y must survive: %+v", r)
+	}
+	// 11: the same key in another service keeps its own binding and address.
+	if r := got.Results[11]; !r.OK || r.InstanceID != "a" || r.Address != "o1:1" {
+		t.Fatalf("other x must survive: %+v", r)
+	}
+	// 12: released svc x joins the rotation at the cursor (just after y's b)
+	// and binds to c.
+	if r := got.Results[12]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 3 {
+		t.Fatalf("released svc x should rotate to c: %+v", r)
+	}
+	// 13: svc y is still pinned to b.
+	if r := got.Results[13]; !r.OK || r.InstanceID != "b" {
+		t.Fatalf("svc y must stay bound to b: %+v", r)
+	}
+}
+
+// TestReleaseSessionBoundInstanceStateIrrelevant releases bindings whose
+// instance is unhealthy, removed, unknown after an address change, or where
+// the whole instance list is empty: every release still removes an existing
+// binding, and a repeat release then succeeds unchanged.
+func TestReleaseSessionBoundInstanceStateIrrelevant(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"k"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":2,"healthy":false,"reason":"down"},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[]},
+		{"type":"select","service":"svc","expectedRevision":2,"sessionKey":"k"},
+		{"type":"release_session","service":"svc","expectedRevision":2,"sessionKey":"k"},
+		{"type":"release_session","service":"svc","expectedRevision":2,"sessionKey":"k"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains a no_healthy failure, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 8 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 4: the instance list is emptied while a is unhealthy; the service and
+	// the session binding both survive the replacement.
+	if r := got.Results[4]; !r.OK || !r.Changed || r.Revision != 2 {
+		t.Fatalf("empty-list replacement: %+v", r)
+	}
+	// 5: selection on the emptied service is no_healthy and invents no target;
+	// the failure preserves the dangling binding.
+	if r := got.Results[5]; r.OK || r.Error != "no_healthy" || r.InstanceID != "" || r.Revision != 2 {
+		t.Fatalf("empty-list select: %+v", r)
+	}
+	// 6: neither the unhealthy/removed target nor the empty list blocks the
+	// release of the surviving binding: changed, with no target fields.
+	if r := got.Results[6]; !r.OK || !r.Changed || r.Revision != 2 || r.InstanceID != "" {
+		t.Fatalf("release on an empty list: %+v", r)
+	}
+	// 7: repeat release is an unchanged success, not not_found.
+	if r := got.Results[7]; !r.OK || r.Changed || r.Revision != 2 {
+		t.Fatalf("repeat release on the empty list: %+v", r)
+	}
+
+	// Removed instance, then an address change that leaves a unknown at a new
+	// address: the dangling binding releases once, and later releases are
+	// unchanged successes.
+	input = `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"k"},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[]},
+		{"type":"release_session","service":"svc","expectedRevision":2,"sessionKey":"k"},
+		{"type":"register","service":"svc","expectedRevision":2,"instances":[{"id":"a","address":"h9:9"}]},
+		{"type":"release_session","service":"svc","expectedRevision":3,"sessionKey":"k"}
+	]}`
+	out, code = runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("exit code: %d, output: %s", code, out)
+	}
+	got = registerOutput{}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 7 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	if r := got.Results[4]; !r.OK || !r.Changed || r.Revision != 2 {
+		t.Fatalf("release pointing at a removed instance: %+v", r)
+	}
+	if r := got.Results[6]; !r.OK || r.Changed || r.Revision != 3 {
+		t.Fatalf("release with an unknown re-added instance should be unchanged: %+v", r)
+	}
+}
+
+// TestReleaseSessionFailures exercises invalid/conflict/not_found and their
+// ordering, and proves a failed release keeps the binding so a later valid
+// request still reuses it.
+func TestReleaseSessionFailures(t *testing.T) {
+	cases := map[string]string{
+		"missing key":   `{"requests":[{"type":"release_session","service":"s","expectedRevision":0}]}`,
+		"null key":      `{"requests":[{"type":"release_session","service":"s","expectedRevision":0,"sessionKey":null}]}`,
+		"number key":    `{"requests":[{"type":"release_session","service":"s","expectedRevision":0,"sessionKey":5}]}`,
+		"boolean key":   `{"requests":[{"type":"release_session","service":"s","expectedRevision":0,"sessionKey":true}]}`,
+		"object key":    `{"requests":[{"type":"release_session","service":"s","expectedRevision":0,"sessionKey":{}}]}`,
+		"blank key":     `{"requests":[{"type":"release_session","service":"s","expectedRevision":0,"sessionKey":"  "}]}`,
+		"empty key":     `{"requests":[{"type":"release_session","service":"s","expectedRevision":0,"sessionKey":""}]}`,
+		"blank service": `{"requests":[{"type":"release_session","service":"  ","expectedRevision":0,"sessionKey":"k"}]}`,
+	}
+	for name, input := range cases {
+		t.Run("invalid "+name, func(t *testing.T) {
+			out, code := runRegisterWith(t, input)
+			if code != 1 {
+				t.Fatalf("exit code: %d", code)
+			}
+			var got registerOutput
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("output is not JSON: %v\n%s", err, out)
+			}
+			if len(got.Results) != 1 || got.Results[0].OK || got.Results[0].Error != "invalid" {
+				t.Fatalf("expected one invalid result, got %+v", got.Results)
+			}
+			if !strings.Contains(got.Results[0].Reason, "sessionKey") &&
+				!strings.Contains(got.Results[0].Reason, "service name") {
+				t.Fatalf("reason should name sessionKey or the service field, got %q", got.Results[0].Reason)
+			}
+		})
+	}
+
+	// A batch covering ordering and preservation of the binding.
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":2,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"k"},
+		{"type":"release_session","service":"svc","expectedRevision":9,"sessionKey":"  "},
+		{"type":"release_session","service":"svc","expectedRevision":9,"sessionKey":"k"},
+		{"type":"release_session","service":"ghost","expectedRevision":0,"sessionKey":"k"},
+		{"type":"release_session","service":"svc","expectedRevision":1,"sessionKey":"k"},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"k"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains failures, exit code: %d", code)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 9 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 3: the binding k -> a exists.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" {
+		t.Fatalf("bind: %+v", r)
+	}
+	// 4: blank key is invalid (field validity precedes the revision check),
+	// reporting the current revision.
+	if r := got.Results[4]; r.OK || r.Error != "invalid" || r.Revision != 1 ||
+		!strings.Contains(r.Reason, "sessionKey") {
+		t.Fatalf("blank key invalid precedence: %+v", r)
+	}
+	// 5: valid fields, mismatching revision: conflict with both revisions.
+	if r := got.Results[5]; r.OK || r.Error != "conflict" || r.Revision != 1 ||
+		r.ExpectedRevision != 9 || r.ActualRevision != 1 {
+		t.Fatalf("revision conflict: %+v", r)
+	}
+	// 6: unknown service at expectedRevision 0 is not_found.
+	if r := got.Results[6]; r.OK || r.Error != "not_found" || r.Revision != 0 {
+		t.Fatalf("unknown service expected 0: %+v", r)
+	}
+	// 7: the failures preserved the binding, so releasing now reports changed
+	// and carries no target fields.
+	if r := got.Results[7]; !r.OK || !r.Changed || r.Revision != 1 ||
+		r.InstanceID != "" || r.Address != "" || r.Sequence != 0 {
+		t.Fatalf("release after failures: %+v", r)
+	}
+	// 8: released, the key rejoins the rotation after a and gets b.
+	if r := got.Results[8]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 2 {
+		t.Fatalf("released key should rotate to b: %+v", r)
+	}
+}
+
 func TestRegisterNormalDeliveryKeepsBehavior(t *testing.T) {
 	// Sanity: when stdout accepts everything, no stderr diagnostic is emitted
 	// on either the success path or the business-failure path, and existing

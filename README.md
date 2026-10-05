@@ -89,6 +89,27 @@ session), bindings are independent per service, and an explicit `null`, a
 non-string or a blank-after-trim key is `invalid` with a reason naming the
 `sessionKey` problem. Failed selections never create or rewrite a binding.
 
+A `release_session` request carries `service`, `expectedRevision` and a
+**required** `sessionKey` and drops that one session binding in that one
+service, so the key's next selection joins the normal rotation again. A
+present binding is removed and the result carries `changed:true`; releasing a
+key that has no binding still succeeds, but the result omits `changed`. The
+state of the formerly bound instance is irrelevant: removed, never-confirmed-
+healthy or currently unhealthy instances, and even an empty instance list, do
+not block removing the binding. A release chooses no target — its result never
+contains `instanceId`, `address` or a health `sequence` — and it moves or
+resets neither the rotation cursor nor any other session's binding (including
+another session bound to the same instance and the same key in another
+service); it never alters the instance list, revision or health records. The
+key's next selection follows the first-binding rule, rotating from just after
+the last actually rotated position and rebinding on success. The service name
+and session key are trimmed first; a missing, `null`, non-string or
+blank-after-trim key is `invalid` (the reason names the `sessionKey`
+problem), field validity precedes the revision check, a revision mismatch is
+`conflict`, and an unknown service at `expectedRevision` 0 is `not_found` —
+each failure states the current revision and a reason, preserves every binding
+and the rotation position, and later requests in the batch still run.
+
 ## 离线健康上报（`health` 请求）中文说明
 
 `health` 请求在 `register` 命令的同一批 `requests` 中记录一条离线健康观察，不做任何网络探测。规则如下：
@@ -399,6 +420,101 @@ echo '{"requests":[
 15. `user-42` 最后再选择：依旧复用 `i2`、序号 1。普通轮询在第 14 项经过 `i1` 不会改写会话绑定。
 
 末尾的 `services` 列表与逐项结果一一对应：`i1` 为 `healthy`、序号 3，`i2` 为 `healthy`、序号 1；`i1` 的不健康原因已被第 12 项的健康观察清空，因此列表中没有原因字段，实例按标识升序排列。整批选择期间注册修订号始终是 1，健康序号只由第 2、3、8、12 项 `health` 请求推进，`select` 不改变注册修订号或任何健康记录；成功的选择结果没有 `changed` 字段，失败项（第 10 项）没有目标实例字段。本批次含有失败项，进程退出状态为 1，即使其后第 11–15 项全部成功也一样。输出只包含程序实际公开的字段：会话绑定和轮询位置没有查询接口，只能像本示例这样通过后续选择的返回来观察。
+
+## 解除单个会话绑定（`release_session` 请求）中文说明
+
+`release_session` 请求在同一批 `requests` 中解除**指定服务下指定会话键**的绑定，让该键的下一次选择重新参与轮询。它与已有请求按输入顺序处理，只使用本次调用的内存状态，不进行任何网络访问。
+
+### 请求字段与校验规则
+
+- `service`：服务名，先去除两端空白；整理后为空返回 `invalid`。解除只作用于该服务，其他服务下的同名会话键不受影响。
+- `expectedRevision`：必填整数，合法性要求与其他请求完全一致（32 位程序 `0..2147483647`、64 位程序 `0..9223372036854775807`）。
+- `sessionKey`：**必填**。先去除两端空白；缺失、显式 `null`、非字符串或整理后为空都返回 `invalid`，原因明确指出 `sessionKey` 问题（整理后相同的键是同一个会话）。
+- **字段检查先于修订号判断**：字段全部合法后，修订号不匹配返回 `conflict`（携带 `expectedRevision` 与 `actualRevision`）；未知服务在 `expectedRevision` 为 0 时返回 `not_found`。失败报告处理该项时的当前修订号和具体原因，保留全部绑定和轮询位置，批次后续请求继续执行。
+
+### 成功语义与不变量
+
+- 该服务下该键**存在绑定时**：移除它，成功结果含 `service`、当前 `revision` 与 `changed:true`。
+- **没有绑定时**（从未绑定、或已经解除过）：仍然成功，但结果中**不出现 `changed`**。
+- 绑定指向的实例已被删除、尚未确认健康（`unknown`）、已不健康（`unhealthy`），以及服务实例列表为空，**都不能阻止**解除已有绑定——绑定只是记住的一个实例标识。
+- 解除**不选择目标**：结果永远不出现 `instanceId`、`address` 或健康 `sequence`。
+- 解除本身**不移动也不重置**轮询位置，不改变实例列表、注册修订号和健康记录。其他会话即使绑定同一实例也继续保留自己的绑定。
+- 解除之后同一键的选择沿用**首次建立绑定的规则**：从最近一次实际轮询位置之后选取健康实例，成功后建立新绑定。例如健康实例依次为 `i1`、`i2`、`i3`，会话先绑定 `i1`，随后普通选择得到 `i2`，解除后该会话再次选择应得到 `i3`。
+
+### 完整示例
+
+```bash
+echo '{"requests":[
+  {"type":"register","service":"svc","expectedRevision":0,"instances":[
+    {"id":"i1","address":"h1:8080"},
+    {"id":"i2","address":"h2:8080"},
+    {"id":"i3","address":"h3:8080"}
+  ]},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"health","service":"svc","instanceId":"i3","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"  user-42  "},
+  {"type":"select","service":"svc","expectedRevision":1},
+  {"type":"release_session","service":"svc","expectedRevision":1,"sessionKey":"  user-42  "},
+  {"type":"release_session","service":"svc","expectedRevision":1,"sessionKey":"user-42"},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"user-42"},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"user-42"},
+  {"type":"select","service":"svc","expectedRevision":1},
+  {"type":"release_session","service":"svc","expectedRevision":9,"sessionKey":"user-42"},
+  {"type":"release_session","service":"ghost","expectedRevision":0,"sessionKey":"user-42"},
+  {"type":"release_session","service":"svc","expectedRevision":1,"sessionKey":"   "},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"user-42"}
+]}' | go run ./cmd/indexroom register
+```
+
+输出（逐项说明见后）：
+
+```json
+{
+  "results": [
+    {"service":"svc","ok":true,"changed":true,"revision":1},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i1","address":"h1:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i2","address":"h2:8080"},
+    {"service":"svc","ok":true,"changed":true,"revision":1},
+    {"service":"svc","ok":true,"revision":1},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i3","address":"h3:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i3","address":"h3:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i1","address":"h1:8080"},
+    {"service":"svc","ok":false,"revision":1,"error":"conflict","reason":"service \"svc\" is at revision 1, not 9","expectedRevision":9,"actualRevision":1},
+    {"service":"ghost","ok":false,"revision":0,"error":"not_found","reason":"service \"ghost\" does not exist"},
+    {"service":"svc","ok":false,"revision":1,"error":"invalid","reason":"sessionKey must not be empty"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i3","address":"h3:8080"}
+  ],
+  "services": [
+    {"service":"svc","revision":1,"instances":[
+      {"id":"i1","address":"h1:8080","health":"healthy","sequence":1},
+      {"id":"i2","address":"h2:8080","health":"healthy","sequence":1},
+      {"id":"i3","address":"h3:8080","health":"healthy","sequence":1}
+    ]}
+  ]
+}
+```
+
+逐项说明：
+
+1. 注册服务 `svc`，含三个实例，修订号为 1。
+2–4. 三个实例各接受序号 1 的健康观察，全部 `healthy`；健康上报不增加修订号。
+5. 会话键 `"  user-42  "` 整理为 `user-42`，首次选择参与正常轮询得到 `i1`，轮询位置停在 `i1`，并记住绑定 `user-42 → i1`。
+6. 不带键的普通选择从 `i1` 之后继续，得到 `i2`，轮询位置推进到 `i2`。
+7. 解除 `svc` 下整理后为 `user-42` 的绑定：绑定存在，`changed:true`；结果只有服务名和当前修订号，没有任何目标实例字段。轮询位置仍是 `i2`。
+8. 再次解除同一个键：绑定已不存在，仍然成功，但**没有 `changed`**。
+9. 该键的下一次选择按首次绑定规则，从最近一次实际轮询位置 `i2` 之后选取，得到 `i3`，成功后建立新绑定 `user-42 → i3`。
+10. 再次使用该键：复用新绑定的 `i3`，不推动轮询。
+11. 普通选择越过末尾回到最小的 `i1`，证明解除和复用都没有重置或移动轮询位置。
+12. 字段合法但 `expectedRevision` 9 与当前修订号 1 不符：`conflict`，携带两个修订号；绑定不受影响。
+13. 未知服务在 `expectedRevision` 为 0 时返回 `not_found`，`revision` 为 0。
+14. 纯空白会话键返回 `invalid`，原因 `sessionKey must not be empty` 明确指出 `sessionKey` 问题，`revision` 报告当前修订号 1；失败项没有目标字段，也不改变任何绑定和轮询位置。
+15. 第 12–14 项失败之后，会话绑定仍是第 9 项建立的 `i3`：返回 `i3`、地址 `h3:8080`、序号 1。
+
+末尾的 `services` 快照与处理前的健康状态一一对应，证明解除不改变实例列表、修订号和健康记录。本批次含失败项（第 12–14 项），进程退出状态为 1；解除与选择都不进行网络访问，注册、健康观察、绑定建立与解除必须放在同一批 `requests` 中提交。
 
 ## 技术方向
 

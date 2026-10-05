@@ -134,6 +134,37 @@ type SelectOutcome struct {
 	Sequence   int64
 }
 
+// SessionRelease is a validated request that drops one session binding.
+//
+// SessionKey is the trimmed session identifier. The release is scoped to the
+// named service only: the same key in another service keeps its binding.
+type SessionRelease struct {
+	Service    string
+	Revision   int
+	SessionKey string
+}
+
+// ReleaseOutcome is the result of releasing one session binding.
+//
+// A release never selects a target, so it carries no instance id, address or
+// health sequence even on success. Changed is set only when a binding actually
+// existed for the key; releasing an unbound key still succeeds with Changed
+// left false. The release moves neither the per-service rotation cursor nor
+// any binding other than the named one, and it never alters registrations,
+// revisions or health records — whether the bound instance was removed, never
+// observed healthy or is currently unhealthy does not block removing the
+// binding itself.
+type ReleaseOutcome struct {
+	Service  string
+	OK       bool
+	Changed  bool
+	Kind     OutcomeKind
+	Reason   string
+	Revision int
+	Expected int
+	Actual   int
+}
+
 // Registry is an in-memory service instance registry.
 type Registry struct {
 	services map[string]*serviceState
@@ -317,6 +348,20 @@ func (f *revisionFailure) asHealth(service string) HealthOutcome {
 // never fabricates an instance id, address or sequence on rejection.
 func (f *revisionFailure) asSelect(service string) SelectOutcome {
 	return SelectOutcome{
+		Service:  service,
+		OK:       false,
+		Kind:     f.kind,
+		Reason:   f.reason,
+		Revision: f.revision,
+		Expected: f.expected,
+		Actual:   f.actual,
+	}
+}
+
+// asRelease maps the shared revision gate failure onto a session-release
+// result. It carries no target fields: a release never selects an instance.
+func (f *revisionFailure) asRelease(service string) ReleaseOutcome {
+	return ReleaseOutcome{
 		Service:  service,
 		OK:       false,
 		Kind:     f.kind,
@@ -564,6 +609,32 @@ func (r *Registry) ValidateSelectionWithSession(service string, revision int64, 
 	return Selection{Service: name, Revision: int(revision), SessionKey: key}, nil
 }
 
+// ValidateSessionRelease trims and validates one release_session request
+// without touching the registry. Unlike a selection the sessionKey is
+// mandatory: a nil (absent) key or a blank-after-trim key is invalid with a
+// reason naming the sessionKey problem. revision is the raw submitted
+// expectedRevision, range-checked before it is narrowed to int. The check
+// order mirrors ValidateSelectionWithSession — service name, then the
+// revision range, then the key — and content validity is fully established
+// before any revision comparison against the registry.
+func (r *Registry) ValidateSessionRelease(service string, revision int64, sessionKey *string) (SessionRelease, error) {
+	name, err := validateServiceName(service)
+	if err != nil {
+		return SessionRelease{}, err
+	}
+	if err := validateExpectedRevision(revision); err != nil {
+		return SessionRelease{}, err
+	}
+	if sessionKey == nil {
+		return SessionRelease{}, errInvalid("sessionKey is required and must be a non-empty string")
+	}
+	key := strings.TrimSpace(*sessionKey)
+	if key == "" {
+		return SessionRelease{}, errInvalid("sessionKey must not be empty")
+	}
+	return SessionRelease{Service: name, Revision: int(revision), SessionKey: key}, nil
+}
+
 // Select chooses one healthy instance for the service once the shared revision
 // gate has passed.
 //
@@ -660,6 +731,46 @@ func (r *Registry) Select(sel Selection) SelectOutcome {
 		InstanceID: chosen,
 		Address:    cur.address,
 		Sequence:   cur.sequence,
+	}
+}
+
+// ReleaseSession drops one session binding once the shared revision gate has
+// passed.
+//
+// The gate is the same one health and select use (see
+// checkServiceRevision): a revision mismatch is a conflict carrying the
+// request and current revisions (an unknown service is at revision 0), and a
+// matching request for an unknown service is not_found — including when
+// expectedRevision is 0. Only after it does release do its own work.
+//
+// Releasing deletes at most the named key's binding in the named service. It
+// never consults the bound instance's state: whether that instance was
+// removed, never observed healthy, is currently unknown/unhealthy, or the
+// service's instance list is empty cannot keep the binding in place, since
+// the binding is only a remembered id. Releasing a key that has no binding
+// still succeeds with Changed left false. No target is chosen, so the result
+// carries no instance id, address or health sequence.
+//
+// The release moves and resets neither the rotation cursor nor any other
+// session's binding (including another session bound to the same instance and
+// the same key in another service), and it never alters the instance list,
+// the registration revision or a health record. The next selection with the
+// released key follows the first-binding rule: it rotates from just after the
+// last actually rotated position and records a fresh binding only on success.
+func (r *Registry) ReleaseSession(rel SessionRelease) ReleaseOutcome {
+	st, fail := r.checkServiceRevision(rel.Service, rel.Revision)
+	if fail != nil {
+		return fail.asRelease(rel.Service)
+	}
+	_, bound := st.sessions[rel.SessionKey]
+	if bound {
+		delete(st.sessions, rel.SessionKey)
+	}
+	return ReleaseOutcome{
+		Service:  rel.Service,
+		OK:       true,
+		Changed:  bound,
+		Revision: st.revision,
 	}
 }
 

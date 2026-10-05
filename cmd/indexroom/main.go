@@ -43,7 +43,8 @@ func usage() {
 	fmt.Println("in-memory service instance registry with offline health observations:")
 	fmt.Println(`  {"requests":[{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"host:8080"}]},`)
 	fmt.Println(`              {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true},`)
-	fmt.Println(`              {"type":"select","service":"svc","expectedRevision":1}]}`)
+	fmt.Println(`              {"type":"select","service":"svc","expectedRevision":1},`)
+	fmt.Println(`              {"type":"release_session","service":"svc","expectedRevision":1,"sessionKey":"user-42"}]}`)
 	fmt.Println("A register request fully replaces the service's instance list; new services")
 	fmt.Println("require expectedRevision 0, existing services the current revision. A health")
 	fmt.Println("request records an offline observation (healthy/unhealthy) for one instance;")
@@ -54,6 +55,10 @@ func usage() {
 	fmt.Println("A select request may carry an optional \"sessionKey\" string: requests in the")
 	fmt.Println("same service with the same trimmed key reuse the instance first chosen for")
 	fmt.Println("that key while it stays registered and healthy, without moving the rotation.")
+	fmt.Println("A release_session request carries service, expectedRevision and a required")
+	fmt.Println("sessionKey; it drops that key's binding in the named service so the next")
+	fmt.Println("selection with the key joins the rotation again. It chooses no target, moves")
+	fmt.Println("no cursor, and succeeds without changed when the key has no binding.")
 	fmt.Println("Exit status is 0 only when every request succeeds and the JSON result")
 	fmt.Println("is fully written to standard output. A failed result write is reported")
 	fmt.Println("on standard error with the underlying write error and also exits 1,")
@@ -158,6 +163,8 @@ func runRegisterIO(in io.Reader, out io.Writer, errOut io.Writer) int {
 			proc.healthRequest(raw, service)
 		case "select":
 			proc.selectRequest(raw, service)
+		case "release_session":
+			proc.releaseSessionRequest(raw, service)
 		default:
 			proc.invalidf(service, "unknown type %q", reqType)
 		}
@@ -442,6 +449,75 @@ func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 		InstanceID: outcome.InstanceID,
 		Address:    outcome.Address,
 		Sequence:   outcome.Sequence,
+	})
+}
+
+// releaseSessionRequest processes one release_session request, appending its
+// outcome. The request releases one session binding in one service: it never
+// selects a target, never moves the rotation cursor or any other binding, and
+// never alters the instance list, revision or health records. A present
+// binding is removed and reported changed; releasing an unbound key still
+// succeeds without changed.
+func (p *registerProcessor) releaseSessionRequest(raw json.RawMessage, service string) {
+	var req struct {
+		Service  string          `json:"service"`
+		Revision json.RawMessage `json:"expectedRevision"`
+		Session  json.RawMessage `json:"sessionKey"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		p.invalidf(service, "release_session request must be an object with service, expectedRevision and sessionKey: %v", err)
+		return
+	}
+	service = strings.TrimSpace(req.Service)
+
+	if len(req.Revision) == 0 || strings.TrimSpace(string(req.Revision)) == "null" {
+		p.invalid(service, "expectedRevision is required and must be a non-negative integer")
+		return
+	}
+
+	// sessionKey is required here (unlike on a select). An explicitly null or
+	// non-string value is invalid at the token level, exactly as for select;
+	// an absent key reaches the validator as nil and is rejected there, after
+	// the revision token has been parsed, so a malformed revision is reported
+	// in the same order as everywhere else. The validator trims the key, so
+	// keys equal after trimming name one session and a blank-after-trim key
+	// fails with a reason naming the sessionKey problem.
+	var sessionKey *string
+	if len(req.Session) > 0 {
+		if strings.TrimSpace(string(req.Session)) == "null" {
+			p.invalid(service, "sessionKey must be a string, not null")
+			return
+		}
+		var key string
+		if err := json.Unmarshal(req.Session, &key); err != nil {
+			p.invalid(service, "sessionKey must be a string")
+			return
+		}
+		sessionKey = &key
+	}
+
+	// Parse the raw token (integer type); ValidateSessionRelease then
+	// range-checks the int64 against the architecture before narrowing to int.
+	revision, ok := p.parseRevision(service, req.Revision)
+	if !ok {
+		return
+	}
+
+	release, err := p.registry.ValidateSessionRelease(service, revision, sessionKey)
+	if err != nil {
+		p.invalid(service, err.Error())
+		return
+	}
+
+	outcome := p.registry.ReleaseSession(release)
+	if !outcome.OK {
+		p.reject(outcome.Service, outcome.Kind, outcome.Reason, outcome.Revision, outcome.Expected, outcome.Actual, 0)
+		return
+	}
+	p.succeed(registerResult{
+		Service:  outcome.Service,
+		Changed:  outcome.Changed,
+		Revision: outcome.Revision,
 	})
 }
 
