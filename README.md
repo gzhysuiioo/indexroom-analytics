@@ -63,7 +63,11 @@ participate in id order. Failed selections (`invalid`, `conflict`,
 advance the cursor; a selection never changes a revision or a health record.
 
 Field validation precedes the revision check: a blank `service` or a
-missing/negative `expectedRevision` is `invalid`. Then a revision mismatch is
+missing/negative `expectedRevision` is `invalid`. The submitted
+`expectedRevision` is judged by its raw value: an integer beyond this build's
+range (0 to 2147483647 in 32-bit programs, 0 to 9223372036854775807 in 64-bit
+programs) is likewise `invalid` with a reason naming the range problem, never
+a truncated revision that slips through the checks. Then a revision mismatch is
 `conflict` (an unknown service is at revision 0), an unknown service with a
 matching revision is `not_found`, and a service with no healthy instance is
 `no_healthy`. Every failure states the reason and current revision and leaves
@@ -149,7 +153,7 @@ echo '{"requests":[
 ### 请求字段与校验规则
 
 - `service`：服务名，去除两端空白后使用；整理后为空返回 `invalid`。
-- `expectedRevision`：必填的非负整数。新服务必须提交 `0`，创建成功后修订号为 `1`；已有服务必须提交该服务**当前**修订号，提交其他值（包括对尚不存在的服务提交非 0 值）返回 `conflict`。
+- `expectedRevision`：必填的非负整数，按提交的原始数值判断，可接受范围随程序字长：32 位程序为 0 至 2147483647，64 位程序为 0 至 9223372036854775807；超出对应范围的整数或任何负数都返回 `invalid`，reason 指明 `expectedRevision` 的范围问题。新服务必须提交 `0`，创建成功后修订号为 `1`；已有服务必须提交该服务**当前**修订号，提交其他值（包括对尚不存在的服务提交非 0 值）返回 `conflict`。
 - `instances`：实例对象数组，每项含 `id` 与 `address`。注册提交的是**完整实例列表**：本次列表中未包含的已有实例会被移除。
   - 实例 `id` 先去除两端空白；整理后为空、或同一服务内整理后的标识重复，都返回 `invalid`。
   - `address` 先去除两端空白，之后必须是带端口的 `host:port`：主机支持域名、IPv4 和带方括号的 IPv6（如 `h1:8080`、`10.0.0.2:8081`、`[2001:db8::1]:9000`，裸 IPv6 必须加方括号）；端口必须是 1 到 65535 的十进制整数；地址内部不能含空白或控制字符。

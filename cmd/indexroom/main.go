@@ -226,6 +226,26 @@ func (p *registerProcessor) invalidf(service, format string, args ...any) {
 	p.invalid(service, fmt.Sprintf(format, args...))
 }
 
+// parseRevision judges a request's expectedRevision by its raw submitted JSON
+// number and returns it as an int, recording an invalid result when it is
+// missing, not a JSON integer, negative, or beyond this build's revision
+// range. Judging the raw submission — never a value already narrowed to int —
+// keeps an integer a narrower int would truncate (for example 4294967297 or
+// -4294967295 in a 32-bit program) from passing the revision checks, and keeps
+// such a failure an invalid rather than a conflict or not_found.
+func (p *registerProcessor) parseRevision(service string, raw json.RawMessage) (int, bool) {
+	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
+		p.invalid(service, "expectedRevision is required and must be a non-negative integer")
+		return 0, false
+	}
+	revision, err := indexroom.ParseExpectedRevision(string(raw))
+	if err != nil {
+		p.invalid(service, err.Error())
+		return 0, false
+	}
+	return revision, true
+}
+
 // reject records a business-rule failure (conflict, not_found, stale or
 // no_healthy), keeping each operation's distinct result fields. Health
 // rejections additionally carry the current sequence; register and select
@@ -255,7 +275,7 @@ func (p *registerProcessor) succeed(result registerResult) {
 func (p *registerProcessor) registerRequest(raw json.RawMessage, service string) {
 	var req struct {
 		Service   string          `json:"service"`
-		Revision  *int64          `json:"expectedRevision"`
+		Revision  json.RawMessage `json:"expectedRevision"`
 		Instances json.RawMessage `json:"instances"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -264,8 +284,8 @@ func (p *registerProcessor) registerRequest(raw json.RawMessage, service string)
 	}
 	service = strings.TrimSpace(req.Service)
 
-	if req.Revision == nil {
-		p.invalid(service, "expectedRevision is required and must be a non-negative integer")
+	revision, ok := p.parseRevision(service, req.Revision)
+	if !ok {
 		return
 	}
 	if !isJSONArray(req.Instances) {
@@ -278,7 +298,7 @@ func (p *registerProcessor) registerRequest(raw json.RawMessage, service string)
 		return
 	}
 
-	registration, err := p.registry.ValidateRegistration(service, int(*req.Revision), instances)
+	registration, err := p.registry.ValidateRegistration(service, revision, instances)
 	if err != nil {
 		p.invalid(service, err.Error())
 		return
@@ -299,12 +319,12 @@ func (p *registerProcessor) registerRequest(raw json.RawMessage, service string)
 // healthRequest processes one health observation request, appending its outcome.
 func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 	var req struct {
-		Service    string  `json:"service"`
-		InstanceID string  `json:"instanceId"`
-		Revision   *int64  `json:"expectedRevision"`
-		Sequence   *int64  `json:"sequence"`
-		Healthy    *bool   `json:"healthy"`
-		Reason     *string `json:"reason"`
+		Service    string          `json:"service"`
+		InstanceID string          `json:"instanceId"`
+		Revision   json.RawMessage `json:"expectedRevision"`
+		Sequence   *int64          `json:"sequence"`
+		Healthy    *bool           `json:"healthy"`
+		Reason     *string         `json:"reason"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		p.invalidf(service, "health request must be an object with service, instanceId, expectedRevision, sequence and healthy: %v", err)
@@ -312,8 +332,8 @@ func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 	}
 	service = strings.TrimSpace(req.Service)
 
-	if req.Revision == nil {
-		p.invalid(service, "expectedRevision is required and must be a non-negative integer")
+	revision, ok := p.parseRevision(service, req.Revision)
+	if !ok {
 		return
 	}
 	if req.Sequence == nil {
@@ -329,7 +349,7 @@ func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 		reason = *req.Reason
 	}
 
-	update, err := p.registry.ValidateHealth(service, req.InstanceID, int(*req.Revision), *req.Sequence, *req.Healthy, reason)
+	update, err := p.registry.ValidateHealth(service, req.InstanceID, revision, *req.Sequence, *req.Healthy, reason)
 	if err != nil {
 		p.invalid(service, err.Error())
 		return
@@ -355,7 +375,7 @@ func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 	var req struct {
 		Service  string          `json:"service"`
-		Revision *int64          `json:"expectedRevision"`
+		Revision json.RawMessage `json:"expectedRevision"`
 		Session  json.RawMessage `json:"sessionKey"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -364,8 +384,8 @@ func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 	}
 	service = strings.TrimSpace(req.Service)
 
-	if req.Revision == nil {
-		p.invalid(service, "expectedRevision is required and must be a non-negative integer")
+	revision, ok := p.parseRevision(service, req.Revision)
+	if !ok {
 		return
 	}
 
@@ -387,7 +407,7 @@ func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 		sessionKey = &key
 	}
 
-	selection, err := p.registry.ValidateSelectionWithSession(service, int(*req.Revision), sessionKey)
+	selection, err := p.registry.ValidateSelectionWithSession(service, revision, sessionKey)
 	if err != nil {
 		p.invalid(service, err.Error())
 		return

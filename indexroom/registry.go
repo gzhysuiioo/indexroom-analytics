@@ -2,7 +2,9 @@
 package indexroom
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sort"
 	"strconv"
@@ -198,12 +200,48 @@ func validateServiceName(service string) (string, error) {
 // validateExpectedRevision is the revision field shared by every request: it
 // must be a non-negative integer. Callers check their remaining content fields
 // after this one, so content validity is fully established before any revision
-// comparison against the registry.
+// comparison against the registry. It only sees an int, so a caller holding
+// the submitted JSON number must judge it with ParseExpectedRevision first:
+// narrowing a raw submission to int directly can truncate it on a platform
+// whose int is narrower than the submitted value.
 func validateExpectedRevision(revision int) error {
 	if revision < 0 {
 		return errInvalid("expectedRevision must be a non-negative integer")
 	}
 	return nil
+}
+
+// MaxExpectedRevision is the largest expectedRevision this build accepts.
+// Revisions are held in int, so the limit follows the program's word size:
+// 2147483647 in 32-bit programs, 9223372036854775807 in 64-bit programs.
+const MaxExpectedRevision = int64(math.MaxInt)
+
+// ParseExpectedRevision judges a submitted expectedRevision by its raw JSON
+// number text and returns it as an int. Judging the raw text — rather than a
+// value already narrowed to int — keeps an integer that does not fit this
+// build's int (for example 4294967297 or -4294967295 in a 32-bit program)
+// from being truncated into a plausible revision and passing the revision
+// checks. The acceptable range is 0 to MaxExpectedRevision: an integer beyond
+// it and any negative integer are both invalid, as is any text that is not a
+// JSON integer at all. The reason names the expectedRevision range problem.
+func ParseExpectedRevision(raw string) (int, error) {
+	text := strings.TrimSpace(raw)
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		// A range error means the submission is an integer that does not even
+		// fit int64; anything else is not a JSON integer at all.
+		if errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(text, "-") {
+			return 0, errInvalid(fmt.Sprintf("expectedRevision must be an integer between 0 and %d", MaxExpectedRevision))
+		}
+		return 0, errInvalid("expectedRevision must be a non-negative integer")
+	}
+	if n < 0 {
+		return 0, errInvalid("expectedRevision must be a non-negative integer")
+	}
+	if n > MaxExpectedRevision {
+		return 0, errInvalid(fmt.Sprintf("expectedRevision must be an integer between 0 and %d", MaxExpectedRevision))
+	}
+	return int(n), nil
 }
 
 // revisionFailure describes the common revision-gate result shared by health
