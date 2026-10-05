@@ -54,6 +54,11 @@ func usage() {
 	fmt.Println("A select request may carry an optional \"sessionKey\" string: requests in the")
 	fmt.Println("same service with the same trimmed key reuse the instance first chosen for")
 	fmt.Println("that key while it stays registered and healthy, without moving the rotation.")
+	fmt.Println("A release_session request carries service, expectedRevision and a required")
+	fmt.Println("\"sessionKey\" string and drops that key's binding in that service, reporting")
+	fmt.Println("changed only when a binding existed; it selects no target, moves no rotation")
+	fmt.Println("and changes no registration or health state, so the key's next select")
+	fmt.Println("rotates again from the last actual rotation position.")
 	fmt.Println("Exit status is 0 only when every request succeeds and the JSON result")
 	fmt.Println("is fully written to standard output. A failed result write is reported")
 	fmt.Println("on standard error with the underlying write error and also exits 1,")
@@ -158,6 +163,8 @@ func runRegisterIO(in io.Reader, out io.Writer, errOut io.Writer) int {
 			proc.healthRequest(raw, service)
 		case "select":
 			proc.selectRequest(raw, service)
+		case "release_session":
+			proc.releaseSessionRequest(raw, service)
 		default:
 			proc.invalidf(service, "unknown type %q", reqType)
 		}
@@ -445,8 +452,70 @@ func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 	})
 }
 
-// failRegister emits a top-level input error as the single JSON document on
-// out and returns exit code 1. If that error JSON itself cannot be written,
+// releaseSessionRequest processes one release_session request, appending its
+// outcome. A release drops only the named session key's binding in the named
+// service: it never selects a target (its result carries no instance id,
+// address or sequence), never moves the rotation and never changes
+// registrations or health records. A failed release removes nothing.
+func (p *registerProcessor) releaseSessionRequest(raw json.RawMessage, service string) {
+	var req struct {
+		Service  string          `json:"service"`
+		Revision json.RawMessage `json:"expectedRevision"`
+		Session  json.RawMessage `json:"sessionKey"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		p.invalidf(service, "release_session request must be an object with service, expectedRevision and sessionKey: %v", err)
+		return
+	}
+	service = strings.TrimSpace(req.Service)
+
+	if len(req.Revision) == 0 || strings.TrimSpace(string(req.Revision)) == "null" {
+		p.invalid(service, "expectedRevision is required and must be a non-negative integer")
+		return
+	}
+
+	// sessionKey is required here, unlike on select: absent, explicitly null or
+	// a non-string value is invalid, and the registry rejects a key that trims
+	// to blank. Content validity is fully established before any revision
+	// comparison, so an invalid key wins over a revision conflict.
+	if len(req.Session) == 0 {
+		p.invalid(service, "sessionKey is required and must be a string")
+		return
+	}
+	if strings.TrimSpace(string(req.Session)) == "null" {
+		p.invalid(service, "sessionKey must be a string, not null")
+		return
+	}
+	var key string
+	if err := json.Unmarshal(req.Session, &key); err != nil {
+		p.invalid(service, "sessionKey must be a string")
+		return
+	}
+
+	revision, ok := p.parseRevision(service, req.Revision)
+	if !ok {
+		return
+	}
+
+	release, err := p.registry.ValidateReleaseSession(service, revision, key)
+	if err != nil {
+		p.invalid(service, err.Error())
+		return
+	}
+
+	outcome := p.registry.ReleaseSession(release)
+	if !outcome.OK {
+		p.reject(outcome.Service, outcome.Kind, outcome.Reason, outcome.Revision, outcome.Expected, outcome.Actual, 0)
+		return
+	}
+	p.succeed(registerResult{
+		Service:  outcome.Service,
+		Changed:  outcome.Changed,
+		Revision: outcome.Revision,
+	})
+}
+
+// failRegister emits a top-level input error as the single JSON document on// out and returns exit code 1. If that error JSON itself cannot be written,
 // the delivery failure is diagnosed on errOut (out may already hold a partial
 // document, so no second JSON is appended) and the exit code stays 1.
 func failRegister(out io.Writer, errOut io.Writer, reason string) int {
