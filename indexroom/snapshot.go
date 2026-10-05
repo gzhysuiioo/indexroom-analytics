@@ -286,55 +286,12 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		}
 		return err
 	}
-	tok, err := dec.Token()
-	if err != nil {
-		return 0, nil, classify(err)
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return 0, nil, reject(invalidSnapshot("snapshot must be a single JSON object"))
-	}
-
 	// Top-level fields are captured raw so blocks can be parsed with the
 	// strict schema matching the declared version, whatever the field order,
 	// and so null can be told apart from a zero value.
-	var (
-		rawVersion, rawTip   json.RawMessage
-		rawBlocks            json.RawMessage
-		haveVersion, haveTip bool
-		haveBlocks           bool
-		seen                 = map[string]bool{}
-	)
-	for dec.More() {
-		key, err := snapshotKey(dec)
-		if err != nil {
-			return 0, nil, classify(err)
-		}
-		if seen[key] {
-			return 0, nil, reject(invalidSnapshot("duplicate field %q", key))
-		}
-		seen[key] = true
-		switch key {
-		case "version":
-			if err := dec.Decode(&rawVersion); err != nil {
-				return 0, nil, classify(fmt.Errorf("field %q: %w", key, err))
-			}
-			haveVersion = true
-		case "tip":
-			if err := dec.Decode(&rawTip); err != nil {
-				return 0, nil, classify(fmt.Errorf("field %q: %w", key, err))
-			}
-			haveTip = true
-		case "blocks":
-			if err := dec.Decode(&rawBlocks); err != nil {
-				return 0, nil, classify(fmt.Errorf("field %q: %w", key, err))
-			}
-			haveBlocks = true
-		default:
-			return 0, nil, reject(invalidSnapshot("unknown field %q", key))
-		}
-	}
-	if _, err := dec.Token(); err != nil { // closing '}'
-		return 0, nil, classify(err)
+	fields, err := readSnapshotObject(dec, snapshotDocSpec, classify, reject, "version", "tip", "blocks")
+	if err != nil {
+		return 0, nil, err
 	}
 	// Only whitespace may follow the snapshot object. A reader fault that
 	// arrived together with the document's final bytes is held back by
@@ -354,20 +311,14 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		return 0, nil, classify(err)
 	}
 
-	if !haveVersion {
-		return 0, nil, invalidSnapshot("missing field %q", "version")
+	if err := requireSnapshotFields(snapshotDocSpec, fields, "version", "tip", "blocks"); err != nil {
+		return 0, nil, err
 	}
-	if !haveTip {
-		return 0, nil, invalidSnapshot("missing field %q", "tip")
-	}
-	if !haveBlocks {
-		return 0, nil, invalidSnapshot("missing field %q", "blocks")
-	}
-	version, err := snapshotInt64(rawVersion, "version")
+	version, err := snapshotInt64(fields["version"], "version")
 	if err != nil {
 		return 0, nil, err
 	}
-	tip, err := snapshotInt64(rawTip, "tip")
+	tip, err := snapshotInt64(fields["tip"], "tip")
 	if err != nil {
 		return 0, nil, err
 	}
@@ -375,7 +326,7 @@ func parseSnapshot(r io.Reader) (int64, []Block, error) {
 		return 0, nil, invalidSnapshot("unsupported version %d", version)
 	}
 
-	blockDec := json.NewDecoder(bytes.NewReader(rawBlocks))
+	blockDec := json.NewDecoder(bytes.NewReader(fields["blocks"]))
 	blocks, err := parseSnapshotBlocks(blockDec, version)
 	if err != nil {
 		return 0, nil, err
@@ -447,7 +398,7 @@ func parseSnapshotBlocks(dec *json.Decoder, version int64) ([]Block, error) {
 // fields height, hash, parent, and txs.
 func parseSnapshotBlock(dec *json.Decoder) (Block, error) {
 	var block Block
-	fields, err := readSnapshotBlockObject(dec, "height", "hash", "parent", "txs")
+	fields, err := readSnapshotObject(dec, snapshotBlockSpec, classifySnapshotErr, snapshotContentErr, "height", "hash", "parent", "txs")
 	if err != nil {
 		return block, err
 	}
@@ -459,12 +410,12 @@ func parseSnapshotBlock(dec *json.Decoder) (Block, error) {
 // null or a non-negative integer; the block returns a nil time for null.
 func parseSnapshotBlockV2(dec *json.Decoder) (Block, error) {
 	var block Block
-	fields, err := readSnapshotBlockObject(dec, "height", "hash", "parent", "txs", "timestamp")
+	fields, err := readSnapshotObject(dec, snapshotBlockSpec, classifySnapshotErr, snapshotContentErr, "height", "hash", "parent", "txs", "timestamp")
 	if err != nil {
 		return block, err
 	}
-	if _, ok := fields["timestamp"]; !ok {
-		return block, invalidSnapshot("block is missing field %q", "timestamp")
+	if err := requireSnapshotFields(snapshotBlockSpec, fields, "timestamp"); err != nil {
+		return block, err
 	}
 	block, err = finishSnapshotBlock(fields)
 	if err != nil {
@@ -478,50 +429,104 @@ func parseSnapshotBlockV2(dec *json.Decoder) (Block, error) {
 	return block, nil
 }
 
-// readSnapshotBlockObject reads one block object and captures each known
-// field's raw value. Fields are decoded only after the whole object is read,
-// so a null can be rejected per field and a txs element error can name the
-// block's height whatever order the fields arrive in.
-func readSnapshotBlockObject(dec *json.Decoder, known ...string) (map[string]json.RawMessage, error) {
+// snapshotObjectSpec describes one object level of the snapshot document:
+// which error reasons it reports when the value is not an object or a field
+// is repeated, unrecognized, or required but absent. The two levels share
+// the reading and validation rules through readSnapshotObject and
+// requireSnapshotFields; the spec keeps each level's own wording so an error
+// still says whether the top-level object or a block is at fault.
+type snapshotObjectSpec struct {
+	shape     string // reason when the value is not a JSON object
+	duplicate string // reason format naming a repeated field
+	unknown   string // reason format naming an unrecognized field
+	missing   string // reason format naming a required field that never appeared
+}
+
+var (
+	// snapshotDocSpec is the top-level snapshot object.
+	snapshotDocSpec = snapshotObjectSpec{
+		shape:     "snapshot must be a single JSON object",
+		duplicate: "duplicate field %q",
+		unknown:   "unknown field %q",
+		missing:   "missing field %q",
+	}
+	// snapshotBlockSpec is one block object inside the blocks array.
+	snapshotBlockSpec = snapshotObjectSpec{
+		shape:     "block must be a JSON object",
+		duplicate: "duplicate block field %q",
+		unknown:   "unknown block field %q",
+		missing:   "block is missing field %q",
+	}
+)
+
+// readSnapshotObject reads one JSON object and captures each known field's
+// raw value, applying the rules both object levels share: the value must be
+// an object, every key is matched by its decoded name (so a Unicode-escaped
+// spelling of a field still counts as that field), a repeated or unknown
+// field is rejected, and each known field's raw bytes are kept for later
+// decoding. Fields are decoded only after the whole object is read, so a
+// null can be rejected per field and a value error can be reported whatever
+// order the fields arrive in.
+//
+// classify maps a decoder failure onto the snapshot error model for the
+// level's input source, and reject reports a content error found in bytes
+// already decoded; the top level passes its reader-fault-aware closures,
+// while a level decoded from already-buffered bytes passes
+// classifySnapshotErr and snapshotContentErr.
+func readSnapshotObject(dec *json.Decoder, spec snapshotObjectSpec, classify, reject func(error) error, known ...string) (map[string]json.RawMessage, error) {
 	tok, err := dec.Token()
 	if err != nil {
-		return nil, classifySnapshotErr(err)
+		return nil, classify(err)
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return nil, invalidSnapshot("block must be a JSON object")
+		return nil, reject(invalidSnapshot("%s", spec.shape))
 	}
 	fields := map[string]json.RawMessage{}
 	for dec.More() {
 		key, err := snapshotKey(dec)
 		if err != nil {
-			return nil, classifySnapshotErr(err)
+			return nil, classify(err)
 		}
 		if _, dup := fields[key]; dup {
-			return nil, invalidSnapshot("duplicate block field %q", key)
+			return nil, reject(invalidSnapshot(spec.duplicate, key))
 		}
 		if !slices.Contains(known, key) {
-			return nil, invalidSnapshot("unknown block field %q", key)
+			return nil, reject(invalidSnapshot(spec.unknown, key))
 		}
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
-			return nil, classifySnapshotErr(fmt.Errorf("field %q: %w", key, err))
+			return nil, classify(fmt.Errorf("field %q: %w", key, err))
 		}
 		fields[key] = raw
 	}
 	if _, err := dec.Token(); err != nil { // closing '}'
-		return nil, classifySnapshotErr(err)
+		return nil, classify(err)
 	}
 	return fields, nil
 }
+
+// requireSnapshotFields verifies that every required field appeared in the
+// object, reporting the first absent one with the level's own wording.
+func requireSnapshotFields(spec snapshotObjectSpec, fields map[string]json.RawMessage, required ...string) error {
+	for _, field := range required {
+		if _, ok := fields[field]; !ok {
+			return invalidSnapshot(spec.missing, field)
+		}
+	}
+	return nil
+}
+
+// snapshotContentErr reports a content error as-is. It is the reject
+// function for object levels decoded from already-buffered bytes, where no
+// underlying read failure can outrank a content error.
+func snapshotContentErr(err error) error { return err }
 
 // finishSnapshotBlock decodes the shared block fields from their raw values,
 // requiring height, hash, parent, and txs and rejecting null for each.
 func finishSnapshotBlock(fields map[string]json.RawMessage) (Block, error) {
 	var block Block
-	for _, field := range []string{"height", "hash", "parent", "txs"} {
-		if _, ok := fields[field]; !ok {
-			return block, invalidSnapshot("block is missing field %q", field)
-		}
+	if err := requireSnapshotFields(snapshotBlockSpec, fields, "height", "hash", "parent", "txs"); err != nil {
+		return block, err
 	}
 	var err error
 	if block.Height, err = snapshotInt64(fields["height"], "height"); err != nil {
