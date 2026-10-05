@@ -2197,6 +2197,179 @@ func TestSelectTwoSessionKeysNoHealthyIsolation(t *testing.T) {
 	}
 }
 
+// TestSelectSessionKeyClearListThenReadd is the batch-level regression guard
+// for the session-persistence condition "clear the service's instance list,
+// then re-add instances". Clearing removes the instances together with their
+// health records but keeps the service, its rotation position and the session
+// bindings; whether the old session can still reach its target is judged from
+// the instance state at the next selection. The batch walks:
+//
+//   - a, b, c registered at revision 1 and observed healthy at sequences above
+//     1; the key first selects a (binding s -> a), then a keyless selection
+//     advances the rotation to b, the last real rotation;
+//   - an empty-list replacement at revision 1 succeeds, reports changed and
+//     bumps the revision to 2 without deleting the service;
+//   - the session's request at revision 2 fails with no_healthy — never
+//     not_found — naming the current revision and a non-empty reason and
+//     carrying no pre-clear instance id, address or health sequence; the
+//     failure rewrites the binding and moves the cursor neither;
+//   - re-adding the original ids at revision 2 bumps the revision to 3: the
+//     bound instance a comes back at a NEW address, while b and c keep their
+//     old addresses, yet all three start at unknown/0/no reason; with no fresh
+//     observation accepted the session still fails no_healthy at revision 3;
+//   - fresh observations at revision 3 use positive sequence 1 even though it
+//     is below the pre-clear sequences; the session then reuses its surviving
+//     binding and returns a at the new address h9:9 with sequence 1;
+//   - a keyless selection continues from the rotation position preserved
+//     through the clear (just after b) and lands on c, rather than being
+//     pulled back to the bound instance a by the session reuse or by the
+//     failed requests; the next one wraps to a.
+//
+// The batch contains selection failures, so the process exits 1: the failed
+// items keep their own result slots while the later registration, health
+// reports and selections continue to take effect, and no selection changes
+// the registration revision or an accepted health record.
+func TestSelectSessionKeyClearListThenReadd(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":12,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":13,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[]},
+		{"type":"select","service":"svc","expectedRevision":2,"sessionKey":"s"},
+		{"type":"register","service":"svc","expectedRevision":2,"instances":[{"id":"a","address":"h9:9"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"select","service":"svc","expectedRevision":3,"sessionKey":"s"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":3,"sequence":1,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":3,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":3,"sessionKey":"s"},
+		{"type":"select","service":"svc","expectedRevision":3},
+		{"type":"select","service":"svc","expectedRevision":3},
+		{"type":"select","service":"svc","expectedRevision":3,"sessionKey":"s"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains selection failures, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	// One result per request, in input order; the failed selections keep their
+	// own slots and later items still land in theirs.
+	if len(got.Results) != 16 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 0: registration accepted at revision 1.
+	if r := got.Results[0]; !r.OK || !r.Changed || r.Revision != 1 {
+		t.Fatalf("result 0: %+v", r)
+	}
+	// 1-3: observations accepted without bumping the registration revision.
+	if r := got.Results[1]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 11 {
+		t.Fatalf("result 1: %+v", r)
+	}
+	if r := got.Results[2]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 12 {
+		t.Fatalf("result 2: %+v", r)
+	}
+	if r := got.Results[3]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 13 {
+		t.Fatalf("result 3: %+v", r)
+	}
+	// 4: the key's first success rotates to the smallest id and binds s -> a,
+	// carrying a's pre-clear address and accepted sequence.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 11 || r.Revision != 1 {
+		t.Fatalf("result 4 session bind: %+v", r)
+	}
+	// 5: a keyless selection advances the rotation to b, the last real
+	// rotation before the clear.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 12 || r.Revision != 1 {
+		t.Fatalf("result 5 keyless rotation: %+v", r)
+	}
+	// 6: clearing the instance list succeeds, reports the change and bumps the
+	// revision to 2; the service itself stays.
+	if r := got.Results[6]; !r.OK || !r.Changed || r.Revision != 2 {
+		t.Fatalf("result 6 clear: %+v", r)
+	}
+	// 7: the service survived at revision 2, so the session request is
+	// no_healthy — never not_found — with the current revision and a non-empty
+	// reason, fabricating no pre-clear instance id, address or sequence. The
+	// failure rewrites the s -> a binding and moves the cursor neither.
+	if r := got.Results[7]; r.OK || r.Error != "no_healthy" || r.Reason == "" ||
+		r.Revision != 2 || r.InstanceID != "" || r.Address != "" || r.Sequence != 0 {
+		t.Fatalf("result 7 no_healthy on the cleared service: %+v", r)
+	}
+	// 8: re-adding the original ids succeeds at revision 2 and bumps to 3; a
+	// uses a new address while b and c merely keep their old addresses.
+	if r := got.Results[8]; !r.OK || !r.Changed || r.Revision != 3 {
+		t.Fatalf("result 8 re-add: %+v", r)
+	}
+	// 9: identical ids and addresses restore no old health: every instance is
+	// unknown again, so before any fresh observation the same session still
+	// fails no_healthy at the current revision 3 with no fabricated target.
+	if r := got.Results[9]; r.OK || r.Error != "no_healthy" || r.Reason == "" ||
+		r.Revision != 3 || r.InstanceID != "" || r.Address != "" || r.Sequence != 0 {
+		t.Fatalf("result 9 no_healthy before fresh observations: %+v", r)
+	}
+	// 10-11: fresh observations at the post-readd revision are accepted with
+	// positive sequence 1, which is below the pre-clear sequences; health
+	// reports never bump the registration revision, which stays 3.
+	if r := got.Results[10]; !r.OK || !r.Changed || r.Revision != 3 || r.Sequence != 1 {
+		t.Fatalf("result 10: %+v", r)
+	}
+	if r := got.Results[11]; !r.OK || !r.Changed || r.Revision != 3 || r.Sequence != 1 {
+		t.Fatalf("result 11: %+v", r)
+	}
+	// 12: the binding survived the clear and the failed requests, so the
+	// session reuses a — returning its CURRENT post-readd address h9:9 and the
+	// new sequence 1, never h1:1/11 — and leaves the rotation on b.
+	if r := got.Results[12]; !r.OK || r.InstanceID != "a" || r.Address != "h9:9" || r.Sequence != 1 || r.Revision != 3 {
+		t.Fatalf("result 12 session reuse after recovery: %+v", r)
+	}
+	// 13: the session reuse and the two failed selections moved no cursor, so
+	// the keyless rotation continues just after the pre-clear position b and
+	// lands on c (b is unknown), not on the bound a.
+	if r := got.Results[13]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 1 || r.Revision != 3 {
+		t.Fatalf("result 13 keyless selection should resume after b at c: %+v", r)
+	}
+	// 14: only now does the rotation wrap past c back to a, with its current
+	// address and sequence.
+	if r := got.Results[14]; !r.OK || r.InstanceID != "a" || r.Address != "h9:9" || r.Sequence != 1 || r.Revision != 3 {
+		t.Fatalf("result 14 keyless selection should wrap to a: %+v", r)
+	}
+	// 15: the plain rotation rewrote no binding; the session still answers a
+	// with the post-readd record.
+	if r := got.Results[15]; !r.OK || r.InstanceID != "a" || r.Address != "h9:9" || r.Sequence != 1 || r.Revision != 3 {
+		t.Fatalf("result 15 session binding after plain rotation: %+v", r)
+	}
+
+	// The final snapshot shows the service at revision 3 (selections changed
+	// no revision) with the instances sorted by id: a healthy at its new
+	// address from the fresh observation, c healthy from its own fresh
+	// observation, and b — which only kept its old address — still unknown at
+	// sequence 0 with no reason, proving identical ids/addresses restored no
+	// pre-clear health record.
+	if len(got.Services) != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	svc := got.Services[0]
+	if svc.Service != "svc" || svc.Revision != 3 {
+		t.Fatalf("service view: %+v", svc)
+	}
+	if len(svc.Instances) != 3 {
+		t.Fatalf("instances: %+v", svc.Instances)
+	}
+	wantInsts := []registerInstance{
+		{ID: "a", Address: "h9:9", Health: "healthy", Sequence: 1},
+		{ID: "b", Address: "h2:2", Health: "unknown", Sequence: 0},
+		{ID: "c", Address: "h3:3", Health: "healthy", Sequence: 1},
+	}
+	for i, want := range wantInsts {
+		if svc.Instances[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, svc.Instances[i], want)
+		}
+	}
+}
+
 // failingWriter fails every Write with errWriteBroken, optionally accepting the
 // first failAfter bytes to emulate an output destination that becomes unwritable
 // partway through the result document.
