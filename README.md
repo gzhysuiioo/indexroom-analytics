@@ -24,7 +24,13 @@ echo '{"requests":[{"service":"svc","expectedRevision":0,"instances":[{"id":"i1"
 Each request fully replaces that service's instance list. New services require
 `expectedRevision` 0; existing services require the current revision. Output is
 JSON with per-item results and the final sorted service list; exit status is 0
-only when every registration succeeds.
+only when every registration succeeds **and** the JSON result is fully written
+to standard output. If standard output rejects the result (including the
+top-level error JSON for malformed input), the command writes a clear
+"failed to write request results" diagnostic carrying the actual write error to
+standard error, exits 1 even when every request succeeded, and never appends a
+second JSON document to an already partially written standard output; this
+lets a rejected request be distinguished from an undelivered result.
 
 The same `requests` array also accepts health observations and target
 selection, processed strictly in input order (a selection sees only state

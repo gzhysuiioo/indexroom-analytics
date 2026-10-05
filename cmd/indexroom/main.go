@@ -22,6 +22,10 @@ func main() {
 	case "version":
 		fmt.Println("indexroom 0.1.0")
 	case "register":
+		// register reports result-delivery failures via its exit status and
+		// stderr; a broken standard output must surface as an EPIPE write error,
+		// not as the default SIGPIPE termination.
+		ignoreSigpipe()
 		os.Exit(runRegister())
 	case "help", "-h", "--help":
 		usage()
@@ -50,7 +54,10 @@ func usage() {
 	fmt.Println("A select request may carry an optional \"sessionKey\" string: requests in the")
 	fmt.Println("same service with the same trimmed key reuse the instance first chosen for")
 	fmt.Println("that key while it stays registered and healthy, without moving the rotation.")
-	fmt.Println("Exit status is 0 only when every request succeeds.")
+	fmt.Println("Exit status is 0 only when every request succeeds and the JSON result")
+	fmt.Println("is fully written to standard output. A failed result write is reported")
+	fmt.Println("on standard error with the underlying write error and also exits 1,")
+	fmt.Println("without appending a second JSON document to the partial output.")
 }
 
 // registerInstance is one instance in the final service list.
@@ -90,26 +97,35 @@ type registerOutput struct {
 	Services []registerService `json:"services"`
 }
 
-// runRegister processes registration requests from standard input.
-// It returns the process exit code: 0 when all registrations succeed, 1 otherwise.
+// runRegister processes registration requests from the process standard
+// streams. It returns the process exit code: 0 when all registrations succeed
+// and the result is fully written, 1 otherwise.
 func runRegister() int {
-	data, err := io.ReadAll(os.Stdin)
+	return runRegisterIO(os.Stdin, os.Stdout, os.Stderr)
+}
+
+// runRegisterIO is runRegister with injectable streams. in supplies the JSON
+// request batch, out receives the single JSON result document and errOut
+// receives diagnostics (in particular a result-delivery failure, which must
+// never be mixed into out).
+func runRegisterIO(in io.Reader, out io.Writer, errOut io.Writer) int {
+	data, err := io.ReadAll(in)
 	if err != nil {
-		return failRegister(fmt.Sprintf("could not read standard input: %v", err))
+		return failRegister(out, errOut, fmt.Sprintf("could not read standard input: %v", err))
 	}
 
 	var top struct {
 		Requests json.RawMessage `json:"requests"`
 	}
 	if err := json.Unmarshal(data, &top); err != nil {
-		return failRegister(fmt.Sprintf("input must be a JSON object with a requests array: %v", err))
+		return failRegister(out, errOut, fmt.Sprintf("input must be a JSON object with a requests array: %v", err))
 	}
 	if len(top.Requests) == 0 || strings.TrimSpace(string(top.Requests)) == "null" {
-		return failRegister("input must contain a \"requests\" array")
+		return failRegister(out, errOut, "input must contain a \"requests\" array")
 	}
 	var rawRequests []json.RawMessage
 	if err := json.Unmarshal(top.Requests, &rawRequests); err != nil {
-		return failRegister("\"requests\" must be a JSON array")
+		return failRegister(out, errOut, "\"requests\" must be a JSON array")
 	}
 
 	proc := &registerProcessor{
@@ -169,7 +185,13 @@ func runRegister() int {
 		})
 	}
 
-	writeRegisterOutput(registerOutput{Results: results, Services: services})
+	if err := writeRegisterOutput(out, registerOutput{Results: results, Services: services}); err != nil {
+		// The request results could not be delivered. This is independent of
+		// whether the requests themselves succeeded: the caller must be able to
+		// tell an undelivered result from a rejected request.
+		reportRegisterDeliveryFailure(errOut, err)
+		return 1
+	}
 	if anyFailed {
 		return 1
 	}
@@ -385,18 +407,35 @@ func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 	})
 }
 
-// failRegister emits a top-level input error and returns exit code 1.
-func failRegister(reason string) int {
-	writeRegisterOutput(struct {
+// failRegister emits a top-level input error as the single JSON document on
+// out and returns exit code 1. If that error JSON itself cannot be written,
+// the delivery failure is diagnosed on errOut (out may already hold a partial
+// document, so no second JSON is appended) and the exit code stays 1.
+func failRegister(out io.Writer, errOut io.Writer, reason string) int {
+	if err := writeRegisterOutput(out, struct {
 		Error string `json:"error"`
-	}{Error: reason})
+	}{Error: reason}); err != nil {
+		reportRegisterDeliveryFailure(errOut, err)
+	}
 	return 1
 }
 
-func writeRegisterOutput(v any) {
-	enc := json.NewEncoder(os.Stdout)
+// reportRegisterDeliveryFailure reports on errOut that the register command's
+// JSON result could not be delivered, preserving the underlying write error.
+// It never writes to standard output, which may already contain a partial
+// result.
+func reportRegisterDeliveryFailure(errOut io.Writer, err error) {
+	fmt.Fprintf(errOut, "register: failed to write request results to standard output: %v\n", err)
+}
+
+// writeRegisterOutput writes v as the single indented JSON document on w.
+// Standard output is dedicated to this document, so a write failure is returned
+// instead of swallowed: the caller must not attempt to append another document
+// after a partial write.
+func writeRegisterOutput(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(v)
+	return enc.Encode(v)
 }
 
 // isJSONArray reports whether raw is a JSON array (ignoring leading whitespace).

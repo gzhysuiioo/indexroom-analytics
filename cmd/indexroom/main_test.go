@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -2192,5 +2194,171 @@ func TestSelectTwoSessionKeysNoHealthyIsolation(t *testing.T) {
 		if insts[i] != want {
 			t.Fatalf("instance %d: got %+v want %+v", i, insts[i], want)
 		}
+	}
+}
+
+// failingWriter fails every Write with errWriteBroken, optionally accepting the
+// first failAfter bytes to emulate an output destination that becomes unwritable
+// partway through the result document.
+type failingWriter struct {
+	buf       bytes.Buffer
+	failAfter int
+}
+
+var errWriteBroken = errors.New("disk on fire")
+
+func (w *failingWriter) Write(p []byte) (int, error) {
+	if w.failAfter <= 0 {
+		return 0, errWriteBroken
+	}
+	take := min(w.failAfter, len(p))
+	n, _ := w.buf.Write(p[:take])
+	w.failAfter -= take
+	if take < len(p) {
+		// A writer that accepts only part of p must return n < len(p) and the
+		// failure without panic; json.Encoder stops at that point.
+		return n, errWriteBroken
+	}
+	return n, nil
+}
+
+// runRegisterIOWith runs runRegisterIO with normal stdin plus the given stdout
+// writer, capturing stderr. It returns the exit code, whatever reached stdout
+// and the stderr text.
+func runRegisterIOWith(t *testing.T, input string, out io.Writer) (int, string, string) {
+	t.Helper()
+	var stderr bytes.Buffer
+	code := runRegisterIO(strings.NewReader(input), out, &stderr)
+	return code, string(writerBytes(out)), stderr.String()
+}
+
+func writerBytes(w io.Writer) []byte {
+	if fw, ok := w.(*failingWriter); ok {
+		return fw.buf.Bytes()
+	}
+	return nil
+}
+
+func TestRegisterDeliveryFailureExitOneWithStderrDiagnostic(t *testing.T) {
+	// The destination is unwritable from the first byte: even though every
+	// request succeeds, the undelivered result must yield exit 1 with a clear
+	// stderr diagnostic preserving the actual write error.
+	input := `{"requests":[
+		{"service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"}]}
+	]}`
+	out := &failingWriter{}
+	code, partial, diag := runRegisterIOWith(t, input, out)
+	if code != 1 {
+		t.Fatalf("undelivered success batch should exit 1, got %d", code)
+	}
+	if partial != "" {
+		t.Fatalf("nothing should leak to stdout on an immediate failure, got %q", partial)
+	}
+	if !strings.Contains(diag, "register:") ||
+		!strings.Contains(diag, "write request results") ||
+		!strings.Contains(diag, errWriteBroken.Error()) {
+		t.Fatalf("stderr should explain the result write failure and keep the error, got %q", diag)
+	}
+}
+
+func TestRegisterDeliveryFailureAfterPartialWrite(t *testing.T) {
+	// The destination accepts part of the document and then fails: exit 1,
+	// stderr explains, and no second JSON document or success-looking tail is
+	// appended to the truncated stdout.
+	input := `{"requests":[
+		{"service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"}]}
+	]}`
+	out := &failingWriter{failAfter: 20}
+	code, partial, diag := runRegisterIOWith(t, input, out)
+	if code != 1 {
+		t.Fatalf("mid-document write failure should exit 1, got %d", code)
+	}
+	if len(partial) == 0 {
+		t.Fatalf("expected the already-written prefix on stdout")
+	}
+	if strings.Contains(partial, errWriteBroken.Error()) ||
+		strings.Contains(partial, "register:") {
+		t.Fatalf("delivery diagnostic must stay on stderr, got on stdout: %q", partial)
+	}
+	// The prefix is an incomplete JSON document.
+	if json.Valid([]byte(partial)) {
+		t.Fatalf("partial write should not look like a complete result: %q", partial)
+	}
+	if !strings.Contains(diag, errWriteBroken.Error()) ||
+		!strings.Contains(diag, "write request results") {
+		t.Fatalf("stderr diagnostic missing write-error reason: %q", diag)
+	}
+}
+
+func TestRegisterDeliveryFailureOnTopLevelInputError(t *testing.T) {
+	// Malformed input normally yields a top-level {"error":...} on stdout and
+	// exit 1; when even that document cannot be written, the delivery failure
+	// must be reported on stderr (with the real error) and still exit 1, with
+	// nothing on stdout.
+	out := &failingWriter{}
+	code, partial, diag := runRegisterIOWith(t, `{not json`, out)
+	if code != 1 {
+		t.Fatalf("write failure on the input-error document should exit 1, got %d", code)
+	}
+	if partial != "" {
+		t.Fatalf("nothing should reach stdout, got %q", partial)
+	}
+	if !strings.Contains(diag, errWriteBroken.Error()) ||
+		!strings.Contains(diag, "write request results") {
+		t.Fatalf("stderr should report the undelivered input-error document: %q", diag)
+	}
+}
+
+func TestRegisterDeliveryFailureWithFailedItems(t *testing.T) {
+	// A batch with business failures and an unwritable stdout: the exit code
+	// is still 1, stderr names the delivery problem rather than a business
+	// error kind, and the write failure does not alter the processed results
+	// (verified indirectly: the diagnostic never masquerades as invalid or
+	// conflict).
+	input := `{"requests":[
+		{"service":"svc","expectedRevision":9,"instances":[]}
+	]}`
+	out := &failingWriter{}
+	code, _, diag := runRegisterIOWith(t, input, out)
+	if code != 1 {
+		t.Fatalf("exit code: %d", code)
+	}
+	for _, kind := range []string{"invalid", "conflict", "not_found", "no_healthy", "stale"} {
+		if strings.Contains(diag, kind) {
+			t.Fatalf("delivery diagnostic must not look like a business %q error: %q", kind, diag)
+		}
+	}
+	if !strings.Contains(diag, errWriteBroken.Error()) {
+		t.Fatalf("diagnostic should preserve the actual write error: %q", diag)
+	}
+}
+
+func TestRegisterNormalDeliveryKeepsBehavior(t *testing.T) {
+	// Sanity: when stdout accepts everything, no stderr diagnostic is emitted
+	// on either the success path or the business-failure path, and existing
+	// exit codes are preserved.
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  int
+	}{
+		{"all success", `{"requests":[{"service":"a","expectedRevision":0,"instances":[]}]}`, 0},
+		{"empty requests", `{"requests":[]}`, 0},
+		{"business failure", `{"requests":[{"service":"a","expectedRevision":9,"instances":[]}]}`, 1},
+		{"top-level input error", `{not json`, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runRegisterIO(strings.NewReader(tc.input), &stdout, &stderr)
+			if code != tc.want {
+				t.Fatalf("exit code: got %d want %d (stdout %q stderr %q)", code, tc.want, stdout.String(), stderr.String())
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("no diagnostics expected on successful delivery, got %q", stderr.String())
+			}
+			if !json.Valid(bytes.TrimSpace(stdout.Bytes())) {
+				t.Fatalf("stdout should be a complete JSON document: %q", stdout.String())
+			}
+		})
 	}
 }
