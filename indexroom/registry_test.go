@@ -1239,4 +1239,205 @@ func TestRegistrySelectSessionKeyValidation(t *testing.T) {
 	}
 }
 
+// TestRegistryAddressPaddingOnlyReregistrationUnchanged is the regression guard
+// for the address-tidying rule at the unchanged boundary: registration removes
+// only surrounding whitespace from an address and then keeps the legal text. An
+// instance that is already registered and has an accepted health observation,
+// resubmitted with whitespace added only around the address, tidies to exactly
+// the stored text, so the whole-list replacement succeeds without "changed":
+// the revision is not consumed and the accepted health state, sequence and
+// reason survive; a later selection returns the tidied original address and
+// the original health sequence.
+func TestRegistryAddressPaddingOnlyReregistrationUnchanged(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{{ID: "a", Address: "api.example:8080"}})
+	markHealth(t, r, "svc", "a", 1, 7, true, "")
+
+	// Surrounding whitespace only: after trimming, the submitted text equals the
+	// stored address. Validation itself tidies by trimming and nothing else.
+	reg, err := r.ValidateRegistration("svc", 1, []Instance{{ID: "a", Address: "\t api.example:8080 \n"}})
+	if err != nil {
+		t.Fatalf("padded legal address should validate: %v", err)
+	}
+	if reg.Instances[0].Address != "api.example:8080" {
+		t.Fatalf("address should be tidied by surrounding trim only: %q", reg.Instances[0].Address)
+	}
+	out := r.Apply(reg)
+	if !out.OK || out.Changed || out.Revision != 1 {
+		t.Fatalf("padding-only resubmission must succeed without change: %+v", out)
+	}
+
+	// The accepted observation survives exactly: state, sequence and reason, and
+	// the stored address is the original (already tidied) spelling.
+	if inst := instanceHealth(t, r, "svc", "a"); inst.Address != "api.example:8080" ||
+		inst.Health != HealthHealthy || inst.Sequence != 7 || inst.Reason != "" {
+		t.Fatalf("accepted health record must survive a padding-only registration: %+v", inst)
+	}
+
+	// Selection returns the tidied original address and the original sequence.
+	if sel := selected(t, r, "svc", 1); sel.InstanceID != "a" ||
+		sel.Address != "api.example:8080" || sel.Sequence != 7 || sel.Revision != 1 {
+		t.Fatalf("selection after padding-only registration: %+v", sel)
+	}
+}
+
+// TestRegistryDistinctLegalAddressSpellingIsChange locks the other side of the
+// tidying rule: trimming must not collapse distinct legal spellings. Domain
+// letters keep their case and a port keeps its leading zeros, so
+// "api.example:8080" and "API.example:08080" both parse as legal host:port
+// addresses but remain different texts after trimming. For an unchanged
+// instance id that is a content change: the replacement reports changed, bumps
+// the revision exactly once and stores the new spelling as submitted, while the
+// instance's health record restarts at unknown/0 with no reason; another
+// instance whose id and address are unchanged keeps its own record. With no
+// other healthy instance the new address is not selectable until an
+// observation is accepted under the current revision; that observation may
+// restart the sequence at 1, and selection then returns the new spelling with
+// the new sequence.
+func TestRegistryDistinctLegalAddressSpellingIsChange(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "a", Address: "api.example:8080"},
+		{ID: "b", Address: "other.example:9090"},
+	})
+	markHealth(t, r, "svc", "a", 1, 11, true, "")
+	markHealth(t, r, "svc", "b", 1, 12, false, "connection refused")
+
+	// The new spelling parses on its own: uppercase domain labels and a leading
+	// zero in the port are accepted forms, never normalized onto the old text.
+	reg, err := r.ValidateRegistration("svc", 1, []Instance{
+		{ID: "a", Address: "API.example:08080"},
+		{ID: "b", Address: "other.example:9090"},
+	})
+	if err != nil {
+		t.Fatalf("distinct legal spelling should validate: %v", err)
+	}
+	if reg.Instances[0].Address != "API.example:08080" {
+		t.Fatalf("new spelling must be kept as submitted, got %q", reg.Instances[0].Address)
+	}
+	out := r.Apply(reg)
+	if !out.OK || !out.Changed || out.Revision != 2 {
+		t.Fatalf("distinct legal spelling is a content change: %+v", out)
+	}
+
+	// a resets to the fresh observation at the new spelling; b's id and address
+	// are unchanged so its unhealthy record, sequence and reason are retained.
+	if inst := instanceHealth(t, r, "svc", "a"); inst.Address != "API.example:08080" ||
+		inst.Health != HealthUnknown || inst.Sequence != 0 || inst.Reason != "" {
+		t.Fatalf("a should reset to unknown/0/no-reason at its new spelling: %+v", inst)
+	}
+	if inst := instanceHealth(t, r, "svc", "b"); inst.Address != "other.example:9090" ||
+		inst.Health != HealthUnhealthy || inst.Sequence != 12 || inst.Reason != "connection refused" {
+		t.Fatalf("b should keep its own record: %+v", inst)
+	}
+
+	// No other healthy instance: the new address is unknown, so selection at the
+	// current revision is no_healthy with the current revision and no fabricated
+	// target.
+	sel, _ := r.ValidateSelection("svc", 2)
+	sout := r.Select(sel)
+	if sout.OK || sout.Kind != OutcomeNoHealthy || sout.Revision != 2 ||
+		sout.InstanceID != "" || sout.Address != "" || sout.Sequence != 0 {
+		t.Fatalf("new address must not be selectable before a new observation: %+v", sout)
+	}
+
+	// An observation under the old revision conflicts even with a sequence far
+	// above the old accepted one and heals nothing.
+	upd, _ := r.ValidateHealth("svc", "a", 1, 99, true, "")
+	if hout := r.ApplyHealth(upd); hout.OK || hout.Kind != OutcomeConflict ||
+		hout.Expected != 1 || hout.Actual != 2 {
+		t.Fatalf("old-revision observation must conflict: %+v", hout)
+	}
+	sel, _ = r.ValidateSelection("svc", 2)
+	if sout := r.Select(sel); sout.OK || sout.Kind != OutcomeNoHealthy {
+		t.Fatalf("conflicting observation must not restore eligibility: %+v", sout)
+	}
+
+	// The reset releases the sequence floor: a fresh observation at the current
+	// revision may start at 1 even though 11 was accepted for the old spelling.
+	markHealth(t, r, "svc", "a", 2, 1, true, "")
+	sel, _ = r.ValidateSelection("svc", 2)
+	sout = r.Select(sel)
+	if !sout.OK || sout.InstanceID != "a" ||
+		sout.Address != "API.example:08080" || sout.Sequence != 1 || sout.Revision != 2 {
+		t.Fatalf("selection must return the new spelling with its new sequence: %+v", sout)
+	}
+}
+
+// TestRegistryAddressInternalWhitespaceAndControlRejected locks the illegal
+// side of the address acceptance range: whitespace and control characters are
+// tolerated only around the ends and removed there; an address containing them
+// internally makes the whole item invalid. The failure explains the address
+// problem and stamps the service's current revision, and a simultaneously
+// wrong expectedRevision must not turn the answer into a conflict. The legal
+// changes elsewhere in the same list must not partially apply — revision,
+// original list and accepted health records all survive — and later requests
+// keep being processed in batch order against the committed state.
+func TestRegistryAddressInternalWhitespaceAndControlRejected(t *testing.T) {
+	r := NewRegistry()
+	registerService(t, r, "svc", 0, []Instance{
+		{ID: "a", Address: "h1:1"},
+		{ID: "b", Address: "h2:2"},
+	})
+	markHealth(t, r, "svc", "a", 1, 11, true, "")
+	markHealth(t, r, "svc", "b", 1, 22, true, "")
+
+	bad := []struct {
+		name    string
+		address string
+	}{
+		{"internal space", "api.example :8080"},
+		{"internal tab", "api.ex\tmple:8080"},
+		{"control character", "api.ex\u0001ample:8080"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			// a's legal address change earlier in the same list plus b's illegal
+			// address, with expectedRevision 9 also wrong: content validity wins,
+			// the item is invalid and the legal prefix must not take effect.
+			reg, err := r.ValidateRegistration("svc", 9, []Instance{
+				{ID: "a", Address: "h9:9"},
+				{ID: "b", Address: tc.address},
+			})
+			if err == nil {
+				t.Fatalf("address with an %s should be invalid, got registration %+v", tc.name, reg)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "instance address") ||
+				!strings.Contains(msg, "must not contain whitespace or control characters") {
+				t.Fatalf("error should explain the address problem, got %q", msg)
+			}
+			if reg.Service != "" || reg.Revision != 0 || reg.Instances != nil {
+				t.Fatalf("failed validation must not return a partial registration: %+v", reg)
+			}
+		})
+	}
+
+	// Nothing leaked through any rejected attempt: revision stays 1, the
+	// original addresses and the accepted health records are all intact.
+	if rev := r.RevisionOf("svc"); rev != 1 {
+		t.Fatalf("revision consumed by invalid registrations: %d", rev)
+	}
+	if inst := instanceHealth(t, r, "svc", "a"); inst.Address != "h1:1" ||
+		inst.Health != HealthHealthy || inst.Sequence != 11 {
+		t.Fatalf("a must keep its accepted record: %+v", inst)
+	}
+	if inst := instanceHealth(t, r, "svc", "b"); inst.Address != "h2:2" ||
+		inst.Health != HealthHealthy || inst.Sequence != 22 {
+		t.Fatalf("b must keep its accepted record: %+v", inst)
+	}
+
+	// Later legal requests still apply, and selection keeps using the accepted
+	// addresses and sequences: the rejected items consumed neither a revision
+	// nor a rotation step.
+	registerService(t, r, "svc", 1, []Instance{
+		{ID: "a", Address: "h1:1"},
+		{ID: "b", Address: "h2:2"},
+	})
+	if out := selected(t, r, "svc", 1); out.InstanceID != "a" ||
+		out.Address != "h1:1" || out.Sequence != 11 || out.Revision != 1 {
+		t.Fatalf("selection after rejected items should use the accepted state: %+v", out)
+	}
+}
+
 func strPtr(s string) *string { return &s }

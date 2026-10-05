@@ -2535,3 +2535,241 @@ func TestRegisterNormalDeliveryKeepsBehavior(t *testing.T) {
 		})
 	}
 }
+
+// TestRegisterAddressPaddingOnlyReregistrationUnchanged is the batch-level
+// regression guard for the address-tidying rule at the unchanged boundary.
+// Registration removes only the whitespace around an address and then keeps the
+// legal text; an instance already registered with an accepted health record
+// that is resubmitted with surrounding whitespace added tidies to the same
+// text, so the item succeeds without "changed": the revision is not consumed,
+// the accepted health state, sequence and reason survive, and selections
+// return the tidied original address with the original sequence. Every item
+// succeeds, so the exit status is 0.
+func TestRegisterAddressPaddingOnlyReregistrationUnchanged(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"api.example:8080"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":7,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[{"id":"a","address":"\t api.example:8080 \n"}]},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[{"id":"a","address":"   api.example:8080   "}]},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 0 {
+		t.Fatalf("all items succeed, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 6 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 0: initial registration at revision 1; the stored spelling is the text
+	// after trimming, with nothing else rewritten.
+	if r := got.Results[0]; !r.OK || !r.Changed || r.Revision != 1 {
+		t.Fatalf("result 0: %+v", r)
+	}
+	// 1: the observation is accepted without bumping the registration revision.
+	if r := got.Results[1]; !r.OK || !r.Changed || r.Revision != 1 || r.Sequence != 7 {
+		t.Fatalf("result 1: %+v", r)
+	}
+	// 2: selection returns the tidied original address and original sequence.
+	if r := got.Results[2]; !r.OK || r.InstanceID != "a" || r.Address != "api.example:8080" || r.Sequence != 7 {
+		t.Fatalf("result 2: %+v", r)
+	}
+	// 3-4: padding-only resubmissions tidy to the stored text: both succeed,
+	// neither reports changed and the revision stays at its original value.
+	for _, i := range []int{3, 4} {
+		if r := got.Results[i]; !r.OK || r.Changed || r.Revision != 1 {
+			t.Fatalf("result %d padding-only registration must be unchanged: %+v", i, r)
+		}
+	}
+	// 5: the accepted health record survived; selection still carries the
+	// tidied original address and the original sequence.
+	if r := got.Results[5]; !r.OK || r.InstanceID != "a" || r.Address != "api.example:8080" || r.Sequence != 7 || r.Revision != 1 {
+		t.Fatalf("result 5: %+v", r)
+	}
+	// The final list keeps revision 1 with the original spelling and the
+	// accepted healthy record.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	if insts := got.Services[0].Instances; len(insts) != 1 ||
+		insts[0].ID != "a" || insts[0].Address != "api.example:8080" ||
+		insts[0].Health != "healthy" || insts[0].Sequence != 7 || insts[0].Reason != "" {
+		t.Fatalf("final instance: %+v", insts)
+	}
+}
+
+// TestRegisterDistinctLegalAddressSpellingIsChange is the batch-level guard for
+// the rule that trimming must not merge distinct legal spellings: uppercase
+// domain labels and a port with leading zeros are both accepted forms, so
+// "api.example:8080" and "API.example:08080" stay different texts after
+// trimming. Resubmitting an unchanged instance id with the new spelling
+// reports changed, bumps the revision once and stores the new spelling as
+// submitted, resetting that instance to unknown/0/no-reason; the other
+// instance, whose id and address are unchanged, keeps its unhealthy record,
+// sequence and reason. With no other healthy instance the new address answers
+// no_healthy until an observation is accepted under the current revision; an
+// observation under the old revision conflicts even with a far higher sequence
+// and heals nothing, while a fresh observation (sequence restarting at 1) makes
+// selection return the new spelling with the new sequence. The batch contains
+// failures, so it exits 1.
+func TestRegisterDistinctLegalAddressSpellingIsChange(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"api.example:8080"},{"id":"b","address":"other.example:9090"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":12,"healthy":false,"reason":"connection refused"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[{"id":"a","address":"API.example:08080"},{"id":"b","address":"other.example:9090"}]},
+		{"type":"select","service":"svc","expectedRevision":2},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":99,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":2},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":2,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":2}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains failures, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 10 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 3: before the replacement selection returns a's old spelling and sequence.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" || r.Address != "api.example:8080" || r.Sequence != 11 || r.Revision != 1 {
+		t.Fatalf("result 3: %+v", r)
+	}
+	// 4: the new spelling is different text after trimming: changed, revision
+	// bumped exactly once.
+	if r := got.Results[4]; !r.OK || !r.Changed || r.Revision != 2 {
+		t.Fatalf("result 4 distinct legal spelling must be a change: %+v", r)
+	}
+	// 5: a reset to unknown and b unhealthy leave no healthy instance:
+	// no_healthy with the current revision and no fabricated target.
+	if r := got.Results[5]; r.OK || r.Error != "no_healthy" || r.Reason == "" ||
+		r.Revision != 2 || r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("result 5 no_healthy at the new revision: %+v", r)
+	}
+	// 6: an observation under the old revision conflicts even though its
+	// sequence (99) exceeds the 11 accepted for the old spelling; it names both
+	// revisions.
+	if r := got.Results[6]; r.OK || r.Error != "conflict" || r.Reason == "" ||
+		r.ExpectedRevision != 1 || r.ActualRevision != 2 || r.Revision != 2 {
+		t.Fatalf("result 6 old-revision observation: %+v", r)
+	}
+	// 7: the conflicting report healed nothing — still no_healthy.
+	if r := got.Results[7]; r.OK || r.Error != "no_healthy" || r.Revision != 2 ||
+		r.InstanceID != "" || r.Address != "" {
+		t.Fatalf("result 7 new spelling must not regain eligibility: %+v", r)
+	}
+	// 8: at the current revision a sequence of 1 suffices after the reset; it
+	// need not exceed the old sequence 11.
+	if r := got.Results[8]; !r.OK || !r.Changed || r.Revision != 2 || r.Sequence != 1 {
+		t.Fatalf("result 8 fresh observation: %+v", r)
+	}
+	// 9: selection returns the NEW spelling with the NEW sequence.
+	if r := got.Results[9]; !r.OK || r.InstanceID != "a" ||
+		r.Address != "API.example:08080" || r.Sequence != 1 || r.Revision != 2 {
+		t.Fatalf("result 9 must select the new spelling with its new sequence: %+v", r)
+	}
+	// Final list: revision 2; a healthy at the new spelling with sequence 1 and
+	// no reason; b kept its address and its unhealthy record, sequence and
+	// reason.
+	if len(got.Services) != 1 || got.Services[0].Revision != 2 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 2 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	if insts[0].ID != "a" || insts[0].Address != "API.example:08080" ||
+		insts[0].Health != "healthy" || insts[0].Sequence != 1 || insts[0].Reason != "" {
+		t.Fatalf("a should be healthy at its new spelling: %+v", insts[0])
+	}
+	if insts[1].ID != "b" || insts[1].Address != "other.example:9090" ||
+		insts[1].Health != "unhealthy" || insts[1].Sequence != 12 || insts[1].Reason != "connection refused" {
+		t.Fatalf("b should keep its own record: %+v", insts[1])
+	}
+}
+
+// TestRegisterAddressInternalWhitespaceAndControlRejected is the batch-level
+// guard for the illegal side of the address acceptance range: whitespace or
+// control characters inside an address make the whole item invalid. Field
+// validation precedes the revision comparison, so a simultaneously wrong
+// expectedRevision still yields invalid (never conflict), the result states
+// the address problem and stamps the service's current revision, and legal
+// address changes earlier in the same list must not partially apply — the
+// original list, revision and accepted health records all survive. Later
+// items keep being processed in batch order against the committed state.
+func TestRegisterAddressInternalWhitespaceAndControlRejected(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":22,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":9,"instances":[{"id":"a","address":"h9:9"},{"id":"b","address":"api.ex\tmple:8080"}]},
+		{"type":"register","service":"svc","expectedRevision":5,"instances":[{"id":"a","address":"h9:9"},{"id":"b","address":"api.example :8080"}]},
+		{"type":"register","service":"svc","expectedRevision":5,"instances":[{"id":"a","address":"h9:9"},{"id":"b","address":"api.ex\u0001ample:8080"}]},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains invalid items, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Results) != 8 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 3: first selection takes the smallest healthy id; the cursor rests on a.
+	if r := got.Results[3]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 11 {
+		t.Fatalf("result 3: %+v", r)
+	}
+	// 4-6: each item is invalid as a whole. The reason explains the address
+	// problem and the result stamps the service's CURRENT revision 1; the wrong
+	// expectedRevision is not compared, so no conflict fields appear, and the
+	// legal prefix changing a's address must not apply.
+	for _, i := range []int{4, 5, 6} {
+		r := got.Results[i]
+		if r.OK || r.Error != "invalid" || r.Revision != 1 ||
+			r.ExpectedRevision != 0 || r.ActualRevision != 0 ||
+			r.InstanceID != "" || r.Address != "" {
+			t.Fatalf("result %d invalid address rejection: %+v", i, r)
+		}
+		if !strings.Contains(r.Reason, "instance address") ||
+			!strings.Contains(r.Reason, "must not contain whitespace or control characters") {
+			t.Fatalf("result %d reason should explain the address problem, got %q", i, r.Reason)
+		}
+	}
+	// 7: later items still run in batch order and the rejected prefixes changed
+	// nothing — the rotation continues just after a and returns b's original
+	// address and accepted sequence.
+	if r := got.Results[7]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 22 || r.Revision != 1 {
+		t.Fatalf("result 7 later select should use the committed state: %+v", r)
+	}
+	// Final list: revision untouched, the legal address h9:9 nowhere present,
+	// both original instances healthy with their accepted sequences.
+	if len(got.Services) != 1 || got.Services[0].Revision != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	insts := got.Services[0].Instances
+	if len(insts) != 2 {
+		t.Fatalf("instances: %+v", insts)
+	}
+	wantInsts := []registerInstance{
+		{ID: "a", Address: "h1:1", Health: "healthy", Sequence: 11},
+		{ID: "b", Address: "h2:2", Health: "healthy", Sequence: 22},
+	}
+	for i, want := range wantInsts {
+		if insts[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, insts[i], want)
+		}
+	}
+}
