@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -2192,5 +2193,148 @@ func TestSelectTwoSessionKeysNoHealthyIsolation(t *testing.T) {
 		if insts[i] != want {
 			t.Fatalf("instance %d: got %+v want %+v", i, insts[i], want)
 		}
+	}
+}
+
+// errBrokenStdout stands in for a real write failure (closed pipe, full disk,
+// etc.); its text must survive into the standard-error diagnostic verbatim.
+var errBrokenStdout = errors.New("simulated broken stdout")
+
+// failingStdout accepts at most failAfter bytes total, then fails every write
+// (including the first one when failAfter is 0) with errBrokenStdout. It
+// records the bytes actually written so a test can prove nothing is appended
+// after the failure.
+type failingStdout struct {
+	buf       bytes.Buffer
+	failAfter int
+}
+
+func (w *failingStdout) Write(p []byte) (int, error) {
+	remaining := w.failAfter - w.buf.Len()
+	if remaining <= 0 {
+		return 0, errBrokenStdout
+	}
+	if len(p) <= remaining {
+		return w.buf.Write(p)
+	}
+	n, _ := w.buf.Write(p[:remaining])
+	return n, errBrokenStdout
+}
+
+// TestRegisterUndeliveredResultsExitsOne covers every shape of result: an
+// all-success batch, a batch with a business failure, an empty batch, and a
+// top-level input error. Whether standard output rejects the first byte or
+// fails after a partial write, the process must exit 1, diagnose a result
+// delivery failure (not an invalid/conflict business error) on standard
+// error while preserving the real write error, and leave the possibly partial
+// standard output untouched.
+func TestRegisterUndeliveredResultsExitsOne(t *testing.T) {
+	const goodInput = `{"requests":[
+		{"service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"h1:8080"}]},
+		{"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1}
+	]}`
+	const businessFailureInput = `{"requests":[
+		{"service":"svc","expectedRevision":5,"instances":[]}
+	]}`
+
+	cases := []struct {
+		name        string
+		input       string
+		failAfter   int
+		topLevelErr bool
+	}{
+		{"all success stdout closed from start", goodInput, 0, false},
+		{"all success stdout fails mid write", goodInput, 40, false},
+		{"business failure stdout closed from start", businessFailureInput, 0, false},
+		{"empty requests stdout closed from start", `{"requests":[]}`, 0, false},
+		{"top level error stdout closed from start", `{not json`, 0, true},
+		{"top level error stdout fails mid write", `{not json`, 5, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := &failingStdout{failAfter: tc.failAfter}
+			var stderr bytes.Buffer
+			code := runRegisterIO(strings.NewReader(tc.input), out, &stderr)
+			if code != 1 {
+				t.Fatalf("exit code = %d, want 1", code)
+			}
+
+			// Only the bytes accepted before the failure are on standard
+			// output: no second JSON document, no error object, no "successful"
+			// tail may be appended to an undeliverable stream.
+			written := out.buf.String()
+			if len(written) != tc.failAfter {
+				t.Fatalf("stdout bytes = %d, want exactly %d (nothing appended): %q", len(written), tc.failAfter, written)
+			}
+			if json.Valid([]byte(written)) {
+				t.Fatalf("caller must not receive a complete result: %q", written)
+			}
+			if strings.Contains(written, `"error"`) {
+				t.Fatalf("delivery failure must not be appended to stdout as JSON: %q", written)
+			}
+
+			diag := stderr.String()
+			if diag == "" {
+				t.Fatal("expected a delivery-failure diagnostic on standard error")
+			}
+			if !strings.Contains(diag, "failed to write") || !strings.Contains(diag, "standard output") {
+				t.Fatalf("diagnostic should name result delivery to standard output: %q", diag)
+			}
+			// The actual write error reason must be preserved.
+			if !strings.Contains(diag, errBrokenStdout.Error()) {
+				t.Fatalf("diagnostic should preserve the write error cause: %q", diag)
+			}
+			// A delivery problem must not masquerade as a per-request business
+			// rejection or a top-level input error.
+			for _, business := range []string{"invalid", "conflict", "not_found", "no_healthy", "stale"} {
+				if strings.Contains(diag, business) {
+					t.Fatalf("delivery diagnostic must not look like a %q business error: %q", business, diag)
+				}
+			}
+			if tc.topLevelErr {
+				if !strings.Contains(diag, "error result") {
+					t.Fatalf("top-level error delivery should be identified as such: %q", diag)
+				}
+			} else if strings.Contains(diag, "error result") {
+				t.Fatalf("batch result delivery should not be called an error result: %q", diag)
+			}
+		})
+	}
+}
+
+// TestRegisterDeliveredOutputWritesNoStderrDiagnostic pins the healthy-path
+// behavior: with standard output writable, success is silent on standard
+// error and exits 0 (including the empty-requests batch), while a business
+// failure still exits 1 without any delivery diagnostic.
+func TestRegisterDeliveredOutputWritesNoStderrDiagnostic(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		wantCode int
+	}{
+		{"all success", `{"requests":[
+			{"service":"svc","expectedRevision":0,"instances":[{"id":"i1","address":"h1:8080"}]}
+		]}`, 0},
+		{"empty requests", `{"requests":[]}`, 0},
+		{"business failure", `{"requests":[
+			{"service":"svc","expectedRevision":9,"instances":[]}
+		]}`, 1},
+		{"top level input error", `{not json`, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, stderr bytes.Buffer
+			code := runRegisterIO(strings.NewReader(tc.input), &out, &stderr)
+			if code != tc.wantCode {
+				t.Fatalf("exit code = %d, want %d, output: %s", code, tc.wantCode, out.String())
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("delivered output must not add diagnostics to standard error: %q", stderr.String())
+			}
+			if !json.Valid(out.Bytes()) {
+				t.Fatalf("standard output must carry the complete JSON result: %q", out.String())
+			}
+		})
 	}
 }
