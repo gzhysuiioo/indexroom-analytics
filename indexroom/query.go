@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"sync/atomic"
 )
@@ -163,8 +162,9 @@ func (index *Index) firstQuery(query TxQuery, pageSize int) (TxPage, error) {
 	if queryTxsHookLocked != nil {
 		queryTxsHookLocked(from, to, false)
 	}
-	hits, total, blocks := index.scanPageLocked(from, to, query.TxIDs, 0, pageSize)
-	return index.buildPageLocked(query, from, to, hits, total, blocks, 0, pageSize), nil
+	filter := newTxFilter(query.TxIDs)
+	hits, total, blocks := index.scanPageLocked(from, to, filter, 0, pageSize)
+	return index.buildPageLocked(query, filter, from, to, hits, total, blocks, 0, pageSize), nil
 }
 
 func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
@@ -182,7 +182,8 @@ func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
 	if query.To != payload.ReqTo {
 		return TxPage{}, fmt.Errorf("%w: to height differs from the first page", ErrInvalidArgument)
 	}
-	if got := hex.EncodeToString(hashTxSet(query.TxIDs)); got != payload.Set {
+	filter := newTxFilter(query.TxIDs)
+	if filter.sum != payload.Set {
 		return TxPage{}, fmt.Errorf("%w: transaction filter differs from the first page", ErrInvalidArgument)
 	}
 
@@ -201,18 +202,18 @@ func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
 	}
 	// Re-scan the still-identical pinned range: the cursor records the
 	// absolute offset, but no full match list is kept between pages.
-	hits, total, blocks := index.scanPageLocked(payload.From, payload.To, query.TxIDs, payload.Off, pageSize)
+	hits, total, blocks := index.scanPageLocked(payload.From, payload.To, filter, payload.Off, pageSize)
 	if payload.Off > total {
 		return TxPage{}, fmt.Errorf("%w: cursor offset is beyond the pinned results", ErrQueryChanged)
 	}
-	return index.buildPageLocked(query, payload.From, payload.To, hits, total, blocks, payload.Off, pageSize), nil
+	return index.buildPageLocked(query, filter, payload.From, payload.To, hits, total, blocks, payload.Off, pageSize), nil
 }
 
 // buildPageLocked assembles one page from a page-sized scan and mints the
 // continuation cursor when matches remain. total and blocks describe the
 // whole pinned range; hits holds only the window [offset, offset+pageSize).
 // The caller must hold index.mu.
-func (index *Index) buildPageLocked(query TxQuery, from, to int64, hits []TxHit, total, blocks, offset int64, pageSize int) TxPage {
+func (index *Index) buildPageLocked(query TxQuery, filter txFilter, from, to int64, hits []TxHit, total, blocks, offset int64, pageSize int) TxPage {
 	page := TxPage{
 		Hits:          hits,
 		TotalMatches:  total,
@@ -225,7 +226,7 @@ func (index *Index) buildPageLocked(query TxQuery, from, to int64, hits []TxHit,
 			From:  from,
 			ReqTo: query.To,
 			To:    to,
-			Set:   hex.EncodeToString(hashTxSet(query.TxIDs)),
+			Set:   filter.sum,
 			FP:    hex.EncodeToString(index.fingerprintLocked(from, to)),
 			Off:   offset + int64(len(hits)),
 		})
@@ -238,23 +239,14 @@ func (index *Index) buildPageLocked(query TxQuery, from, to int64, hits []TxHit,
 // retaining only the page window [offset, offset+pageSize) in a pre-sized
 // slice: at most pageSize TxHit records, independent of how many matches the
 // whole range holds. The caller must hold index.mu.
-func (index *Index) scanPageLocked(from, to int64, txIDs []string, offset int64, pageSize int) (hits []TxHit, total, blocks int64) {
-	var filter map[string]struct{}
-	if len(txIDs) > 0 {
-		filter = make(map[string]struct{}, len(txIDs))
-		for _, id := range txIDs {
-			filter[id] = struct{}{}
-		}
-	}
+func (index *Index) scanPageLocked(from, to int64, filter txFilter, offset int64, pageSize int) (hits []TxHit, total, blocks int64) {
 	hits = make([]TxHit, 0, pageSize)
 	for height := from; height <= to; height++ {
 		block := index.Blocks[height]
 		matched := false
 		for position, tx := range block.Txs {
-			if filter != nil {
-				if _, ok := filter[tx]; !ok {
-					continue
-				}
+			if !filter.matches(tx) {
+				continue
 			}
 			if total >= offset && int64(len(hits)) < int64(pageSize) {
 				hits = append(hits, TxHit{Height: height, BlockHash: block.Hash, TxID: tx, Position: position})
@@ -299,29 +291,6 @@ func (index *Index) fingerprintLocked(from, to int64) []byte {
 			binary.BigEndian.PutUint64(lenBuf[:], uint64(*block.Time))
 			h.Write(lenBuf[:])
 		}
-	}
-	return h.Sum(nil)
-}
-
-// hashTxSet hashes the deduplicated, sorted identifier set so that cursor
-// validation is insensitive to duplicates and ordering.
-func hashTxSet(txIDs []string) []byte {
-	unique := make(map[string]struct{}, len(txIDs))
-	sorted := make([]string, 0, len(txIDs))
-	for _, id := range txIDs {
-		if _, ok := unique[id]; ok {
-			continue
-		}
-		unique[id] = struct{}{}
-		sorted = append(sorted, id)
-	}
-	sort.Strings(sorted)
-	h := sha256.New()
-	var lenBuf [8]byte
-	for _, id := range sorted {
-		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(id)))
-		h.Write(lenBuf[:])
-		h.Write([]byte(id))
 	}
 	return h.Sum(nil)
 }
