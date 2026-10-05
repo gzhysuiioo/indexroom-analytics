@@ -15,7 +15,7 @@ go test ./...
 ## 主要接口
 
 - `indexroom.Block` 的 `Time *int64` 字段携带非负 Unix 秒数；`nil` 表示未提供时间，与时间为 0 严格区分。
-- `Index.Append` / `Index.Reorg`：摄取区块与重组，负时间整体拒绝且不改变已有链；哈希、父哈希或任一交易标识含非法 UTF-8 字节时同样整体拒绝，错误信息指出区块高度与字段（交易标识另指出从 0 开始的位置），保证快照可无损导出与恢复。
+- `Index.Append` / `Index.Reorg`：摄取区块与重组，负时间整体拒绝且不改变已有链；哈希、父哈希或任一交易标识含非法 UTF-8 字节时同样整体拒绝，错误信息指出区块高度与字段（交易标识另指出从 0 开始的位置），保证快照可无损导出与恢复。`Reorg` 的分支范围、丢弃高度口径、失败原子性与完整用法见下方[重组指南（Reorg）](#重组指南reorg)。
 - `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
 - `Index.QueryTimeStats`：按 `[Start, End)` 半开窗口与 `StepSeconds` 分段统计交易出现次数、不同标识数、含匹配交易的区块数，并给出整窗口去重汇总与缺失时间区块数；非法参数返回 `ErrInvalidArgument`。完整用法见下方[按时间窗口统计交易指南](#按时间窗口统计交易指南querytimestats)。
 - `Index.Export` / `Index.Restore`：快照版本 1（区块不含 `timestamp`）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）。`Restore` 保证**数据一致**并把再导出规范化为本功能的固定文本，不保留输入的字段顺序、空白与转义写法；它用一份完整快照整体替换主链，非法输入返回 `ErrInvalidSnapshot` 且不改变现有链。完整用法见下方[快照导出与恢复指南（Export/Restore）](#快照导出与恢复指南exportrestore)。
@@ -536,6 +536,288 @@ From=100 超过链顶 7：err=<nil> 段数=4 解析后高度范围=[100, 7] 整�
 起点时间不小于终点：ErrInvalidArgument=true
 非正步长：ErrInvalidArgument=true
 分段超过一万段：ErrInvalidArgument=true
+```
+
+## 重组指南（Reorg）
+
+`Index.Reorg(blocks []Block) (dropped []int64, err error)` 用提交的**分支**整体替换主链在某个已索引父区块之后的全部内容，并返回旧内容发生变化或被删除的高度（升序）。调用与查询、摄取、快照可并发，每次调用看到的都是一个完整的链状态；重组失败不会留下半截分支。
+
+### 分支范围：父哈希必须已索引，父之后整体替换
+
+准备 `Reorg` 输入时按下面的边界组织分支，这是最容易理解错的一点：
+
+- **第一个新区块的父哈希（`blocks[0].Parent`）必须对应当前主链中已经索引的某个区块**。设该父区块高度为 `a`，则分支第一个区块的高度必须是 `a+1`。
+- **分支内部高度连续、逐个连接**：从第二个区块起，每个区块高度必须是前一块高度加一，父哈希必须等于前一块的哈希；分支末尾区块的高度就是重组后的**新链顶**。
+- **父区块及其之前的主链原样保留；父区块高度之后的内容由提交的分支整体替换**——无论主链原来在这段有多少区块，重组后这段恰好是分支里的区块。分支比旧链短时，多出的旧区块被删除，链顶随之降到分支末尾。
+- 因此**不能只提交“变化的区块”然后指望旧链余下部分自动保留**：若新链顶之后还有旧区块要留下，就必须把它们（或其在新链上的对应区块）一并放进分支。要替换从高度 `a+1` 开始的一段，就提交从高度 `a+1` 到目标新链顶的完整后缀。
+- **与首块摄取的区别**：空索引 `Append` 第一个区块（高度 1）时，它的 `Parent` 只是命名链起点的标识，**不需要也不可能**已索引。`Reorg` 没有这个豁免——即使分支首块高度写成 1，它的父哈希仍必须能在当前主链中找到，否则返回 `branch parent is unknown`。首块摄取允许未索引起点，**不代表**重组也能拿这个标识当父哈希去替换高度 1。想用全新内容替换整条链（含高度 1），应使用 [`Restore` 整体替换](#快照导出与恢复指南exportrestore)。
+
+分支内哈希还需满足：哈希非空、分支内不重复；**父区块及其以下保留区间的哈希不能被分支复用**（冲突返回 `hash conflicts with a retained block`）；被替换后缀里的旧哈希则允许在分支中重新出现，甚至可以出现在与原来不同的高度。负时间、非法 UTF-8 等校验与 `Append` 一致。
+
+### 丢弃高度（dropped）报的是什么
+
+成功时返回的 `dropped` 是一个**按高度升序**的列表，口径是**父区块之后、旧内容发生变化或被删除的高度**：
+
+- 旧链在 `(父高度, 旧链顶]` 内、新分支也覆盖到的高度，逐块比较该高度上的**旧区块与分支区块**（高度、哈希、父哈希、按序的交易列表、时间的有无与取值全部相同才算相同）；不同就把该高度列入。
+- 旧链高出新链顶的高度（分支更短、旧区块被删除）全部列入。
+- 提交的区块与旧块**完全相同**的高度不列入；重新提交当前已生效的同一条分支，返回空列表。
+
+所以它**既不是“全部提交高度”，也不是“消失的哈希数量”**：分支里与旧块相同的高度不报；反过来，某个旧哈希即使在分支别的高度重新出现，原高度内容变了仍要报。特别注意**缺失时间与真实零秒是两种不同的区块内容**（`Time == nil` 与 `Time` 指向 0），只改这一点的高度也必须列入。
+
+### 失败是整体拒绝，没有部分生效
+
+整支分支在应用之前完整校验：空分支、父哈希未索引、首块高度不是父高度加一、分支高度不连续、某块父哈希不等于前一块哈希、哈希为空或分支内重复、复用保留区间哈希、负时间、非法 UTF-8 等，任何一项不过（哪怕错误出现在**最后一个区块**）都会：
+
+- 返回非 nil 错误，并返回**空的**丢弃高度列表；
+- 前面看似合法的区块**不会提前生效**：原链顶、各高度区块内容、哈希→高度对应关系全部保持原状（可用再次 `Export` 逐字节比对验证）。
+
+本功能没有为重组错误导出专用哨兵，调用方把任何非 nil 返回当作“本次分支被整体拒绝、状态未变”处理即可，修正分支后重新提交。重组成功后，之前分页查询取得的游标仍按[既有固定范围规则](#游标失效区分-errquerychanged-与-errinvalidargument)校验：固定范围内区块变化（即使只改时间）或链顶降到固定上界以下，续查返回 `ErrQueryChanged`，此时应从空游标重新开始。
+
+### 完整示例：缩短重组与父链接错误的整体拒绝
+
+下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/reorg/main.go`](examples/reorg/main.go)：
+
+```bash
+go run ./examples/reorg
+```
+
+场景分四步：先准备一条高度 1 到 4 的旧链（h1/h2/h4 有时间，h3 没有时间）；再以高度 1（h1）为父提交高度 2、3 的缩短分支——高度 2 与原区块完全相同，高度 3 保持原哈希 h3、父哈希 h2 与交易列表 `[t3]`，只把时间从缺失改为 0，分支在高度 3 结束。成功后链顶为 3、高度 4 不再存在，丢弃高度按升序为 `[3,4]`：高度 2 完全相同不报，高度 3 因“缺失时间→真实零秒”而内容不同必须报，高度 4 被删除必须报。第三步用一个**全新索引**从原来的四块链重新开始（避免与成功后的状态混淆），提交同一分支但把最后一个区块（高度 3）的父哈希改错：调用返回错误、丢弃高度为 `[]`，链顶仍为 4，区块内容、哈希对应关系与再次导出文本全部保持原状。最后一步演示首块摄取的未索引起点不能用作重组父哈希。
+
+```go
+// 重组（Index.Reorg）完整示例：从一条高度 1..4 的链出发，以已索引的
+// 高度 1 为父区块（分支首块高度 2，h2 与原块完全相同；h3 保持原哈希、
+// 父哈希与交易列表，只把时间从缺失改为 0）做一次缩短重组；再用一个全新的
+// 索引从同样的四块链出发，演示同一分支最后一个区块父链接错误时整支分支被
+// 拒绝、不报告丢弃高度、原链顶/区块内容/哈希对应关系全部保持原状；最后
+// 区分“首块摄取允许未索引的链起点标识”与“重组父哈希必须已索引”。
+//
+// 运行：go run ./examples/reorg
+package main
+
+import (
+	"bytes"
+	"fmt"
+
+	"github.com/gzhysuiioo/indexroom-analytics/indexroom"
+)
+
+func mustAppend(index *indexroom.Index, block indexroom.Block) {
+	if err := index.Append(block); err != nil {
+		panic(err)
+	}
+}
+
+// unix 返回指向给定 Unix 秒的指针，用于设置区块时间。
+func unix(sec int64) *int64 { return &sec }
+
+// timeText 把区块时间渲染成便于阅读的文本：缺失时间为 "nil（缺失）"，
+// 否则为实际 Unix 秒。
+func timeText(b indexroom.Block) string {
+	if b.Time == nil {
+		return "nil（缺失）"
+	}
+	return fmt.Sprintf("%d", *b.Time)
+}
+
+// heightsText 把丢弃高度列表渲染成 [3,4] 这样的文本（空列表为 []），
+// 便于直接看到“按升序报告高度”，而不是 Go 默认的 [3 4]。
+func heightsText(heights []int64) string {
+	var sb bytes.Buffer
+	sb.WriteByte('[')
+	for i, h := range heights {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprint(&sb, h)
+	}
+	sb.WriteByte(']')
+	return sb.String()
+}
+
+// dumpChain 按高度升序打印每个主链区块的完整内容（哈希、父哈希、交易、
+// 时间），并给出链顶与哈希→高度对应表，用来观察操作后的主链。
+func dumpChain(title string, index *indexroom.Index) {
+	fmt.Println(title)
+	for h := int64(1); h <= index.Tip; h++ {
+		b := index.Blocks[h]
+		fmt.Printf("  高度 %d：hash=%s parent=%s txs=%q 时间=%s\n",
+			h, b.Hash, b.Parent, b.Txs, timeText(b))
+	}
+	fmt.Printf("  链顶 tip=%d；ByHash=%v\n", index.Tip, index.ByHash)
+}
+
+// exportText 返回当前主链的规范化导出文本，用于逐字节核对失败前后的链内容。
+func exportText(index *indexroom.Index) string {
+	var buf bytes.Buffer
+	if err := index.Export(&buf); err != nil {
+		panic(err)
+	}
+	return buf.String()
+}
+
+// newFourBlockChain 返回一条高度 1..4 的链，用于成功与失败两个场景。
+// h1、h2、h4 有正常时间（链上只要有任一块带时间，再导出即为版本 2），
+// h3 没有时间（这是成功重组要修改的唯一内容）。
+func newFourBlockChain() *indexroom.Index {
+	idx := indexroom.New()
+	mustAppend(idx, indexroom.Block{Height: 1, Hash: "h1", Parent: "genesis", Txs: []string{"t1"}, Time: unix(100)})
+	mustAppend(idx, indexroom.Block{Height: 2, Hash: "h2", Parent: "h1", Txs: []string{"t2"}, Time: unix(200)})
+	mustAppend(idx, indexroom.Block{Height: 3, Hash: "h3", Parent: "h2", Txs: []string{"t3"}})
+	mustAppend(idx, indexroom.Block{Height: 4, Hash: "h4", Parent: "h3", Txs: []string{"t4"}, Time: unix(400)})
+	return idx
+}
+
+// shorteningBranch 构造成功场景提交的分支：
+//   - 第一个新区块（高度 2）的父哈希是 h1 —— 当前主链上已索引的高度 1；
+//   - 高度 2 的块与原块完全相同（h2，时间 200，不进入丢弃列表）；
+//   - 高度 3 保持原哈希 h3、父哈希 h2、交易 [t3]，只把时间从缺失改为 0；
+//   - 分支在高度 3 结束，因此旧高度 4（h4）整体消失，新的链顶就是分支末尾的 h3。
+func shorteningBranch() []indexroom.Block {
+	return []indexroom.Block{
+		{Height: 2, Hash: "h2", Parent: "h1", Txs: []string{"t2"}, Time: unix(200)},
+		{Height: 3, Hash: "h3", Parent: "h2", Txs: []string{"t3"}, Time: unix(0)},
+	}
+}
+
+// brokenBranch 构造失败场景提交的同一分支，但最后一个区块（高度 3）的
+// 父哈希被改错：它应指向分支前一块的哈希 h2，却写成了未在分支中出现的
+// "WRONG-PARENT"。
+func brokenBranch() []indexroom.Block {
+	return []indexroom.Block{
+		{Height: 2, Hash: "h2", Parent: "h1", Txs: []string{"t2"}, Time: unix(200)},
+		{Height: 3, Hash: "h3", Parent: "WRONG-PARENT", Txs: []string{"t3"}, Time: unix(0)},
+	}
+}
+
+func main() {
+	// 1. 成功场景：一条高度 1..4 的旧链。
+	idx := newFourBlockChain()
+	fmt.Println("操作 1：高度 1 到 4 的旧链")
+	dumpChain("主链内容：", idx)
+	fmt.Printf("  h3 的时间：%s —— 旧 h3 没有时间，这不是 0\n", timeText(idx.Blocks[3]))
+	fmt.Println()
+
+	// 2. 以高度 1（h1）为父提交缩短分支：高度 2 完全相同，高度 3 只改时间，
+	//    分支在 3 结束，旧高度 4 被整体删除。Reorg 是“分支整体替换父之后
+	//    全部主链内容”，不是只应用变化的块。
+	dropped, err := idx.Reorg(shorteningBranch())
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("操作 2：以高度 1（h1）为父提交高度 2、3 的缩短分支，Reorg 返回\n")
+	fmt.Printf("  err=%v\n", err)
+	fmt.Printf("  丢弃高度 dropped=%s（升序）\n", heightsText(dropped))
+	fmt.Println("  解释：该列表报告旧内容发生变化或被删除的高度——")
+	fmt.Println("  · 高度 2 提交的块与旧块完全相同，不列入；")
+	fmt.Println("  · 高度 3 哈希/父哈希/交易都没变，但时间由缺失变成真实零秒，旧内容变了，必须列入；")
+	fmt.Println("  · 高度 4 在分支覆盖范围之外，旧块被删除，必须列入；")
+	fmt.Println("  · 它不是全部提交高度（提交的是 2、3），也不是消失的哈希数量（h4 只有一个）。")
+	dumpChain("操作后的主链：", idx)
+	fmt.Printf("  h3 现在的时间：%s —— 真实零秒，与缺失严格不同\n", timeText(idx.Blocks[3]))
+	fmt.Printf("  高度 4 是否存在：%v；h4 是否还在哈希表：%v\n",
+		idx.Blocks[4].Hash != "", idx.ByHash["h4"] != 0)
+	page, err := idx.QueryTxs(indexroom.TxQuery{From: 1, To: 4})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("  查询高度 [1, 4]：ToHeight=%d TotalMatches=%d MatchedBlocks=%d\n",
+		page.ToHeight, page.TotalMatches, page.MatchedBlocks)
+	for _, hit := range page.Hits {
+		fmt.Printf("    命中 height=%d block=%s tx=%q position=%d\n",
+			hit.Height, hit.BlockHash, hit.TxID, hit.Position)
+	}
+	fmt.Println()
+
+	// 3. 失败场景：用一个全新的索引从原来的四块链重新开始（避免与成功后的
+	//    状态混淆）。同一分支，只是最后一个区块父链接错误。
+	fresh := newFourBlockChain()
+	before := exportText(fresh)
+	fmt.Println("操作 3：新索引，仍是原来的高度 1..4 链（失败场景从这条链开始）")
+	fmt.Printf("  失败前链顶 tip=%d；h3 时间=%s\n", fresh.Tip, timeText(fresh.Blocks[3]))
+	badDropped, badErr := fresh.Reorg(brokenBranch())
+	fmt.Printf("  提交最后一块父链接错误的分支：err=%v\n", badErr)
+	fmt.Printf("  重组失败只表现为非 nil 错误（本功能未导出专用哨兵错误）\n")
+	fmt.Printf("  返回的丢弃高度 dropped=%s —— 出错时不报告任何高度，前面合法的块也不会提前生效\n",
+		heightsText(badDropped))
+	fmt.Printf("  失败后链顶 tip=%d（应仍为 4）\n", fresh.Tip)
+	fmt.Println("  失败后的主链（应与操作 1 的旧链完全一致：h3 仍无时间，h4 仍在）：")
+	for h := int64(1); h <= fresh.Tip; h++ {
+		b := fresh.Blocks[h]
+		fmt.Printf("    高度 %d：hash=%s parent=%s txs=%q 时间=%s\n",
+			h, b.Hash, b.Parent, b.Txs, timeText(b))
+	}
+	fmt.Printf("  ByHash=%v\n", fresh.ByHash)
+	fmt.Printf("  失败前后导出逐字节一致：%v；h3 时间仍缺失=%v；h4 仍在哈希表=%v\n",
+		exportText(fresh) == before, fresh.Blocks[3].Time == nil, fresh.ByHash["h4"] != 0)
+	fmt.Println()
+
+	// 4. 区分：空索引上的第一个块，父哈希只是链起点标识，不需要已索引；
+	//    但 Reorg 的父哈希必须对应当前主链中已索引的区块。
+	fmt.Println("操作 4：首块摄取的未索引起点 vs 重组的父哈希")
+	first := indexroom.New()
+	firstErr := first.Append(indexroom.Block{Height: 1, Hash: "b1", Parent: "unindexed-start", Txs: []string{"x"}})
+	fmt.Printf("  空索引 Append 高度 1、parent=%q：err=%v（该标识只是链起点，无需已索引）\n",
+		"unindexed-start", firstErr)
+	_, reorgErr := first.Reorg([]indexroom.Block{
+		{Height: 1, Hash: "r1", Parent: "unindexed-start", Txs: []string{"y"}},
+	})
+	fmt.Printf("  对同一个未索引标识发起 Reorg（试图从高度 1 整体替换）：err=%v\n", reorgErr)
+	fmt.Println("  即：首块摄取允许用未索引的起点标识，不代表重组也能以这个标识为父哈希替换高度 1；")
+	fmt.Println("  重组第一个新区块的父哈希必须是当前主链上已经索引的区块，分支从它的下一高度开始。")
+}
+```
+
+对应输出（`go run ./examples/reorg` 的实际输出，每次运行逐字一致）：
+
+```text
+操作 1：高度 1 到 4 的旧链
+主链内容：
+  高度 1：hash=h1 parent=genesis txs=["t1"] 时间=100
+  高度 2：hash=h2 parent=h1 txs=["t2"] 时间=200
+  高度 3：hash=h3 parent=h2 txs=["t3"] 时间=nil（缺失）
+  高度 4：hash=h4 parent=h3 txs=["t4"] 时间=400
+  链顶 tip=4；ByHash=map[h1:1 h2:2 h3:3 h4:4]
+  h3 的时间：nil（缺失） —— 旧 h3 没有时间，这不是 0
+
+操作 2：以高度 1（h1）为父提交高度 2、3 的缩短分支，Reorg 返回
+  err=<nil>
+  丢弃高度 dropped=[3,4]（升序）
+  解释：该列表报告旧内容发生变化或被删除的高度——
+  · 高度 2 提交的块与旧块完全相同，不列入；
+  · 高度 3 哈希/父哈希/交易都没变，但时间由缺失变成真实零秒，旧内容变了，必须列入；
+  · 高度 4 在分支覆盖范围之外，旧块被删除，必须列入；
+  · 它不是全部提交高度（提交的是 2、3），也不是消失的哈希数量（h4 只有一个）。
+操作后的主链：
+  高度 1：hash=h1 parent=genesis txs=["t1"] 时间=100
+  高度 2：hash=h2 parent=h1 txs=["t2"] 时间=200
+  高度 3：hash=h3 parent=h2 txs=["t3"] 时间=0
+  链顶 tip=3；ByHash=map[h1:1 h2:2 h3:3]
+  h3 现在的时间：0 —— 真实零秒，与缺失严格不同
+  高度 4 是否存在：false；h4 是否还在哈希表：false
+  查询高度 [1, 4]：ToHeight=3 TotalMatches=3 MatchedBlocks=3
+    命中 height=1 block=h1 tx="t1" position=0
+    命中 height=2 block=h2 tx="t2" position=0
+    命中 height=3 block=h3 tx="t3" position=0
+
+操作 3：新索引，仍是原来的高度 1..4 链（失败场景从这条链开始）
+  失败前链顶 tip=4；h3 时间=nil（缺失）
+  提交最后一块父链接错误的分支：err=branch parent does not match the previous block
+  重组失败只表现为非 nil 错误（本功能未导出专用哨兵错误）
+  返回的丢弃高度 dropped=[] —— 出错时不报告任何高度，前面合法的块也不会提前生效
+  失败后链顶 tip=4（应仍为 4）
+  失败后的主链（应与操作 1 的旧链完全一致：h3 仍无时间，h4 仍在）：
+    高度 1：hash=h1 parent=genesis txs=["t1"] 时间=100
+    高度 2：hash=h2 parent=h1 txs=["t2"] 时间=200
+    高度 3：hash=h3 parent=h2 txs=["t3"] 时间=nil（缺失）
+    高度 4：hash=h4 parent=h3 txs=["t4"] 时间=400
+  ByHash=map[h1:1 h2:2 h3:3 h4:4]
+  失败前后导出逐字节一致：true；h3 时间仍缺失=true；h4 仍在哈希表=true
+
+操作 4：首块摄取的未索引起点 vs 重组的父哈希
+  空索引 Append 高度 1、parent="unindexed-start"：err=<nil>（该标识只是链起点，无需已索引）
+  对同一个未索引标识发起 Reorg（试图从高度 1 整体替换）：err=branch parent is unknown
+  即：首块摄取允许用未索引的起点标识，不代表重组也能以这个标识为父哈希替换高度 1；
+  重组第一个新区块的父哈希必须是当前主链上已经索引的区块，分支从它的下一高度开始。
 ```
 
 ## 快照导出与恢复指南（Export/Restore）
