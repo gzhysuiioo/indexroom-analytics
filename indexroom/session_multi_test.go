@@ -27,7 +27,7 @@ import "testing"
 // selectSession validates and runs one select carrying a session key,
 // returning the outcome (success or failure) so failure cases can be asserted
 // directly instead of failing the helper.
-func selectSession(t *testing.T, r *Registry, service string, revision int, key string) SelectOutcome {
+func selectSession(t *testing.T, r *Registry, service string, revision int64, key string) SelectOutcome {
 	t.Helper()
 	sel, err := r.ValidateSelectionWithSession(service, revision, &key)
 	if err != nil {

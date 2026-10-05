@@ -63,9 +63,17 @@ participate in id order. Failed selections (`invalid`, `conflict`,
 advance the cursor; a selection never changes a revision or a health record.
 
 Field validation precedes the revision check: a blank `service` or a
-missing/negative `expectedRevision` is `invalid`. Then a revision mismatch is
-`conflict` (an unknown service is at revision 0), an unknown service with a
-matching revision is `not_found`, and a service with no healthy instance is
+missing `expectedRevision` is `invalid`, and so is a value that is not an
+integer (`1.5`, a string, `true`) or that falls outside the build's integer
+range — `0..2147483647` on a 32-bit build, `0..9223372036854775807` on a
+64-bit build. A negative number is therefore invalid too, and the check uses
+the submitted value itself, so on a 32-bit build `4294967297` or
+`-4294967295` (both of which truncate to `1` when narrowed) is still rejected
+as out of range rather than matching revision 1; the reason names the
+`expectedRevision` range. `2147483648` stays a valid integer on a 64-bit
+build and yields a normal conflict. Then a revision mismatch is `conflict`
+(an unknown service is at revision 0), an unknown service with a matching
+revision is `not_found`, and a service with no healthy instance is
 `no_healthy`. Every failure states the reason and current revision and leaves
 the rotation position intact.
 
@@ -94,7 +102,7 @@ non-string or a blank-after-trim key is `invalid` with a reason naming the
 - 失败的请求不会覆盖先前记录；批次中后续请求仍按输入顺序继续执行。
 - 每次调用都从空注册表开始，示例所需的注册和观察必须放在同一批请求中。
 - 注册替换与观察的关系：替换实例列表时，实例标识和地址都没变的实例保留健康记录；地址改变或删除后重新加入的实例回到 `unknown`、序号 0、无原因，新地址只有在当前修订号下上报健康结果后才能被选择。旧修订号的观察即使序号更大也返回 `conflict`，不能把旧地址的健康结果带到新修订号。
-- 错误分类：字段无效（如 `service` 为空、`sequence` 非正整数、不健康但原因为空白）返回 `invalid`；修订号不符返回 `conflict`；修订号匹配但服务或实例不存在返回 `not_found`。字段检查先于修订号判断。
+- 错误分类：字段无效（如 `service` 为空、`expectedRevision` 为负数或超出本程序整数范围（32 位 `0..2147483647`、64 位 `0..9223372036854775807`）、`sequence` 非正整数、不健康但原因为空白）返回 `invalid`；修订号不符返回 `conflict`；修订号匹配但服务或实例不存在返回 `not_found`。字段检查先于修订号判断。
 
 ### 完整示例
 
@@ -149,7 +157,7 @@ echo '{"requests":[
 ### 请求字段与校验规则
 
 - `service`：服务名，去除两端空白后使用；整理后为空返回 `invalid`。
-- `expectedRevision`：必填的非负整数。新服务必须提交 `0`，创建成功后修订号为 `1`；已有服务必须提交该服务**当前**修订号，提交其他值（包括对尚不存在的服务提交非 0 值）返回 `conflict`。
+- `expectedRevision`：必填的整数，合法范围为 `0..2147483647`（32 位程序）或 `0..9223372036854775807`（64 位程序），任何负数或超范围整数都按**提交的原始数值**判定为 `invalid`，原因指出 `expectedRevision` 的范围；因此 32 位程序提交 `4294967297`（截断后恰为 1）或 `-4294967295` 不会被当成 1，而 64 位程序中的 `2147483648` 仍是合法整数。新服务必须提交 `0`，创建成功后修订号为 `1`；已有服务必须提交该服务**当前**修订号，提交其他在合法范围内的值（包括对尚不存在的服务提交非 0 值）返回 `conflict`。
 - `instances`：实例对象数组，每项含 `id` 与 `address`。注册提交的是**完整实例列表**：本次列表中未包含的已有实例会被移除。
   - 实例 `id` 先去除两端空白；整理后为空、或同一服务内整理后的标识重复，都返回 `invalid`。
   - `address` 先去除两端空白，之后必须是带端口的 `host:port`：主机支持域名、IPv4 和带方括号的 IPv6（如 `h1:8080`、`10.0.0.2:8081`、`[2001:db8::1]:9000`，裸 IPv6 必须加方括号）；端口必须是 1 到 65535 的十进制整数；地址内部不能含空白或控制字符。

@@ -2,7 +2,9 @@
 package indexroom
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sort"
 	"strconv"
@@ -195,15 +197,59 @@ func validateServiceName(service string) (string, error) {
 	return name, nil
 }
 
-// validateExpectedRevision is the revision field shared by every request: it
-// must be a non-negative integer. Callers check their remaining content fields
-// after this one, so content validity is fully established before any revision
-// comparison against the registry.
-func validateExpectedRevision(revision int) error {
-	if revision < 0 {
-		return errInvalid("expectedRevision must be a non-negative integer")
+// maxRevision is the largest expectedRevision accepted on the running
+// architecture. Revisions are carried by int, so a 32-bit build accepts
+// 0..2147483647 and a 64-bit build 0..9223372036854775807. A value outside
+// that range must be rejected from its raw submitted form; otherwise it wraps
+// when narrowed to int (e.g. 4294967297 becoming 1 on a 32-bit build) and
+// could match a revision it never equalled.
+const maxRevision = math.MaxInt
+
+// expectedRevisionRangeReason is the invalid reason shared by every request
+// kind when a submitted expectedRevision falls outside the architecture's
+// integer range. raw carries the submitted digits so the message reports the
+// actual value even when it cannot be represented as int or int64.
+func expectedRevisionRangeReason(raw string) string {
+	return fmt.Sprintf("expectedRevision must be an integer between 0 and %d, got %s", maxRevision, raw)
+}
+
+// validateExpectedRevision is the revision field shared by every request. It
+// judges the raw submitted value before it is narrowed to int: an int64 still
+// holds values outside int's range on a 32-bit build, and converting
+// 4294967297 or -4294967295 first would wrap either one into 1, letting a
+// mismatching revision look current. A negative value or one above the
+// platform's maximum is invalid with a reason stating the expectedRevision
+// range. Callers check their remaining content fields around this one, so
+// content validity is fully established before any revision comparison
+// against the registry.
+func validateExpectedRevision(revision int64) error {
+	if revision < 0 || revision > maxRevision {
+		return errInvalid(expectedRevisionRangeReason(strconv.FormatInt(revision, 10)))
 	}
 	return nil
+}
+
+// ParseExpectedRevision converts the raw decimal text of a submitted
+// expectedRevision into an int64 that still carries the submitted value. It
+// establishes only the token's integer type: floats, strings, booleans and
+// similar text get the integer-type error, while a decimal integer is returned
+// without platform-specific narrowing. The architecture range (the 32-bit
+// upper bound in particular) is enforced afterwards by
+// validateExpectedRevision inside each Validate* method, so the long-standing
+// field order (service name, then revision, then the remaining fields) is
+// preserved. The one value category that cannot reach that stage is a
+// magnitude too large even for int64: ParseInt rejects it with ErrRange and it
+// is reported as an expectedRevision range error from its raw text rather than
+// an overflowed number.
+func ParseExpectedRevision(text string) (int64, error) {
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, errInvalid(expectedRevisionRangeReason(text))
+		}
+		return 0, errInvalid(fmt.Sprintf("expectedRevision must be an integer, got %s", text))
+	}
+	return n, nil
 }
 
 // revisionFailure describes the common revision-gate result shared by health
@@ -282,8 +328,9 @@ func (f *revisionFailure) asSelect(service string) SelectOutcome {
 }
 
 // ValidateRegistration trims and validates one request without mutating the registry.
-// Content validity is established before any revision check.
-func (r *Registry) ValidateRegistration(service string, revision int, instances []Instance) (Registration, error) {
+// revision is the raw submitted expectedRevision and is range-checked before it
+// is narrowed to int. Content validity is established before any revision check.
+func (r *Registry) ValidateRegistration(service string, revision int64, instances []Instance) (Registration, error) {
 	name, err := validateServiceName(service)
 	if err != nil {
 		return Registration{}, err
@@ -308,7 +355,7 @@ func (r *Registry) ValidateRegistration(service string, revision int, instances 
 		seen[id] = true
 		valid = append(valid, Instance{ID: id, Address: addr})
 	}
-	return Registration{Service: name, Revision: revision, Instances: valid}, nil
+	return Registration{Service: name, Revision: int(revision), Instances: valid}, nil
 }
 
 // Apply checks the revision and, on match, replaces the service's instance list.
@@ -366,8 +413,10 @@ func (r *Registry) Apply(reg Registration) Outcome {
 }
 
 // ValidateHealth trims and validates one health observation without mutating
-// the registry. Content validity is established before any revision check.
-func (r *Registry) ValidateHealth(service, instanceID string, revision int, sequence int64, healthy bool, reason string) (HealthUpdate, error) {
+// the registry. revision is the raw submitted expectedRevision, range-checked
+// before it is narrowed to int. Content validity is established before any
+// revision check.
+func (r *Registry) ValidateHealth(service, instanceID string, revision int64, sequence int64, healthy bool, reason string) (HealthUpdate, error) {
 	name, err := validateServiceName(service)
 	if err != nil {
 		return HealthUpdate{}, err
@@ -392,7 +441,7 @@ func (r *Registry) ValidateHealth(service, instanceID string, revision int, sequ
 	return HealthUpdate{
 		Service:    name,
 		InstanceID: id,
-		Revision:   revision,
+		Revision:   int(revision),
 		Sequence:   sequence,
 		Healthy:    healthy,
 		Reason:     normalizedReason,
@@ -487,16 +536,17 @@ func (r *Registry) ApplyHealth(upd HealthUpdate) HealthOutcome {
 
 // ValidateSelection trims and validates one select request without touching
 // the registry. Content validity is established before any revision check.
-func (r *Registry) ValidateSelection(service string, revision int) (Selection, error) {
+func (r *Registry) ValidateSelection(service string, revision int64) (Selection, error) {
 	return r.ValidateSelectionWithSession(service, revision, nil)
 }
 
 // ValidateSelectionWithSession is ValidateSelection with an optional session
 // key. A nil key means an ordinary rotating selection. A non-nil key is
 // trimmed and must not be blank: keys that differ only in surrounding
-// whitespace name the same session. Content validity is established before
-// any revision check.
-func (r *Registry) ValidateSelectionWithSession(service string, revision int, sessionKey *string) (Selection, error) {
+// whitespace name the same session. revision is the raw submitted
+// expectedRevision, range-checked before it is narrowed to int. Content
+// validity is established before any revision check.
+func (r *Registry) ValidateSelectionWithSession(service string, revision int64, sessionKey *string) (Selection, error) {
 	name, err := validateServiceName(service)
 	if err != nil {
 		return Selection{}, err
@@ -511,7 +561,7 @@ func (r *Registry) ValidateSelectionWithSession(service string, revision int, se
 			return Selection{}, errInvalid("sessionKey must not be empty")
 		}
 	}
-	return Selection{Service: name, Revision: revision, SessionKey: key}, nil
+	return Selection{Service: name, Revision: int(revision), SessionKey: key}, nil
 }
 
 // Select chooses one healthy instance for the service once the shared revision

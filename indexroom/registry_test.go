@@ -126,7 +126,7 @@ func TestRegistryValidation(t *testing.T) {
 	cases := []struct {
 		name      string
 		service   string
-		revision  int
+		revision  int64
 		instances []Instance
 	}{
 		{"empty service", "   ", 0, nil},
@@ -208,7 +208,7 @@ func TestRegistryInvalidThenConflictOrder(t *testing.T) {
 }
 
 // registerService is a helper that creates a service with the given instances.
-func registerService(t *testing.T, r *Registry, service string, rev int, instances []Instance) {
+func registerService(t *testing.T, r *Registry, service string, rev int64, instances []Instance) {
 	t.Helper()
 	reg, err := r.ValidateRegistration(service, rev, instances)
 	if err != nil {
@@ -394,7 +394,7 @@ func TestRegistryHealthValidation(t *testing.T) {
 		name       string
 		service    string
 		instanceID string
-		revision   int
+		revision   int64
 		sequence   int64
 		healthy    bool
 		reason     string
@@ -527,7 +527,7 @@ func TestRegistryHealthFailedRegistrationKeepsObservations(t *testing.T) {
 }
 
 // markHealth records one observation, failing the test on error.
-func markHealth(t *testing.T, r *Registry, service, id string, revision int, sequence int64, healthy bool, reason string) {
+func markHealth(t *testing.T, r *Registry, service, id string, revision int64, sequence int64, healthy bool, reason string) {
 	t.Helper()
 	upd, err := r.ValidateHealth(service, id, revision, sequence, healthy, reason)
 	if err != nil {
@@ -538,7 +538,7 @@ func markHealth(t *testing.T, r *Registry, service, id string, revision int, seq
 	}
 }
 
-func selected(t *testing.T, r *Registry, service string, revision int) SelectOutcome {
+func selected(t *testing.T, r *Registry, service string, revision int64) SelectOutcome {
 	t.Helper()
 	sel, err := r.ValidateSelection(service, revision)
 	if err != nil {
@@ -625,7 +625,7 @@ func TestRegistrySelectFailuresDoNotAdvanceCursor(t *testing.T) {
 		t.Fatalf("first select: %+v", out)
 	}
 
-	selectFail := func(rev int, want OutcomeKind) {
+	selectFail := func(rev int64, want OutcomeKind) {
 		t.Helper()
 		sel, _ := r.ValidateSelection("svc", rev)
 		out := r.Select(sel)
@@ -985,7 +985,7 @@ func TestRegistryConflictReplacementKeepsAcceptedStateAndCursor(t *testing.T) {
 }
 
 // selectedWithSession runs one successful select carrying a session key.
-func selectedWithSession(t *testing.T, r *Registry, service string, revision int, key string) SelectOutcome {
+func selectedWithSession(t *testing.T, r *Registry, service string, revision int64, key string) SelectOutcome {
 	t.Helper()
 	sel, err := r.ValidateSelectionWithSession(service, revision, &key)
 	if err != nil {
