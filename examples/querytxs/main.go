@@ -1,5 +1,5 @@
 // 分页交易查询（Index.QueryTxs）完整示例：第一页、继续翻页、范围固定、
-// 筛选语义、空页、ErrInvalidArgument 与 ErrQueryChanged 的处理。
+// 筛选语义、空页、倒序读取、ErrInvalidArgument 与 ErrQueryChanged 的处理。
 //
 // 运行：go run ./examples/querytxs
 package main
@@ -178,4 +178,63 @@ func main() {
 		panic(err)
 	}
 	printPage("再次从空游标重新开始", restartTip)
+
+	// ===== 倒序读取 =====
+	// 另起一条链，交易列表依次为 [a,b,a]、[a,c]、[b,a]，筛选 a。
+	// 不设置 Reverse 时按高度、再按块内位置升序；设置 Reverse=true 后
+	// 高度从大到小、同一块内位置也从大到小，先看到靠近链顶的出现记录。
+	revIndex := indexroom.New()
+	mustAppend(revIndex, indexroom.Block{Height: 1, Hash: "r1", Parent: "genesis", Txs: []string{"a", "b", "a"}})
+	mustAppend(revIndex, indexroom.Block{Height: 2, Hash: "r2", Parent: "r1", Txs: []string{"a", "c"}})
+	mustAppend(revIndex, indexroom.Block{Height: 3, Hash: "r3", Parent: "r2", Txs: []string{"b", "a"}})
+
+	ascFull, err := revIndex.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 10})
+	if err != nil {
+		panic(err)
+	}
+	revQuery := indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2, Reverse: true}
+	revPage1, err := revIndex.QueryTxs(revQuery)
+	if err != nil {
+		panic(err)
+	}
+	printPage("倒序第1页（每页 2 条）", revPage1)
+	// 继续翻页必须沿用第一页的方向：Reverse 仍为 true，并原样传回游标。
+	// 每页条数可以调整；这里保持 2 条。
+	revQuery.Cursor = revPage1.NextCursor
+	revPage2, err := revIndex.QueryTxs(revQuery)
+	if err != nil {
+		panic(err)
+	}
+	printPage("倒序第2页（继续翻页，最后一页）", revPage2)
+	fmt.Printf("两页的 TotalMatches=%d MatchedBlocks=%d，与正序全量的 %d/%d 完全一致（统计与方向、页大小无关）\n",
+		revPage2.TotalMatches, revPage2.MatchedBlocks, ascFull.TotalMatches, ascFull.MatchedBlocks)
+	fmt.Println("位置仍是块内从零开始的原始位置（高度 1 报位置 2 和 0），同一标识的多次出现也没有合并")
+
+	// 第一页固定上界后追加的更高区块不会插进倒序翻页（上面的翻页仍止于固定上界 3）；
+	// 要读新记录需以空游标重新查询。
+	mustAppend(revIndex, indexroom.Block{Height: 4, Hash: "r4", Parent: "r3", Txs: []string{"a"}})
+	freshRev, err := revIndex.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 10, Reverse: true})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("追加高度 4 后以空游标重新发起倒序查询：第一条为 height=%d position=%d，ToHeight=%d（旧翻页不会看到它）\n\n",
+		freshRev.Hits[0].Height, freshRev.Hits[0].Position, freshRev.ToHeight)
+
+	// 方向是第一页固定下来的查询条件：拿正序游标请求倒序、或拿倒序游标请求正序，
+	// 都是 ErrInvalidArgument，且没有可用的页结果。切换方向只能以空游标重新开始。
+	ascFirst, err := revIndex.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2})
+	if err != nil {
+		panic(err)
+	}
+	revFirst, err := revIndex.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2, Reverse: true})
+	if err != nil {
+		panic(err)
+	}
+	_, wrongOne := revIndex.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2, Reverse: true, Cursor: ascFirst.NextCursor})
+	wrongPage, wrongTwo := revIndex.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2, Cursor: revFirst.NextCursor})
+	fmt.Printf("正序游标 + Reverse=true：ErrInvalidArgument=%v 可用命中数=%d\n",
+		errors.Is(wrongOne, indexroom.ErrInvalidArgument), 0)
+	fmt.Printf("倒序游标 + Reverse 缺省：ErrInvalidArgument=%v 可用命中数=%d\n",
+		errors.Is(wrongTwo, indexroom.ErrInvalidArgument), len(wrongPage.Hits))
+	fmt.Println("切换方向的正确做法：清空 Cursor 重新发起第一页（正序、倒序互不拼接）")
 }
