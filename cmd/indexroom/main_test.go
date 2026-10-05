@@ -2197,6 +2197,157 @@ func TestSelectTwoSessionKeysNoHealthyIsolation(t *testing.T) {
 	}
 }
 
+// TestSelectSessionKeyClearListThenRejoin is the batch-level regression guard
+// for a bound session whose service's instance list is cleared and then
+// repopulated with the same ids. Clearing removes the instances and their
+// health records but keeps the service (the answer is no_healthy, never
+// not_found), the rotation position and the session binding. The failed keyed
+// selection states the current revision and a reason, fabricates no instance
+// id/address/sequence and rewrites neither the binding nor the cursor.
+//
+// Re-adding the ids — the bound one at a NEW address, the others keeping their
+// old addresses — starts every instance at unknown/sequence 0/no reason: an
+// identical id and address restores no old record, and a selection before a
+// fresh observation is accepted keeps failing. An observation sent under a
+// pre-clear revision conflicts even with a larger sequence. Observations at
+// the rejoin revision may restart each instance's sequence at 1 below the
+// cleared numbers; once the bound instance is healthy with no successful
+// rebind in between, the session reuses it with the new address and sequence.
+// A plain selection then resumes from the last pre-clear rotation position,
+// which the failures and the session reuses never moved.
+//
+// Failed items keep their own result slots while the later registrations,
+// health reports and selections keep taking effect, and the batch exits 1
+// because it contains selection failures. Selections never change the
+// registration revision or an accepted health record.
+func TestSelectSessionKeyClearListThenRejoin(t *testing.T) {
+	input := `{"requests":[
+		{"type":"register","service":"svc","expectedRevision":0,"instances":[{"id":"a","address":"h1:1"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":11,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":12,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":13,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":1,"sessionKey":"s"},
+		{"type":"select","service":"svc","expectedRevision":1},
+		{"type":"register","service":"svc","expectedRevision":1,"instances":[]},
+		{"type":"select","service":"svc","expectedRevision":2,"sessionKey":"s"},
+		{"type":"register","service":"svc","expectedRevision":2,"instances":[{"id":"a","address":"h9:9"},{"id":"b","address":"h2:2"},{"id":"c","address":"h3:3"}]},
+		{"type":"select","service":"svc","expectedRevision":3,"sessionKey":"s"},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":99,"healthy":true},
+		{"type":"health","service":"svc","instanceId":"a","expectedRevision":3,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":3,"sessionKey":"s"},
+		{"type":"health","service":"svc","instanceId":"c","expectedRevision":3,"sequence":1,"healthy":true},
+		{"type":"select","service":"svc","expectedRevision":3},
+		{"type":"select","service":"svc","expectedRevision":3},
+		{"type":"select","service":"svc","expectedRevision":3,"sessionKey":"s"}
+	]}`
+	out, code := runRegisterWith(t, input)
+	if code != 1 {
+		t.Fatalf("batch contains selection failures, exit code: %d, output: %s", code, out)
+	}
+	var got registerOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	// One result per request, in input order; failed items keep their slots.
+	if len(got.Results) != 17 {
+		t.Fatalf("results: %+v", got.Results)
+	}
+	// 4-5: the key's first success rotates to the smallest id and binds s -> a,
+	// then the plain selection advances the rotation to b; the cursor rests on b.
+	if r := got.Results[4]; !r.OK || r.InstanceID != "a" || r.Address != "h1:1" || r.Sequence != 11 || r.Revision != 1 {
+		t.Fatalf("session bind: %+v", r)
+	}
+	if r := got.Results[5]; !r.OK || r.InstanceID != "b" || r.Address != "h2:2" || r.Sequence != 12 || r.Revision != 1 {
+		t.Fatalf("plain select: %+v", r)
+	}
+	// 6: the empty list clears the instances, reports the change and bumps the
+	// revision to 2; the service itself survives.
+	if r := got.Results[6]; !r.OK || !r.Changed || r.Revision != 2 {
+		t.Fatalf("clear result: %+v", r)
+	}
+	// 7: the bound session on the empty list is no_healthy at the current
+	// revision with a reason — never not_found — and brings back no instance id,
+	// address or health sequence from before the clear.
+	if r := got.Results[7]; r.OK || r.Error != "no_healthy" || r.Reason == "" ||
+		r.Revision != 2 || r.InstanceID != "" || r.Address != "" || r.Sequence != 0 {
+		t.Fatalf("session select on the cleared list: %+v", r)
+	}
+	// 8: re-adding the same ids succeeds (a on a new address, b and c on their
+	// old ones) and bumps the revision to 3.
+	if r := got.Results[8]; !r.OK || !r.Changed || r.Revision != 3 {
+		t.Fatalf("rejoin registration: %+v", r)
+	}
+	// 9: no fresh health observation has been accepted yet, so every rejoined
+	// instance is unknown and the session keeps failing the same way; this
+	// failure must rewrite neither the binding nor the cursor.
+	if r := got.Results[9]; r.OK || r.Error != "no_healthy" || r.Reason == "" ||
+		r.Revision != 3 || r.InstanceID != "" || r.Address != "" || r.Sequence != 0 {
+		t.Fatalf("session select before fresh observations: %+v", r)
+	}
+	// 10: an observation under the pre-clear revision conflicts even though
+	// sequence 99 exceeds the cleared 11, naming both revisions; it heals the
+	// new address of nothing.
+	if r := got.Results[10]; r.OK || r.Error != "conflict" || r.Reason == "" ||
+		r.ExpectedRevision != 1 || r.ActualRevision != 3 || r.Revision != 3 {
+		t.Fatalf("old-revision observation: %+v", r)
+	}
+	// 11: a fresh positive sequence at the current revision is accepted even
+	// though 1 is below the cleared 11, and health reports keep the revision at 3.
+	if r := got.Results[11]; !r.OK || !r.Changed || r.Revision != 3 || r.Sequence != 1 {
+		t.Fatalf("fresh observation at the rejoin revision: %+v", r)
+	}
+	// 12: with no successful rebind during the failure window, the session
+	// reuses a directly — its CURRENT rejoined address and sequence, never
+	// h1:1/11 — without rotating.
+	if r := got.Results[12]; !r.OK || r.InstanceID != "a" || r.Address != "h9:9" || r.Sequence != 1 || r.Revision != 3 {
+		t.Fatalf("session reuse after recovery must use the new address and sequence: %+v", r)
+	}
+	// 13: c becomes healthy on its reset record, also at a sequence below its
+	// pre-clear 13 despite reusing the same address h3:3.
+	if r := got.Results[13]; !r.OK || !r.Changed || r.Revision != 3 || r.Sequence != 1 {
+		t.Fatalf("c fresh observation: %+v", r)
+	}
+	// 14: the plain rotation resumes from the preserved position just after the
+	// last pre-clear pick b and lands on c rather than on the session's bound a
+	// — proving the failed requests and the keyed reuse never moved the cursor.
+	if r := got.Results[14]; !r.OK || r.InstanceID != "c" || r.Address != "h3:3" || r.Sequence != 1 || r.Revision != 3 {
+		t.Fatalf("plain select should resume after b at c: %+v", r)
+	}
+	// 15: the rotation then wraps past c to a carrying the rejoined record.
+	if r := got.Results[15]; !r.OK || r.InstanceID != "a" || r.Address != "h9:9" || r.Sequence != 1 || r.Revision != 3 {
+		t.Fatalf("plain select should wrap to a: %+v", r)
+	}
+	// 16: the plain rotations rewrote no binding: the session still answers a
+	// with the current record.
+	if r := got.Results[16]; !r.OK || r.InstanceID != "a" || r.Address != "h9:9" || r.Sequence != 1 || r.Revision != 3 {
+		t.Fatalf("session reuse after plain rotation: %+v", r)
+	}
+	// The final snapshot reflects only committed state: the service stays at
+	// revision 3; a and c are healthy at the restarted sequence 1; b re-joined
+	// with its old address but was never re-observed, so it is unknown at
+	// sequence 0 with no reason, and none of the pre-clear records returned.
+	if len(got.Services) != 1 {
+		t.Fatalf("services: %+v", got.Services)
+	}
+	svc := got.Services[0]
+	if svc.Service != "svc" || svc.Revision != 3 {
+		t.Fatalf("service view: %+v", svc)
+	}
+	if len(svc.Instances) != 3 {
+		t.Fatalf("instances: %+v", svc.Instances)
+	}
+	wantInsts := []registerInstance{
+		{ID: "a", Address: "h9:9", Health: "healthy", Sequence: 1},
+		{ID: "b", Address: "h2:2", Health: "unknown", Sequence: 0},
+		{ID: "c", Address: "h3:3", Health: "healthy", Sequence: 1},
+	}
+	for i, want := range wantInsts {
+		if svc.Instances[i] != want {
+			t.Fatalf("instance %d: got %+v want %+v", i, svc.Instances[i], want)
+		}
+	}
+}
+
 // failingWriter fails every Write with errWriteBroken, optionally accepting the
 // first failAfter bytes to emulate an output destination that becomes unwritable
 // partway through the result document.
