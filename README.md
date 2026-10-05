@@ -15,10 +15,185 @@ go test ./...
 ## 主要接口
 
 - `indexroom.Block` 的 `Time *int64` 字段携带非负 Unix 秒数；`nil` 表示未提供时间，与时间为 0 严格区分。
-- `Index.Append` / `Index.Reorg`：摄取区块与重组，负时间整体拒绝且不改变已有链；哈希、父哈希或任一交易标识含非法 UTF-8 字节时同样整体拒绝，错误信息指出区块高度与字段（交易标识另指出从 0 开始的位置），保证快照可无损导出与恢复。`Reorg` 的分支范围、丢弃高度口径、失败原子性与完整用法见下方[重组指南（Reorg）](#重组指南reorg)。
+- `Index.Append` / `Index.Reorg`：摄取区块与重组，负时间整体拒绝且不改变已有链；哈希、父哈希或任一交易标识含非法 UTF-8 字节时同样整体拒绝，错误信息指出区块高度与字段（交易标识另指出从 0 开始的位置），保证快照可无损导出与恢复。再次提交与链上**完全相同**的已有区块是成功的空操作（不推进链顶、不新增交易出现记录），新区块则必须接在当前链顶之后；完整口径见下方[重复提交与追加新区块指南（Append）](#重复提交与追加新区块指南append)。`Reorg` 的分支范围、丢弃高度口径、失败原子性与完整用法见下方[重组指南（Reorg）](#重组指南reorg)。
 - `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
 - `Index.QueryTimeStats`：按 `[Start, End)` 半开窗口与 `StepSeconds` 分段统计交易出现次数、不同标识数、含匹配交易的区块数，并给出整窗口去重汇总与缺失时间区块数；非法参数返回 `ErrInvalidArgument`。完整用法见下方[按时间窗口统计交易指南](#按时间窗口统计交易指南querytimestats)。
 - `Index.Export` / `Index.Restore`：快照版本 1（区块不含 `timestamp`）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）。`Restore` 保证**数据一致**并把再导出规范化为本功能的固定文本，不保留输入的字段顺序、空白与转义写法；它用一份完整快照整体替换主链，非法输入返回 `ErrInvalidSnapshot` 且不改变现有链。完整用法见下方[快照导出与恢复指南（Export/Restore）](#快照导出与恢复指南exportrestore)。
+
+## 重复提交与追加新区块指南（Append）
+
+`Index.Append(block Block) error` 把区块摄取到主链上。调用方需要区分两种情形：**再次提交已有区块**（幂等重发）与**追加新区块**（推进链顶）。`Append` 与查询、重组、快照可并发调用，每次调用都看到一个完整的链状态。
+
+### 再次提交已有区块：内容完全相同即成功
+
+- 提交的高度已被索引时，只要提交的区块与链上该高度的区块**内容完全相同**，`Append` 成功返回 `nil`：这是一次空操作，**不推进链顶，也不新增任何交易出现记录**（`QueryTxs`/`QueryTimeStats` 的结果不变）。
+- 该行为**不限于当前链顶的区块**：链顶已前进之后，重发更早高度的相同区块同样成功。因此链顶前进后可以直接重发旧区块——只要内容逐字相同；内容有任何差别就应修正输入，而不是指望它被接受。
+- **相同的口径**包括：高度、哈希、父哈希、**按原次序排列**的交易标识列表，以及时间的**是否提供**与**具体数值**。两个例外要记住：交易列表**未提供（`nil`）与空列表等价**；时间**未提供（`nil`）与真实的零秒不同**——`Time` 为 `nil` 的区块不能用 `Time` 指向 0 的区块重发。
+- 交易标识的重复项、大小写与首尾空白都属于原始内容：判断相同**不会**对交易列表排序、去重或改写，`[a,b,a]` 与 `[a,a,b]` 是不同内容，`"A"`、`" a "` 与 `"a"` 也是不同内容。
+
+### 追加新区块：只能接在当前链顶之后
+
+- 空索引只接受高度 1 的第一个区块，其 `Parent` 只是命名链起点的标识，不需要已索引。
+- 非空索引上，新区块的高度必须是当前链顶加一、父哈希必须等于链顶区块的哈希，且哈希不能已用于其他高度。
+- **不能通过再次调用 `Append` 覆盖已有高度**：高度已索引而内容不同的提交会被拒绝，已有链保持原状。需要替换链内容时，请使用[重组指南（Reorg）](#重组指南reorg)（以已索引区块为父提交分支）或[快照导出与恢复指南（Export/Restore）](#快照导出与恢复指南exportrestore)（用完整快照整体替换）。
+
+### 拒绝错误的处理方式
+
+`Append` 的拒绝（高度已索引但内容不同、高度不接链顶、父哈希不匹配、哈希复用、空哈希、负时间、非法 UTF-8 等）返回的是**普通错误**，不属于查询参数错误 `ErrInvalidArgument`，`errors.Is(err, indexroom.ErrInvalidArgument)` 为 `false`。本功能没有为摄取错误导出专用哨兵，调用方把任何**非空错误**都当作"本次提交被拒绝、索引未改变"处理，修正输入后重新提交即可。
+
+### 完整示例
+
+下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/resubmit/main.go`](examples/resubmit/main.go)：
+
+```bash
+go run ./examples/resubmit
+```
+
+场景：从空索引摄取两个连续区块——高度 1 的交易按序为 `[a,b,a]` 且没有时间，高度 2 未提供交易列表并带真实的零秒时间。随后原样重发高度 1（链顶已前进到 2，重发更早高度同样成功）、以空列表重发高度 2（空列表与未提供等价），两次都成功返回，链顶仍是 2，查询 `a` 仍只有高度 1 中位置 0 和 2 的两次出现。再展示两种被拒绝的请求：仅把高度 1 的交易顺序改为 `[a,a,b]`，以及仅把它的缺失时间改为零秒——两者都因"高度已索引但内容不同"被拒绝，且该错误不是 `ErrInvalidArgument`；拒绝后原区块内容与交易查询结果保持原状。预期拒绝只打印错误，程序不会提前退出。
+
+```go
+// 重复提交已有区块（Index.Append 的幂等重发）完整示例：从空索引摄取两个
+// 连续区块——高度 1 的交易按序为 [a,b,a] 且没有时间，高度 2 未提供交易列表
+// 并带真实的零秒时间；随后原样重发高度 1、以空列表重发高度 2，展示成功返回、
+// 链顶不前进、交易出现记录不增加；再展示两种被拒绝的重发（交易顺序改为
+// [a,a,b]、缺失时间改为零秒），输出拒绝原因，并核对拒绝后原区块内容与
+// 交易查询结果保持原状。预期拒绝只打印错误，不会提前退出。
+//
+// 运行：go run ./examples/resubmit
+package main
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/gzhysuiioo/indexroom-analytics/indexroom"
+)
+
+// unix 返回指向给定 Unix 秒的指针，用于设置区块时间。
+func unix(sec int64) *int64 { return &sec }
+
+// timeText 把区块时间渲染成便于阅读的文本：缺失时间为 "nil（缺失）"，
+// 否则为实际 Unix 秒。
+func timeText(b indexroom.Block) string {
+	if b.Time == nil {
+		return "nil（缺失）"
+	}
+	return fmt.Sprintf("%d", *b.Time)
+}
+
+// dumpChain 按高度升序打印每个主链区块的完整内容，并给出链顶。
+func dumpChain(index *indexroom.Index) {
+	for h := int64(1); h <= index.Tip; h++ {
+		b := index.Blocks[h]
+		fmt.Printf("  高度 %d：hash=%s parent=%s txs=%q 时间=%s\n",
+			h, b.Hash, b.Parent, b.Txs, timeText(b))
+	}
+	fmt.Printf("  链顶 tip=%d\n", index.Tip)
+}
+
+// queryA 查询标识 a 在主链上的每一次出现，打印高度与块内位置。
+func queryA(index *indexroom.Index) {
+	page, err := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("  查询标识 a：TotalMatches=%d MatchedBlocks=%d\n",
+		page.TotalMatches, page.MatchedBlocks)
+	for _, hit := range page.Hits {
+		fmt.Printf("    命中 height=%d block=%s tx=%q position=%d\n",
+			hit.Height, hit.BlockHash, hit.TxID, hit.Position)
+	}
+}
+
+func main() {
+	// 1. 从空索引摄取两个连续区块：
+	//    高度 1 的交易按序为 [a,b,a]（a 在块内出现两次），没有时间；
+	//    高度 2 未提供交易列表（Txs 为 nil），带真实的零秒时间。
+	index := indexroom.New()
+	block1 := indexroom.Block{Height: 1, Hash: "h1", Parent: "genesis", Txs: []string{"a", "b", "a"}}
+	block2 := indexroom.Block{Height: 2, Hash: "h2", Parent: "h1", Time: unix(0)}
+	for _, b := range []indexroom.Block{block1, block2} {
+		if err := index.Append(b); err != nil {
+			panic(err)
+		}
+	}
+	fmt.Println("操作 1：摄取高度 1（txs=[a,b,a]，无时间）与高度 2（未提供交易列表，时间 0）")
+	dumpChain(index)
+	fmt.Println()
+
+	// 2. 再次提交已有区块：内容完全相同即成功返回，不推进链顶，也不新增
+	//    交易出现记录。重发不限于当前链顶——这里先重发高度 1。交易列表
+	//    未提供与空列表等价，因此高度 2 用空列表重发也算内容相同。
+	err := index.Append(block1)
+	fmt.Printf("操作 2：原样重发高度 1（非链顶区块）：err=%v\n", err)
+	resubmit2 := block2
+	resubmit2.Txs = []string{} // 空列表与未提供等价
+	err = index.Append(resubmit2)
+	fmt.Printf("         以空列表重发高度 2：err=%v\n", err)
+	fmt.Println("重发后的主链与查询（链顶不前进，a 仍只有原来的两次出现）：")
+	dumpChain(index)
+	queryA(index)
+	fmt.Println()
+
+	// 3. 拒绝情形之一：同一高度、同一哈希，但交易顺序改为 [a,a,b]。
+	//    交易标识的顺序、重复项、大小写与首尾空白都属于原始内容，
+	//    不会为了判断相同而排序、去重或改写。Append 的普通拒绝错误
+	//    不是 ErrInvalidArgument，调用方按非空错误处理即可。
+	reordered := block1
+	reordered.Txs = []string{"a", "a", "b"}
+	err = index.Append(reordered)
+	fmt.Printf("操作 3：重发高度 1 但交易顺序改为 [a,a,b]：err=%v\n", err)
+	fmt.Printf("  errors.Is(err, ErrInvalidArgument)=%v（Append 的拒绝是普通错误，按非空错误处理）\n",
+		errors.Is(err, indexroom.ErrInvalidArgument))
+
+	// 4. 拒绝情形之二：只把缺失时间改为真实的零秒。时间是否提供与具体
+	//    数值都属于区块内容，缺失与零秒是两种不同内容。
+	timed := block1
+	timed.Time = unix(0)
+	err = index.Append(timed)
+	fmt.Printf("操作 4：重发高度 1 但补上零秒时间：err=%v\n", err)
+	fmt.Printf("  errors.Is(err, ErrInvalidArgument)=%v\n",
+		errors.Is(err, indexroom.ErrInvalidArgument))
+	fmt.Println()
+
+	// 5. 两次预期拒绝都不改变已有链：原区块内容与交易查询结果保持原状。
+	fmt.Println("操作 5：两次拒绝后的主链与查询（应与操作 2 之后完全一致）：")
+	dumpChain(index)
+	queryA(index)
+}
+```
+
+对应输出（`go run ./examples/resubmit` 的实际输出，每次运行逐字一致）：
+
+```text
+操作 1：摄取高度 1（txs=[a,b,a]，无时间）与高度 2（未提供交易列表，时间 0）
+  高度 1：hash=h1 parent=genesis txs=["a" "b" "a"] 时间=nil（缺失）
+  高度 2：hash=h2 parent=h1 txs=[] 时间=0
+  链顶 tip=2
+
+操作 2：原样重发高度 1（非链顶区块）：err=<nil>
+         以空列表重发高度 2：err=<nil>
+重发后的主链与查询（链顶不前进，a 仍只有原来的两次出现）：
+  高度 1：hash=h1 parent=genesis txs=["a" "b" "a"] 时间=nil（缺失）
+  高度 2：hash=h2 parent=h1 txs=[] 时间=0
+  链顶 tip=2
+  查询标识 a：TotalMatches=2 MatchedBlocks=1
+    命中 height=1 block=h1 tx="a" position=0
+    命中 height=1 block=h1 tx="a" position=2
+
+操作 3：重发高度 1 但交易顺序改为 [a,a,b]：err=height already indexed with different content
+  errors.Is(err, ErrInvalidArgument)=false（Append 的拒绝是普通错误，按非空错误处理）
+操作 4：重发高度 1 但补上零秒时间：err=height already indexed with different content
+  errors.Is(err, ErrInvalidArgument)=false
+
+操作 5：两次拒绝后的主链与查询（应与操作 2 之后完全一致）：
+  高度 1：hash=h1 parent=genesis txs=["a" "b" "a"] 时间=nil（缺失）
+  高度 2：hash=h2 parent=h1 txs=[] 时间=0
+  链顶 tip=2
+  查询标识 a：TotalMatches=2 MatchedBlocks=1
+    命中 height=1 block=h1 tx="a" position=0
+    命中 height=1 block=h1 tx="a" position=2
+```
 
 ## 分页交易查询指南（QueryTxs）
 
