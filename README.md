@@ -16,22 +16,22 @@ go test ./...
 
 - `indexroom.Block` 的 `Time *int64` 字段携带非负 Unix 秒数；`nil` 表示未提供时间，与时间为 0 严格区分。
 - `Index.Append` / `Index.Reorg`：摄取区块与重组，负时间整体拒绝且不改变已有链；哈希、父哈希或任一交易标识含非法 UTF-8 字节时同样整体拒绝，错误信息指出区块高度与字段（交易标识另指出从 0 开始的位置），保证快照可无损导出与恢复。`Append` 在链顶前进后仍可再次提交内容完全相同的旧区块（成功且无副作用），完整规则见下方[重复提交区块指南（Append）](#重复提交区块指南append)；`Reorg` 的分支范围、丢弃高度口径、失败原子性与完整用法见下方[重组指南（Reorg）](#重组指南reorg)。
-- `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
+- `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；默认按高度、再按块内位置升序返回，`Order` 设为 `OrderDesc` 时整体倒序（高度与块内位置均从大到小）；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
 - `Index.QueryTimeStats`：按 `[Start, End)` 半开窗口与 `StepSeconds` 分段统计交易出现次数、不同标识数、含匹配交易的区块数，并给出整窗口去重汇总与缺失时间区块数；非法参数返回 `ErrInvalidArgument`。完整用法见下方[按时间窗口统计交易指南](#按时间窗口统计交易指南querytimestats)。
 - `Index.Export` / `Index.Restore`：快照版本 1（区块不含 `timestamp`）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）。`Restore` 保证**数据一致**并把再导出规范化为本功能的固定文本，不保留输入的字段顺序、空白与转义写法；它用一份完整快照整体替换主链，非法输入返回 `ErrInvalidSnapshot` 且不改变现有链。完整用法见下方[快照导出与恢复指南（Export/Restore）](#快照导出与恢复指南exportrestore)。
 
 ## 分页交易查询指南（QueryTxs）
 
-`Index.QueryTxs(query TxQuery) (TxPage, error)` 围绕一个或多个交易标识，按"高度、再按块内位置"的顺序读取这些标识在主链上的**每一次出现**。查询只读，可与摄取并发调用，每次调用都看到一个完整的链状态。
+`Index.QueryTxs(query TxQuery) (TxPage, error)` 围绕一个或多个交易标识读取这些标识在主链上的**每一次出现**。默认按"高度、再按块内位置"升序；`Order` 设为 `OrderDesc` 时在整个固定范围内倒序——高度从大到小，同一区块内的位置也从大到小。次序只由高度与原有块内位置决定，区块时间是否缺失、相同或随高度下降都不影响次序。查询只读，可与摄取并发调用，每次调用都看到一个完整的链状态。
 
-- `TxQuery`：`From`/`To` 为闭区间高度，`TxIDs` 为筛选标识集合，`PageSize` 为每页条数（0 取 `DefaultPageSize=100`，最大 `MaxPageSize=1000`），`Cursor` 为续查游标。
-- `TxHit`：一次命中，字段为 `Height`、`BlockHash`、`TxID`、`Position`（块内从 0 开始的位置）。
-- `TxPage`：本页 `Hits`，以及对整个固定范围的统计 `TotalMatches`（匹配出现总次数）、`MatchedBlocks`（含匹配交易的区块数）、`ToHeight`（第一页固定下来的实际上界）和 `NextCursor`。
+- `TxQuery`：`From`/`To` 为闭区间高度，`TxIDs` 为筛选标识集合，`PageSize` 为每页条数（0 取 `DefaultPageSize=100`，最大 `MaxPageSize=1000`），`Order` 为读取方向（零值 `OrderAsc` 升序，`OrderDesc` 倒序），`Cursor` 为续查游标。
+- `TxHit`：一次命中，字段为 `Height`、`BlockHash`、`TxID`、`Position`（块内从 0 开始的位置；**倒序不会重新编号**）。
+- `TxPage`：本页 `Hits`，以及对整个固定范围的统计 `TotalMatches`（匹配出现总次数）、`MatchedBlocks`（含匹配交易的区块数）、`ToHeight`（第一页固定下来的实际上界）和 `NextCursor`。统计是整个固定范围的统计，**不随方向或页大小改变**。
 
 ### 如何取得第一页、继续读取、何时结束
 
-1. **第一页**：`Cursor` 传空字符串即首次查询。`From` 为 0 时默认从高度 1 开始；`To` 为 0 时取首次查询看到的链顶。
-2. **继续读取**：把上一页返回的 `NextCursor` 原样填回 `TxQuery.Cursor` 再次调用。游标是服务返回的**不透明字符串**，不要解析或拼接。续查时高度范围与 `TxIDs` 必须与第一页等价；`PageSize` 可以逐页调整。
+1. **第一页**：`Cursor` 传空字符串即首次查询。`From` 为 0 时默认从高度 1 开始；`To` 为 0 时取首次查询看到的链顶。需要先看靠近链顶的记录时，把 `Order` 设为 `OrderDesc`（见下方[倒序读取](#倒序读取orderdesc)）。
+2. **继续读取**：把上一页返回的 `NextCursor` 原样填回 `TxQuery.Cursor` 再次调用。游标是服务返回的**不透明字符串**，不要解析或拼接。续查时高度范围、`TxIDs` 与读取方向 `Order` 必须与第一页等价或一致；`PageSize` 可以逐页调整。
 3. **结束**：返回页的 `NextCursor` 为空即最后一页。范围内没有匹配交易时不是错误，而是成功返回一个空页（`Hits` 为空、无游标）。
 
 重复出现的交易**不会合并**：同一标识在不同区块、或同一区块内出现多次，就返回多条 `TxHit`。筛选按字符串精确匹配，`TxIDs` 的**顺序与重复项不影响匹配**（`["a","a"]` 与 `["a"]` 等价）；但大小写与首尾空白仍按原字符串区分（`"A"`、`" a "` 都不会匹配 `"a"`）。
@@ -44,7 +44,18 @@ go test ./...
 ### 游标失效：区分 ErrQueryChanged 与 ErrInvalidArgument
 
 - **`ErrQueryChanged`（链数据变了）**：固定范围内任一区块的内容发生改变——即使区块哈希不变、**只改变了时间**——或链顶退到固定结束高度以下，续查都会返回该错误，且**没有可用的页结果**。此时只能**从空游标重新开始第一页**，绝不能把新结果拼接到旧结果后面。
-- **`ErrInvalidArgument`（请求本身不合法）**：续查更改高度范围或筛选集合、游标损坏、或把游标交给另一个索引实例（游标带实例签名，跨实例无效）。它与链数据变化无关，用 `errors.Is` 与 `ErrQueryChanged` 区分；请先修正请求再重试。
+- **`ErrInvalidArgument`（请求本身不合法）**：续查更改高度范围或筛选集合、**续查方向与游标不一致**（正序游标配 `OrderDesc`，或倒序游标配 `OrderAsc`/不传 `Order`）、传入非法 `Order` 值、游标损坏、或把游标交给另一个索引实例（游标带实例签名，跨实例无效）。它与链数据变化无关，用 `errors.Is` 与 `ErrQueryChanged` 区分；请先修正请求再重试。方向不一致的续查同样**不返回任何可用页结果**。
+
+### 倒序读取（OrderDesc）
+
+- **选择倒序**：第一页把 `TxQuery.Order` 设为 `indexroom.OrderDesc`。不设置（零值 `OrderAsc`）时行为与过去完全一致，原有正序调用与有效游标都不受影响。
+- **整体次序**：倒序作用于**整个固定范围**，不是只翻转当前页。命中按高度从大到小返回，同一区块内的 `Position` 也从大到小；逐页拼接后仍符合这一整体次序。每条命中的 `Position` 仍是它在区块内从 0 开始的真实位置，**不会因为倒序重新编号**；同一标识的每次出现也**不会合并**。
+- **继续翻页**：续查必须沿用第一页的读取方向，继续把 `NextCursor` 原样传回；`PageSize` 仍可逐页调整，未读记录既不重复也不遗漏。
+- **切换方向**：不能拿一个方向的游标去续查另一个方向——会得到 `ErrInvalidArgument`。要改读另一方向，**以空游标重新发起一次第一页查询**（此时会按当时的链顶重新固定范围）。
+- **范围固定与统计**：第一页照旧固定实际上界，随后追加的更高区块不能插进进行中的倒序翻页；要读取这些新记录同样需要空游标重查。`TotalMatches`、`MatchedBlocks`、`ToHeight` 仍是整个固定范围的统计，与方向、页大小无关。
+- **空结果**：空链、起始高度超过链顶、或筛选无命中时，倒序也成功返回空页与空的后续游标。
+
+例如高度 1 至 3 的交易依次是 `[a,b,a]`、`[a,c]`、`[b,a]`，筛选 `a`、每页 2 条时：第一页依次给出**高度 3 位置 1、高度 2 位置 0**，第二页依次给出**高度 1 位置 2、高度 1 位置 0**，随后结束翻页；两页的 `TotalMatches` 都是 4、`MatchedBlocks` 都是 3。
 
 ### 完整示例
 
@@ -58,7 +69,7 @@ go run ./examples/querytxs
 
 ```go
 // 分页交易查询（Index.QueryTxs）完整示例：第一页、继续翻页、范围固定、
-// 筛选语义、空页、ErrInvalidArgument 与 ErrQueryChanged 的处理。
+// 筛选语义、空页、倒序读取、ErrInvalidArgument 与 ErrQueryChanged 的处理。
 //
 // 运行：go run ./examples/querytxs
 package main
@@ -237,6 +248,83 @@ func main() {
 		panic(err)
 	}
 	printPage("再次从空游标重新开始", restartTip)
+
+	demonstrateDescending()
+}
+
+// demonstrateDescending 在独立索引上展示倒序读取：如何选择倒序、跨页继续、
+// 范围在第一页固定、方向混用被拒绝，以及切换方向时需要重新发起查询。
+func demonstrateDescending() {
+	fmt.Println("---- 倒序读取（Order: indexroom.OrderDesc）----")
+	// 规格示例：高度 1 至 3 的交易依次是 [a,b,a]、[a,c]、[b,a]，筛选 a。
+	index := indexroom.New()
+	mustAppend(index, indexroom.Block{Height: 1, Hash: "g1", Parent: "genesis", Txs: []string{"a", "b", "a"}})
+	mustAppend(index, indexroom.Block{Height: 2, Hash: "g2", Parent: "g1", Txs: []string{"a", "c"}})
+	mustAppend(index, indexroom.Block{Height: 3, Hash: "g3", Parent: "g2", Txs: []string{"b", "a"}})
+
+	// 选择倒序：TxQuery.Order 传 indexroom.OrderDesc；不传（零值）仍是正序。
+	query := indexroom.TxQuery{From: 1, To: 3, TxIDs: []string{"a"}, PageSize: 2, Order: indexroom.OrderDesc}
+	page1, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("倒序第1页（从靠近链顶的出现开始）", page1)
+
+	// 继续翻页：Order 必须沿用第一页的倒序，PageSize 仍可调整，游标原样传回。
+	query.Cursor = page1.NextCursor
+	page2, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("倒序第2页（继续向低高度读取，随后结束翻页）", page2)
+
+	// 第一页固定实际上界：之后追加的更高区块不能插进正在进行的倒序翻页。
+	mustAppend(index, indexroom.Block{Height: 4, Hash: "g4", Parent: "g3", Txs: []string{"a"}})
+	fmt.Printf("已追加高度 4，当前链顶 tip=%d\n", index.Tip)
+	query.Cursor = page1.NextCursor
+	replayed, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("倒序续查仍只看固定范围 1..3：本页 %d 条、ToHeight=%d、TotalMatches=%d\n\n",
+		len(replayed.Hits), replayed.ToHeight, replayed.TotalMatches)
+
+	// 要读取新记录，以空游标重新查询；想换方向也一样，必须重新发起第一页。
+	freshDesc, err := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2, Order: indexroom.OrderDesc})
+	if err != nil {
+		panic(err)
+	}
+	printPage("空游标重新倒序查询（第一页固定到新链顶 4）", freshDesc)
+
+	// 方向必须与游标一致：拿正序游标请求倒序、或拿倒序游标请求正序，
+	// 都返回 ErrInvalidArgument，且没有可用页结果。
+	asc, err := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2})
+	if err != nil {
+		panic(err)
+	}
+	desc, err := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2, Order: indexroom.OrderDesc})
+	if err != nil {
+		panic(err)
+	}
+	wrong1, err1 := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2, Order: indexroom.OrderDesc, Cursor: asc.NextCursor})
+	wrong2, err2 := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2, Cursor: desc.NextCursor})
+	fmt.Printf("正序游标配倒序请求：ErrInvalidArgument=%v 可用命中数=%d\n",
+		errors.Is(err1, indexroom.ErrInvalidArgument), len(wrong1.Hits))
+	fmt.Printf("倒序游标配正序请求：ErrInvalidArgument=%v 可用命中数=%d\n\n",
+		errors.Is(err2, indexroom.ErrInvalidArgument), len(wrong2.Hits))
+
+	// 空链、起始高度超过链顶、筛选无命中：倒序同样成功返回空页与空游标。
+	empty := indexroom.New()
+	emptyPage, err := empty.QueryTxs(indexroom.TxQuery{Order: indexroom.OrderDesc})
+	if err != nil {
+		panic(err)
+	}
+	noHit, err := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"zzz"}, Order: indexroom.OrderDesc})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("空链倒序：err=%v 命中=%d 游标为空=%v；筛选无命中倒序：命中=%d TotalMatches=%d\n",
+		err, len(emptyPage.Hits), emptyPage.NextCursor == "", len(noHit.Hits), noHit.TotalMatches)
 }
 ```
 
@@ -288,6 +376,26 @@ To=0 固定到首次查询看到的链顶：ToHeight=4（当前 tip=4）
   命中 height=1 block=h1 tx="a" position=2
   命中 height=2 block=h2c tx="a" position=0
   TotalMatches=3 MatchedBlocks=2 ToHeight=2 有后续游标=false
+---- 倒序读取（Order: indexroom.OrderDesc）----
+倒序第1页（从靠近链顶的出现开始）：
+  命中 height=3 block=g3 tx="a" position=1
+  命中 height=2 block=g2 tx="a" position=0
+  TotalMatches=4 MatchedBlocks=3 ToHeight=3 有后续游标=true
+倒序第2页（继续向低高度读取，随后结束翻页）：
+  命中 height=1 block=g1 tx="a" position=2
+  命中 height=1 block=g1 tx="a" position=0
+  TotalMatches=4 MatchedBlocks=3 ToHeight=3 有后续游标=false
+已追加高度 4，当前链顶 tip=4
+倒序续查仍只看固定范围 1..3：本页 2 条、ToHeight=3、TotalMatches=4
+
+空游标重新倒序查询（第一页固定到新链顶 4）：
+  命中 height=4 block=g4 tx="a" position=0
+  命中 height=3 block=g3 tx="a" position=1
+  TotalMatches=5 MatchedBlocks=4 ToHeight=4 有后续游标=true
+正序游标配倒序请求：ErrInvalidArgument=true 可用命中数=0
+倒序游标配正序请求：ErrInvalidArgument=true 可用命中数=0
+
+空链倒序：err=<nil> 命中=0 游标为空=true；筛选无命中倒序：命中=0 TotalMatches=0
 ```
 
 ## 按时间窗口统计交易指南（QueryTimeStats）

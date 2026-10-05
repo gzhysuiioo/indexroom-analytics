@@ -45,6 +45,23 @@ const (
 	MaxPageSize = 1000
 )
 
+// TxOrder selects the occurrence order of a QueryTxs result.
+type TxOrder int
+
+const (
+	// OrderAsc returns occurrences by increasing height and, inside one
+	// block, by increasing position. It is the zero value.
+	OrderAsc TxOrder = 0
+	// OrderDesc returns occurrences by decreasing height and, inside one
+	// block, by decreasing position. The order is decided by height and the
+	// original block positions alone; block timestamps never participate.
+	OrderDesc TxOrder = 1
+)
+
+func (order TxOrder) valid() bool {
+	return order == OrderAsc || order == OrderDesc
+}
+
 // TxQuery describes a transaction lookup against the main chain.
 type TxQuery struct {
 	// From and To bound the searched heights, both inclusive. A zero From
@@ -60,8 +77,14 @@ type TxQuery struct {
 	// PageSize picks the page length, 1..MaxPageSize; zero means
 	// DefaultPageSize. It may change between pages of the same query.
 	PageSize int
+	// Order selects the occurrence order over the whole pinned range:
+	// OrderAsc (the zero value) by increasing height/position, OrderDesc by
+	// decreasing height/position. A continuation must repeat the first
+	// page's order, otherwise QueryTxs returns ErrInvalidArgument.
+	Order TxOrder
 	// Cursor continues an earlier query; empty asks for the first page. On
-	// continuation the height range and TxIDs must equal the first page's.
+	// continuation the height range, TxIDs and Order must equal the first
+	// page's.
 	Cursor string
 }
 
@@ -76,8 +99,10 @@ type TxHit struct {
 }
 
 // TxPage is one page of query results together with statistics over the
-// whole filtered range. Hits are ordered by height, then by position inside
-// the block.
+// whole filtered range. Hits are ordered by height then position inside the
+// block: both increasing under OrderAsc and both decreasing under OrderDesc.
+// A hit's Position stays its zero-based index inside the block; descending
+// order never renumbers it.
 type TxPage struct {
 	Hits []TxHit
 	// TotalMatches counts every matching occurrence in the pinned range; it
@@ -97,15 +122,25 @@ type TxPage struct {
 // Reorg calls never leak into a page, and the returned records are copies
 // the caller may freely mutate. The query itself never modifies the index.
 //
+// With Order OrderAsc (the zero value) hits arrive by increasing height and
+// position inside the block; OrderDesc walks the same pinned range the other
+// way, from the tip-bound upper height downward, positions inside each block
+// likewise decreasing. Ordering depends only on height and position — never
+// on block timestamps — and ascending queries behave exactly as before.
+//
 // The first page (empty Cursor) pins the filtered range and returns a
 // continuation cursor while more results remain. Continuations reuse the
 // pinned range — blocks appended above it are invisible to the query — and
 // succeed as long as every block inside the range still matches the first
-// page; otherwise they fail with ErrQueryChanged.
+// page; otherwise they fail with ErrQueryChanged. The order is pinned too:
+// a cursor minted in one direction may not be continued in the other.
 func (index *Index) QueryTxs(query TxQuery) (TxPage, error) {
 	pageSize, err := normalizePageSize(query.PageSize)
 	if err != nil {
 		return TxPage{}, err
+	}
+	if !query.Order.valid() {
+		return TxPage{}, fmt.Errorf("%w: order must be OrderAsc or OrderDesc", ErrInvalidArgument)
 	}
 	if query.Cursor != "" {
 		return index.continueQuery(query, pageSize)
@@ -163,8 +198,8 @@ func (index *Index) firstQuery(query TxQuery, pageSize int) (TxPage, error) {
 		queryTxsHookLocked(from, to, false)
 	}
 	filter := newTxFilter(query.TxIDs)
-	hits, total, blocks := index.scanPageLocked(from, to, filter, 0, pageSize)
-	return index.buildPageLocked(query.To, filter, from, to, hits, total, blocks, 0, pageSize), nil
+	hits, total, blocks := index.scanPageLocked(from, to, filter, query.Order, 0, pageSize)
+	return index.buildPageLocked(query.To, filter, from, to, hits, total, blocks, 0, pageSize, query.Order), nil
 }
 
 func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
@@ -190,6 +225,9 @@ func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
 	if filter.hexDigest() != payload.Set {
 		return TxPage{}, fmt.Errorf("%w: transaction filter differs from the first page", ErrInvalidArgument)
 	}
+	if query.Order != payload.Order {
+		return TxPage{}, fmt.Errorf("%w: read order differs from the first page", ErrInvalidArgument)
+	}
 
 	index.mu.Lock()
 	defer index.mu.Unlock()
@@ -206,19 +244,19 @@ func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
 	}
 	// Re-scan the still-identical pinned range: the cursor records the
 	// absolute offset, but no full match list is kept between pages.
-	hits, total, blocks := index.scanPageLocked(payload.From, payload.To, filter, payload.Off, pageSize)
+	hits, total, blocks := index.scanPageLocked(payload.From, payload.To, filter, payload.Order, payload.Off, pageSize)
 	if payload.Off > total {
 		return TxPage{}, fmt.Errorf("%w: cursor offset is beyond the pinned results", ErrQueryChanged)
 	}
-	return index.buildPageLocked(query.To, filter, payload.From, payload.To, hits, total, blocks, payload.Off, pageSize), nil
+	return index.buildPageLocked(query.To, filter, payload.From, payload.To, hits, total, blocks, payload.Off, pageSize, payload.Order), nil
 }
 
 // buildPageLocked assembles one page from a page-sized scan and mints the
 // continuation cursor when matches remain. total and blocks describe the
-// whole pinned range; hits holds only the window [offset, offset+pageSize).
-// reqTo is the caller's verbatim To (zero for tip-bound queries). The caller
-// must hold index.mu.
-func (index *Index) buildPageLocked(reqTo int64, filter txFilter, from, to int64, hits []TxHit, total, blocks, offset int64, pageSize int) TxPage {
+// whole pinned range; hits holds only the window [offset, offset+pageSize)
+// in the scan's order. reqTo is the caller's verbatim To (zero for
+// tip-bound queries). The caller must hold index.mu.
+func (index *Index) buildPageLocked(reqTo int64, filter txFilter, from, to int64, hits []TxHit, total, blocks, offset int64, pageSize int, order TxOrder) TxPage {
 	page := TxPage{
 		Hits:          hits,
 		TotalMatches:  total,
@@ -233,23 +271,37 @@ func (index *Index) buildPageLocked(reqTo int64, filter txFilter, from, to int64
 			To:    to,
 			Set:   filter.hexDigest(),
 			FP:    hex.EncodeToString(index.fingerprintLocked(from, to)),
+			Order: order,
 			Off:   offset + int64(len(hits)),
 		})
 	}
 	return page
 }
 
-// scanPageLocked walks the whole pinned range once in height/position order,
+// scanPageLocked walks the whole pinned range once in the requested order,
 // counting every matching occurrence and every block holding one, while
 // retaining only the page window [offset, offset+pageSize) in a pre-sized
 // slice: at most pageSize TxHit records, independent of how many matches the
-// whole range holds. The caller must hold index.mu.
-func (index *Index) scanPageLocked(from, to int64, filter txFilter, offset int64, pageSize int) (hits []TxHit, total, blocks int64) {
+// whole range holds. OrderAsc walks increasing heights then increasing
+// positions; OrderDesc walks decreasing heights then decreasing positions.
+// total, blocks and the recorded positions are the same in either order.
+// The caller must hold index.mu.
+func (index *Index) scanPageLocked(from, to int64, filter txFilter, order TxOrder, offset int64, pageSize int) (hits []TxHit, total, blocks int64) {
 	hits = make([]TxHit, 0, pageSize)
-	for height := from; height <= to; height++ {
+	height, step := from, int64(1)
+	if order == OrderDesc {
+		height, step = to, -1
+	}
+	for ; from <= height && height <= to; height += step {
 		block := index.Blocks[height]
 		matched := false
-		for position, tx := range block.Txs {
+		position, pStep := 0, 1
+		end := len(block.Txs)
+		if order == OrderDesc {
+			position, pStep, end = len(block.Txs)-1, -1, -1
+		}
+		for ; position != end; position += pStep {
+			tx := block.Txs[position]
 			if !filter.matches(tx) {
 				continue
 			}
@@ -302,13 +354,14 @@ func (index *Index) fingerprintLocked(from, to int64) []byte {
 
 // cursorPayload is the signed state carried between pages of one query.
 type cursorPayload struct {
-	V     int    `json:"v"`
-	From  int64  `json:"from"`
-	ReqTo int64  `json:"reqTo"`
-	To    int64  `json:"to"`
-	Set   string `json:"set"`
-	FP    string `json:"fp"`
-	Off   int64  `json:"off"`
+	V     int     `json:"v"`
+	From  int64   `json:"from"`
+	ReqTo int64   `json:"reqTo"`
+	To    int64   `json:"to"`
+	Set   string  `json:"set"`
+	FP    string  `json:"fp"`
+	Order TxOrder `json:"ord"`
+	Off   int64   `json:"off"`
 }
 
 const cursorPrefix = "q1"
