@@ -55,6 +55,12 @@ func usage() {
 	fmt.Println("A select request may carry an optional \"sessionKey\" string: requests in the")
 	fmt.Println("same service with the same trimmed key reuse the instance first chosen for")
 	fmt.Println("that key while it stays registered and healthy, without moving the rotation.")
+	fmt.Println("A select request may also carry an optional \"excludeInstanceIds\" array of")
+	fmt.Println("strings naming instances this one request must not choose (e.g. ones already")
+	fmt.Println("tried); the exclusion changes no registration, health record, binding or")
+	fmt.Println("rotation position, and later requests without the list see those instances")
+	fmt.Println("again. An explicit null, a non-array token, a non-string element or a")
+	fmt.Println("blank-after-trim id is invalid with a reason naming excludeInstanceIds.")
 	fmt.Println("A release_session request carries service, expectedRevision and a required")
 	fmt.Println("sessionKey; it drops that key's binding in the named service so the next")
 	fmt.Println("selection with the key joins the rotation again. It chooses no target, moves")
@@ -281,6 +287,55 @@ func (p *registerProcessor) parseSequence(service string, raw json.RawMessage) (
 	return sequence, true
 }
 
+// parseExcludeIDs decodes the raw excludeInstanceIds token of one select
+// request. An omitted field yields nil (an ordinary selection); an explicit
+// null, a non-array token or an array holding a non-string element becomes
+// that item's own invalid result with a reason naming the excludeInstanceIds
+// problem, so one malformed list neither aborts the batch nor steals the
+// outcomes of later items. An empty array is a valid list with no effect.
+// Trimming, blank-id rejection and deduplication stay with the registry's
+// validator alongside the other content checks.
+func (p *registerProcessor) parseExcludeIDs(service string, raw json.RawMessage) ([]string, bool) {
+	var req struct {
+		Exclude json.RawMessage `json:"excludeInstanceIds"`
+	}
+	// raw already decoded as an object in readSessionRequest, so this second
+	// unmarshal cannot fail; it only lifts the one token out.
+	_ = json.Unmarshal(raw, &req)
+	if len(req.Exclude) == 0 {
+		return nil, true
+	}
+	if strings.TrimSpace(string(req.Exclude)) == "null" {
+		p.invalid(service, "excludeInstanceIds must be an array of strings, not null")
+		return nil, false
+	}
+	if !isJSONArray(req.Exclude) {
+		p.invalid(service, "excludeInstanceIds must be an array of strings")
+		return nil, false
+	}
+	var elements []json.RawMessage
+	if err := json.Unmarshal(req.Exclude, &elements); err != nil {
+		p.invalid(service, "excludeInstanceIds must be an array of strings")
+		return nil, false
+	}
+	ids := make([]string, 0, len(elements))
+	for _, element := range elements {
+		// A null element would decode into a string as "" without an error;
+		// judge the token itself so it is reported as the non-string it is.
+		if strings.TrimSpace(string(element)) == "null" {
+			p.invalid(service, "excludeInstanceIds must contain only strings")
+			return nil, false
+		}
+		var id string
+		if err := json.Unmarshal(element, &id); err != nil {
+			p.invalid(service, "excludeInstanceIds must contain only strings")
+			return nil, false
+		}
+		ids = append(ids, id)
+	}
+	return ids, true
+}
+
 // sessionRequestInput is the decoded content shared by select and
 // release_session requests: the trimmed service name, the parsed
 // expectedRevision (still int64, range-checked later by the registry before it
@@ -497,6 +552,8 @@ func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 // A selection performs no network access and never alters registrations or
 // health records; it only advances the service's healthy-instance rotation
 // and, for requests carrying a sessionKey, maintains that session's binding.
+// An optional excludeInstanceIds array of strings narrows this one request's
+// candidate set without touching the excluded instances' state.
 func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 	in, ok := p.readSessionRequest(raw, service,
 		"select request must be an object with service and expectedRevision: %v")
@@ -504,10 +561,21 @@ func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 		return
 	}
 
+	// The exclusion list is select-only, so its token is judged here rather
+	// than in the shared session-request reader: an explicit null, a
+	// non-array token or a non-string element is this item's own invalid
+	// result with a reason naming the excludeInstanceIds problem. An omitted
+	// field or an empty array means an ordinary selection.
+	excludeIDs, ok := p.parseExcludeIDs(in.service, raw)
+	if !ok {
+		return
+	}
+
 	// readSessionRequest delivered the parsed revision and the key as decoded
-	// (nil for an omitted key); ValidateSelectionWithSession repeats the shared
-	// service/revision/key content checks via the registry and trims the key.
-	selection, err := p.registry.ValidateSelectionWithSession(in.service, in.revision, in.sessionKey)
+	// (nil for an omitted key); ValidateSelectionWithExclusions repeats the
+	// shared service/revision/key content checks via the registry, trims the
+	// key, and trims and deduplicates the exclusion ids.
+	selection, err := p.registry.ValidateSelectionWithExclusions(in.service, in.revision, in.sessionKey, excludeIDs)
 	if err != nil {
 		p.invalid(in.service, err.Error())
 		return
