@@ -216,6 +216,8 @@ echo '{"requests":[
 - `instances`：实例对象数组，每项含 `id` 与 `address`。注册提交的是**完整实例列表**：本次列表中未包含的已有实例会被移除。
   - 实例 `id` 先去除两端空白；整理后为空、或同一服务内整理后的标识重复，都返回 `invalid`。
   - `address` 先去除两端空白，之后必须是带端口的 `host:port`：主机支持域名、IPv4 和带方括号的 IPv6（如 `h1:8080`、`10.0.0.2:8081`、`[2001:db8::1]:9000`，裸 IPv6 必须加方括号）；端口必须是 1 到 65535 的十进制整数；地址内部不能含空白或控制字符。
+    - 域名可以写成以**恰好一个**点结尾的完整形式（如 `api.example.:8080`）：末尾点表示 DNS 根，不是分隔符，因此不允许两个末尾点，主体也不能为空（`.:8080` 非法），主体中仍不允许空段（`api..example.:8080`、`api.example..:8080` 非法）。末尾点不计入主体长度，主体（去掉末尾点后的部分）最多 253 个字符，其中每段仍须符合现有字符（字母、数字、连字符）、长度（1–63）与连字符不得位于段首段尾的限制。
+    - 除去除首尾空白外不做任何规范化：域名大小写、末尾点和合法端口文本都原样保留。`api.example:8080` 与 `api.example.:8080` 是两个不同的注册地址；同一实例从前者替换为后者属于真实列表变更，修订号加 1，该实例健康状态回到 `unknown`、序号 0、无原因，必须在新修订号下重新上报健康后才可被选中，而地址未变的其他实例保留健康记录。整个校验离线完成，不做域名解析或网络访问。
 - **字段检查先于修订号判断**：任一字段不合法都返回 `invalid`，即使同一项的修订号也不匹配，仍报 `invalid`；只有字段全部合法、修订号却不符时才报 `conflict`。
 
 ### 修订号、变更判定与空列表
@@ -366,6 +368,70 @@ echo '{"requests":[
 6. 用当前修订号 2 重新加入 `j1`：内容改变，`changed:true`，修订号增至 3；`j1` 作为新内容初始为 `unknown`、序号 0。
 
 末尾 `services` 中 `svc-b` 修订号为 3、仅含 `j1`。本批次含失败项（第 4、5 项），退出状态为 1。
+
+### 完整域名（末尾点）示例
+
+域名主机允许写成以恰好一个点结尾的完整形式（如 `api.example.:8080`）。末尾点与大小写、端口文本一样原样保留，因此带点与不带点是两个不同的注册地址。下面展示首次创建（不带点）、替换为带点地址后健康重置、重置后不可被选中、非法带点地址即使修订号同时不符也先报 `invalid`、重新上报健康后选中返回带点地址文本，以及内容未变的重复提交不变更：
+
+```bash
+echo '{"requests":[
+  {"type":"register","service":"svc-fqdn","expectedRevision":0,"instances":[
+    {"id":"i1","address":"api.example:8080"},
+    {"id":"i2","address":"h2:2"}
+  ]},
+  {"type":"health","service":"svc-fqdn","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"register","service":"svc-fqdn","expectedRevision":1,"instances":[
+    {"id":"i1","address":"api.example.:8080"},
+    {"id":"i2","address":"h2:2"}
+  ]},
+  {"type":"select","service":"svc-fqdn","expectedRevision":2},
+  {"type":"register","service":"svc-fqdn","expectedRevision":9,"instances":[
+    {"id":"i1","address":"api..example.:8080"}
+  ]},
+  {"type":"health","service":"svc-fqdn","instanceId":"i1","expectedRevision":2,"sequence":5,"healthy":true},
+  {"type":"select","service":"svc-fqdn","expectedRevision":2},
+  {"type":"register","service":"svc-fqdn","expectedRevision":2,"instances":[
+    {"id":"i1","address":"api.example.:8080"},
+    {"id":"i2","address":"h2:2"}
+  ]}
+]}' | go run ./cmd/indexroom register
+```
+
+输出（压缩展示，字段与程序实际输出一致）：
+
+```json
+{
+  "results": [
+    {"service":"svc-fqdn","ok":true,"changed":true,"revision":1},
+    {"service":"svc-fqdn","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc-fqdn","ok":true,"changed":true,"revision":2},
+    {"service":"svc-fqdn","ok":false,"revision":2,"error":"no_healthy","reason":"service \"svc-fqdn\" has no healthy instance available"},
+    {"service":"svc-fqdn","ok":false,"revision":2,"error":"invalid","reason":"instance address \"api..example.:8080\" host \"api..example.\" is not a valid domain, IPv4 or bracketed IPv6"},
+    {"service":"svc-fqdn","ok":true,"changed":true,"revision":2,"sequence":5},
+    {"service":"svc-fqdn","ok":true,"revision":2,"sequence":5,"instanceId":"i1","address":"api.example.:8080"},
+    {"service":"svc-fqdn","ok":true,"revision":2}
+  ],
+  "services": [
+    {"service":"svc-fqdn","revision":2,"instances":[
+      {"id":"i1","address":"api.example.:8080","health":"healthy","sequence":5},
+      {"id":"i2","address":"h2:2","health":"unknown","sequence":0}
+    ]}
+  ]
+}
+```
+
+逐项说明：
+
+1. 创建 `svc-fqdn`，`i1` 使用不带末尾点的地址，修订号为 1。
+2. 序号 1 的健康观察被接受，`i1` 成为健康实例，修订号仍为 1。
+3. 把 `i1` 的地址替换为 `api.example.:8080`：带点与不带点是两个不同地址，属于真实列表变更，`changed:true`，修订号增至 2；`i1` 健康记录重置为 `unknown`、序号 0、无原因。地址未变的 `i2` 本就没有健康记录，状态同样为 `unknown`。
+4. 在修订号 2 下选择：`i1` 因地址改变回到 `unknown`、`i2` 从未上报健康，没有健康实例，返回 `no_healthy`；新地址重新获得健康观察前不可被选中。
+5. `api..example.:8080` 主体含空段，即使 `expectedRevision` 9 也与当前修订号 2 不符，字段检查先于修订号判断，仍返回带明确地址原因和当前修订号 2 的 `invalid`，且不输出修订号对比字段；列表与健康记录都不被部分改写。
+6. 在当前修订号 2 下对新地址重新上报序号 5 的健康观察，`i1` 重新成为健康实例，注册修订号不变。
+7. 选择成功，返回的 `address` 是带末尾点的原文 `api.example.:8080` 和最新健康序号 5。
+8. 原样重复提交相同的带点列表：成功但没有 `changed`，修订号保持 2，证明末尾点不会被规范化掉。
+
+末尾 `services` 保存带点地址原文与最新健康序号；`api.example..:8080`、`.:8080` 与第 5 项一样属于 `invalid`。本批次含失败项（第 4、5 项），退出状态为 1。
 
 ## 会话保持（`select` 请求的 `sessionKey`）中文说明
 

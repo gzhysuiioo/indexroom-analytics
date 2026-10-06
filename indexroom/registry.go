@@ -980,7 +980,8 @@ func sameInstances(current map[string]*instanceState, incoming []Instance) bool 
 }
 
 // parseAddress validates a host:port address: domains, IPv4 and bracketed IPv6.
-// No network I/O is performed.
+// A domain host may end in exactly one root dot (e.g. "api.example.:8080"),
+// which is retained in the returned text. No network I/O is performed.
 func parseAddress(raw string) (string, error) {
 	addr := strings.TrimSpace(raw)
 	if addr == "" {
@@ -1036,11 +1037,21 @@ func allDigits(s string) bool {
 }
 
 // isDomainName validates a dotted hostname with alphanumeric/hyphen labels.
+// A domain may be written in its fully qualified form ending in exactly one
+// root dot (e.g. "api.example."): the trailing dot marks the DNS root rather
+// than separating two labels, so it is not itself a label, is not counted in
+// the 253-character body limit, and no second trailing dot is allowed. An
+// empty body (".") or any empty label in the body ("a..b.", "a.b..") is
+// rejected just like any other malformed label. No name resolution occurs.
 func isDomainName(host string) bool {
-	if len(host) > 253 {
+	body := host
+	if strings.HasSuffix(body, ".") {
+		body = body[:len(body)-1]
+	}
+	if body == "" || len(body) > 253 {
 		return false
 	}
-	for _, label := range strings.Split(host, ".") {
+	for _, label := range strings.Split(body, ".") {
 		n := len(label)
 		if n == 0 || n > 63 {
 			return false
