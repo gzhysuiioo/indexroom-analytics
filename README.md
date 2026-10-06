@@ -1162,9 +1162,30 @@ func main() {
 
 允许更换文本写法**不放宽任何校验**：字段仍必须是 schema 规定的字段，且不能缺失、类型错误、未知或重复；只是同一份合法数据可以有多种等价文本。
 
+### 字符串标识的编码规则与拒绝情形
+
+区块哈希（`hash`）、父哈希（`parent`）和每个交易标识（`txs` 的元素）都是 JSON 字符串，恢复时逐个接受同一套编码检查；**版本 1 与版本 2 的规则完全相同**，时间字段不参与这套检查。
+
+- **合法标识是"解码后的值"**：任何合法 UTF-8 字符都可以直接写出——中文、表情符号（如 😀）都没有问题；同一个字符写成字面量还是反斜杠-u 十六进制转义（例如字面的 `"甲"` 与六个字符的 `"\u7532"` 等价；表情符号 😀 直接写出，与高、低两个代理项组成的成对转义 `"\ud83d\ude00"` 等价），解码后是**同一个标识**。父链接也按解码后的值匹配，所以全部用转义写出的父哈希能正确指向字面写出的区块哈希。
+- **查询按解码后的值精确匹配**：用字面量或等价转义写入的同一标识不会变成两个不同标识；同一标识的每次出现（包括在同一区块内出现多次）连同其从零开始的块内位置都原样保留，空标识也保留。再次导出可能改用另一种转义写法（详见[数据一致不等于文本一致](#数据一致不等于文本一致)），这种文本变化不是数据损坏。
+- **真正的"�"（U+FFFD）是合法标识**：U+FFFD 本身是一个正常 Unicode 码点、合法 UTF-8 字符，直接写出 `"�"` 或写成反斜杠-u 转义 `"\ufffd"` 都会被接受，恢复后就是 U+FFFD 这个标识，可按它精确查询。它必须与下面两类"解码失败后被替换出来的 U+FFFD"区分开。
+
+有两类字符串内容会被拒绝，因为它们不表示任何确定的标识：
+
+1. **非法 UTF-8 原始字节**：字符串字面量里出现不属于任何合法 UTF-8 序列的字节（例如 `0xFF`）。
+2. **孤立或顺序错误的代理项转义**：`\uXXXX` 转义落在代理区 `D800–DFFF` 时，唯一合法形态是"高代理项（`D800–DBFF`）后**紧接着**低代理项（`DC00–DFFF`）"成对出现。只有高代理项而后面不是低代理项（包括字符串直接结束、后面是普通字符或另一个高代理项）、低代理项单独出现、低代理项排在高代理项前面，都在拒绝之列。
+
+拒绝这两类是为了防止标识被悄悄合并：标准库 JSON 解码遇到坏字节或孤立代理项时会**静默替换成 U+FFFD**——两个内容不同的坏标识会因此塌缩成同一个值，随后被精确查询、哈希去重和父链接当成同一标识。`Restore` 不接受"替换成 U+FFFD 后导入"，而是在解码之外再检查原始字面量，把整份快照拒绝；真正写入的 U+FFFD（字面或 `\ufffd` 转义）不经过这种替换，始终有效。
+
+- 错误用 `errors.Is(err, indexroom.ErrInvalidSnapshot)` 识别，信息指出问题标识**所属区块高度与字段**（`hash` 或 `parent`），交易标识还会指出它在 `txs` 中**从零开始的位置**，形如 `block at height 2: field "hash" has invalid UTF-8 or unpaired surrogate escapes` 与 `block at height 2: field "txs" element 1 ...`。
+- 拒绝是**整体性**的：编码问题即使出现在最后面的区块，前面自身完全合法的区块也不会部分生效；链顶、已有交易查询结果与再导出内容全部保持恢复前状态。
+- 这是"快照内容非法"，不要与底层读取输入失败混为一谈：`io.Reader` 在读到完整文档前返回的故障走 `indexroom: read snapshot: ...`，不是 `ErrInvalidSnapshot`（见[下一节](#区分非法快照与读取输入的错误)）。
+
+[`examples/snapshotencoding`](examples/snapshotencoding/main.go) 是一份本机离线可运行的完整示例：恢复一份含中文、表情符号与 U+FFFD 的两区块小快照，再分别尝试上述两类非法输入。运行方式、关键输出的含义见文末[补充示例：字符串标识的编码检查](#补充示例字符串标识的编码检查)。
+
 ### 区分非法快照与读取输入的错误
 
-- **快照非法**：JSON 损坏或截断、对象后有多余数据、版本未知、字段缺失/类型错误/未知/重复、高度不连续、哈希为空或重复、父链接断裂、版本 2 时间戳缺失或既非 `null` 也非非负整数等，统一返回可用 `errors.Is(err, indexroom.ErrInvalidSnapshot)` 识别的错误，具体原因附在错误信息中（例如指出断裂发生在哪个高度）。
+- **快照非法**：JSON 损坏或截断、对象后有多余数据、版本未知、字段缺失/类型错误/未知/重复、高度不连续、哈希为空或重复、父链接断裂、版本 2 时间戳缺失或既非 `null` 也非非负整数、字符串标识（`hash`/`parent`/`txs` 元素）含非法 UTF-8 原始字节或孤立/错序代理项转义（见[字符串标识的编码规则与拒绝情形](#字符串标识的编码规则与拒绝情形)）等，统一返回可用 `errors.Is(err, indexroom.ErrInvalidSnapshot)` 识别的错误，具体原因附在错误信息中（指出所属高度与字段；交易标识还指出从零开始的 `txs` 位置，例如断裂或编码错误发生在哪个高度）。
 - **读取输入失败**：底层 `io.Reader` 在读到完整文档前返回的错误（网络中断、存储故障等）**不是** `ErrInvalidSnapshot`，而是包装为 `indexroom: read snapshot: ...` 返回，**原始读取错误仍可用 `errors.Is` 识别**。
 - 两种失败都不会改变现有链：链顶、区块、哈希以及此前发出的分页游标全部保持原状，可以继续使用恢复前那份数据。
 
@@ -1609,6 +1630,281 @@ func main() {
 
 操作 5：对象后追加第二份文档后 Restore：err=indexroom: invalid snapshot: trailing data after the snapshot object
   errors.Is(err, ErrInvalidSnapshot)=true；主链未改变=true，链顶仍为 tip=1
+```
+
+### 补充示例：字符串标识的编码检查
+
+下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/snapshotencoding/main.go`](examples/snapshotencoding/main.go)：
+
+```bash
+go run ./examples/snapshotencoding
+```
+
+场景围绕恢复一份两区块的小快照组织，区块哈希、父哈希与每个交易标识都接受同一套编码检查（先恢复版本 2，再用同一标识数据的版本 1 文本恢复，证明两个版本规则相同）：
+
+- 手写快照混用等价写法：中文与表情符号直接写出，同一个"甲"另一次写成 `\u7532`，区块 2 的哈希与父哈希全部转义写出（父哈希解码后等于区块 1 的字面哈希，父链接按解码值匹配），表情符号一次字面、一次用成对代理转义 `\ud83d\ude00` 写出；真正的 U+FFFD 同时以字面 `�` 与 `\ufffd` 两种写法出现。
+- 程序打印**恢复后实际得到的标识**：字面字符与等价转义解码为同一个标识（不会变成两个），"付款-甲"的三次出现（区块 1 位置 0、1，区块 2 位置 0）、表情符号的两次出现与 U+FFFD 的两次出现连同块内位置全部保留；随后的**精确查询**按解码后的值命中这些位置。
+- 再次导出把转义规范化为字面字符：输出与含转义的输入**字节不同但数据一致**（逐字节一致为 false），规范化文本再恢复、再导出则字节稳定一致——文本变化不是数据损坏。
+- 保留这条可查询的链之后，分别尝试两类非法快照：**高度 2 的 `hash` 含非法 UTF-8 字节 `0xFF`**、**高度 2 的 `txs[1]` 只有高代理项 `\uD83D` 而无紧随的低代理项**。两次都返回可用 `errors.Is(err, indexroom.ErrInvalidSnapshot)` 识别的错误，错误分别定位到"height 2、field hash"与"height 2、field txs、element 1"；被拒快照高度 1 里放置的哨兵标识查询始终 0 次命中，链顶与原有三个标识的查询结果在拒绝前后逐字相同，证明编码问题出现在后面区块时前面的合法区块也没有部分生效。
+
+```go
+// 快照字符串标识的编码规则示例：恢复一份两区块的小快照，区块哈希、父哈希与
+// 每个交易标识都经历同一套编码检查（版本 1、版本 2 规则相同）。手写快照里，
+// 中文、表情符号与真正的 U+FFFD 直接写出；同一个字符也可以写成等价的
+// \uXXXX 转义（包括表情符号的成对代理转义）——恢复后二者是同一个标识，
+// 查询按解码后的值精确匹配，同一交易的多次出现与块内位置全部保留；再次导出
+// 会把转义改写成字面字符，文本变化不代表数据损坏。
+//
+// 随后在保留现有链的前提下分别尝试两类非法快照：其一是字符串中含非法 UTF-8
+// 原始字节（0xFF），其二是 Unicode 转义中出现孤立高代理项（\uD83D 后没有
+// 紧接着的低代理项）。两类都以 ErrInvalidSnapshot 被整体拒绝，错误指出所属
+// 高度、字段（交易标识还指出从零开始的位置）；前面的合法区块不会部分生效，
+// 拒绝后链顶与原交易查询结果保持原状。这类拒绝不同于底层读取输入失败。
+//
+// 运行：go run ./examples/snapshotencoding
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/gzhysuiioo/indexroom-analytics/indexroom"
+)
+
+// u 拼出 JSON 的“反斜杠-u”十六进制转义文本（共六个字符，如 u("7532")
+// 解码后即“甲”），在运行期拼接，让手写快照里同一字符同时有“字面写出”和
+// “转义写出”两种写法可对照。
+func u(hex4 string) string { return `\u` + hex4 }
+
+// 下面两份手写快照刻意混用等价文本写法：
+//   - 区块 1 的哈希、父哈希与 txs[0] 中的“甲”直接写出；txs[1] 的同一个字
+//     写成 u("7532")（“甲”的反斜杠-u 转义）；
+//   - 区块 2 的哈希、父哈希全部写成反斜杠-u 转义（父哈希解码后必须等于
+//     区块 1 的字面哈希，父链接同样按解码后的值匹配）；
+//   - txs[1] 的表情符号直接写出，txs[2] 用成对代理转义
+//     u("d83d")+u("de00") 表示同一个字符；
+//   - txs[3] 是字面写出的真正 U+FFFD（�），txs[4] 写成 u("fffd")。
+//
+// “付款-甲”共出现三次：区块 1 位置 0、1 与区块 2 位置 0。
+var goodV2 = `{"version":2,"tip":2,"blocks":[` +
+	`{"height":1,"hash":"区块-甲","parent":"起点-甲","txs":["付款-甲","付款-` + u("7532") + `"],"timestamp":100},` +
+	`{"height":2,"hash":"` + u("533a") + u("5757") + `-` + u("4e59") + `","parent":"` + u("533a") + u("5757") + `-` + u("7532") + `",` +
+	`"txs":["付款-甲","付款-😀","付款-` + u("d83d") + u("de00") + `","替换符-�","替换符-` + u("fffd") + `"],"timestamp":200}` +
+	`]}`
+
+// goodV1 是同一份标识数据的版本 1 文本（无 timestamp），证明两个版本的
+// 字符串编码规则完全相同。
+var goodV1 = `{"version":1,"tip":2,"blocks":[` +
+	`{"height":1,"hash":"区块-甲","parent":"起点-甲","txs":["付款-甲","付款-` + u("7532") + `"]},` +
+	`{"height":2,"hash":"` + u("533a") + u("5757") + `-` + u("4e59") + `","parent":"` + u("533a") + u("5757") + `-` + u("7532") + `",` +
+	`"txs":["付款-甲","付款-😀","付款-` + u("d83d") + u("de00") + `","替换符-�","替换符-` + u("fffd") + `"]}` +
+	`]}`
+
+// exportString 返回当前主链再次导出的快照文本。
+func exportString(index *indexroom.Index) string {
+	var buf bytes.Buffer
+	if err := index.Export(&buf); err != nil {
+		panic(err)
+	}
+	return buf.String()
+}
+
+// dumpIdentifiers 打印当前链上实际保存的哈希、父哈希与每个交易标识及其
+// 块内位置：这些是 JSON 解码后的值，与输入用字面字符还是 \uXXXX 转义无关。
+func dumpIdentifiers(index *indexroom.Index) {
+	for height := int64(1); height <= index.Tip; height++ {
+		block := index.Blocks[height]
+		fmt.Printf("    height=%d hash=%q parent=%q\n", height, block.Hash, block.Parent)
+		for position, tx := range block.Txs {
+			fmt.Printf("      txs[%d]=%q\n", position, tx)
+		}
+	}
+}
+
+// printQueries 对给定标识逐个做精确查询，打印总命中数与每次出现的位置。
+func printQueries(index *indexroom.Index, txIDs ...string) {
+	for _, txID := range txIDs {
+		page, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 2, TxIDs: []string{txID}, PageSize: 50})
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("  查询 %q：TotalMatches=%d\n", txID, page.TotalMatches)
+		for _, hit := range page.Hits {
+			fmt.Printf("    命中 height=%d block=%q tx=%q position=%d\n",
+				hit.Height, hit.BlockHash, hit.TxID, hit.Position)
+		}
+	}
+}
+
+// printState 打印拒绝前后用于比对的完整可观察状态：链顶、三个既有标识的
+// 查询结果，以及只出现在被拒快照高度 1 里的“哨兵”标识——若它出现，就说明
+// 发生了部分生效；0 次命中才是整份快照被拒绝。
+func printState(index *indexroom.Index) {
+	fmt.Printf("  链顶 tip=%d\n", index.Tip)
+	printQueries(index, "付款-甲", "付款-😀", "替换符-�")
+	printQueries(index, "BAD-SHOULD-NOT-APPEAR")
+}
+
+func main() {
+	idx := indexroom.New()
+
+	// 1. 恢复手写的版本 2 小快照。区块哈希、父哈希和每个交易标识都接受
+	//    同一套编码检查；直接写出的字符与表示同一字符的合法 \uXXXX 转义
+	//    （含表情符号的成对代理转义）解码后是同一个标识。
+	fmt.Println("操作 1：恢复手写的两区块版本 2 小快照（字面字符与等价 Unicode 转义混用）")
+	fmt.Printf("输入文本：%s\n", goodV2)
+	if err := idx.Restore(strings.NewReader(goodV2)); err != nil {
+		panic(err)
+	}
+	fmt.Println("恢复后实际保存的标识（解码后的值；字面与转义不产生两个标识）：")
+	dumpIdentifiers(idx)
+	fmt.Println()
+
+	// 2. 查询按解码后的值精确匹配：同一标识的多次出现（含同一区块内的
+	//    不同位置）全部命中；真正的 U+FFFD 只是一个普通合法标识。
+	fmt.Println("操作 2：按解码后的值精确查询（同一标识的每次出现与块内位置都保留）")
+	printQueries(idx, "付款-甲", "付款-😀", "替换符-�")
+	fmt.Println()
+
+	// 3. 同一份标识数据以版本 1 文本再恢复一次：版本 1 与版本 2 对
+	//    哈希、父哈希和交易标识使用完全相同的编码规则。
+	fmt.Println("操作 3：用同一份标识数据的版本 1 文本再恢复（版本 1、2 的编码规则相同）")
+	if err := idx.Restore(strings.NewReader(goodV1)); err != nil {
+		panic(err)
+	}
+	fmt.Println("恢复后实际保存的标识（与操作 1 完全相同，仅时间字段随版本缺失）：")
+	dumpIdentifiers(idx)
+	fmt.Println()
+
+	// 4. 再次导出：导出按本功能的规范化方式写字面字符，输入里的反斜杠-u
+	//    转义（包括 u("7532") 与成对代理转义）和 u("fffd") 都不再以转义
+	//    形式出现。文本写法变了，但标识、出现次数与位置等数据一字未变，
+	//    这不是数据损坏；用规范化文本再恢复再导出，则字节稳定一致。
+	exported := exportString(idx)
+	fmt.Println("操作 4：再次导出（转义写法被规范化；文本可变、数据不变）")
+	fmt.Printf("  再次导出：%s\n", exported)
+	fmt.Printf("  与含转义的输入逐字节一致=%v（预期 false：数据应按解码后的标识核对，而非字节）\n", exported == goodV1)
+	if err := idx.Restore(strings.NewReader(exported)); err != nil {
+		panic(err)
+	}
+	fmt.Printf("  规范化文本再恢复后再次导出，与上一次导出逐字节一致=%v\n\n", exportString(idx) == exported)
+
+	// 5. 拒绝类一：后面区块（高度 2）的 hash 字符串里带非法 UTF-8 原始
+	//    字节 0xFF。标准库 JSON 解码会把它静默替换成 U+FFFD，若放行，不同
+	//    的坏标识会塌缩成同一个值，因此整份快照被拒绝，而不是替换后导入。
+	//    高度 1 自身虽然合法，也不会部分生效：它的交易里放了哨兵标识。
+	badUTF8 := `{"version":2,"tip":2,"blocks":[` +
+		`{"height":1,"hash":"BAD-1","parent":"g","txs":["付款-甲","BAD-SHOULD-NOT-APPEAR"],"timestamp":1},` +
+		`{"height":2,"hash":"b2-` + "\xff" + `","parent":"BAD-1","txs":["x"],"timestamp":2}` +
+		`]}`
+	fmt.Println("操作 5：尝试非法 UTF-8 原始字节（高度 2 的 hash 中含字节 0xFF）")
+	fmt.Printf("  被拒字段的原始字节（Go 引号语法）：%q\n", "b2-\xff")
+	err := idx.Restore(strings.NewReader(badUTF8))
+	fmt.Printf("  Restore：err=%v\n", err)
+	fmt.Printf("  errors.Is(err, indexroom.ErrInvalidSnapshot)=%v\n",
+		errors.Is(err, indexroom.ErrInvalidSnapshot))
+	fmt.Println("  拒绝后的状态（链顶、原交易查询保持原状；哨兵标识 0 次命中，说明高度 1 也未部分生效）：")
+	printState(idx)
+	fmt.Println()
+
+	// 6. 拒绝类二：高度 2 的 txs[1] 以高代理项转义开头，后面没有紧接着的
+	//    低代理项，字符串随即结束——孤立代理项不表示任何码点。错误同样
+	//    指出高度、字段与从零开始的元素位置。
+	loneSurrogate := `{"version":2,"tip":2,"blocks":[` +
+		`{"height":1,"hash":"BAD-1","parent":"g","txs":["付款-甲","BAD-SHOULD-NOT-APPEAR"],"timestamp":1},` +
+		`{"height":2,"hash":"BAD-2","parent":"BAD-1","txs":["付款-甲","付款-\ud83d"],"timestamp":2}` +
+		`]}`
+	fmt.Println(`操作 6：尝试孤立的高代理项转义（高度 2 的 txs[1]：\uD83D 后没有紧跟低代理项）`)
+	err = idx.Restore(strings.NewReader(loneSurrogate))
+	fmt.Printf("  Restore：err=%v\n", err)
+	fmt.Printf("  errors.Is(err, indexroom.ErrInvalidSnapshot)=%v\n",
+		errors.Is(err, indexroom.ErrInvalidSnapshot))
+	fmt.Println("  拒绝后的状态（与操作 5 之后完全一致，仍是操作 3/4 恢复的原链）：")
+	printState(idx)
+}
+```
+
+对应输出（`go run ./examples/snapshotencoding` 的实际输出，每次运行逐字一致）：
+
+```text
+操作 1：恢复手写的两区块版本 2 小快照（字面字符与等价 Unicode 转义混用）
+输入文本：{"version":2,"tip":2,"blocks":[{"height":1,"hash":"区块-甲","parent":"起点-甲","txs":["付款-甲","付款-\u7532"],"timestamp":100},{"height":2,"hash":"\u533a\u5757-\u4e59","parent":"\u533a\u5757-\u7532","txs":["付款-甲","付款-😀","付款-\ud83d\ude00","替换符-�","替换符-\ufffd"],"timestamp":200}]}
+恢复后实际保存的标识（解码后的值；字面与转义不产生两个标识）：
+    height=1 hash="区块-甲" parent="起点-甲"
+      txs[0]="付款-甲"
+      txs[1]="付款-甲"
+    height=2 hash="区块-乙" parent="区块-甲"
+      txs[0]="付款-甲"
+      txs[1]="付款-😀"
+      txs[2]="付款-😀"
+      txs[3]="替换符-�"
+      txs[4]="替换符-�"
+
+操作 2：按解码后的值精确查询（同一标识的每次出现与块内位置都保留）
+  查询 "付款-甲"：TotalMatches=3
+    命中 height=1 block="区块-甲" tx="付款-甲" position=0
+    命中 height=1 block="区块-甲" tx="付款-甲" position=1
+    命中 height=2 block="区块-乙" tx="付款-甲" position=0
+  查询 "付款-😀"：TotalMatches=2
+    命中 height=2 block="区块-乙" tx="付款-😀" position=1
+    命中 height=2 block="区块-乙" tx="付款-😀" position=2
+  查询 "替换符-�"：TotalMatches=2
+    命中 height=2 block="区块-乙" tx="替换符-�" position=3
+    命中 height=2 block="区块-乙" tx="替换符-�" position=4
+
+操作 3：用同一份标识数据的版本 1 文本再恢复（版本 1、2 的编码规则相同）
+恢复后实际保存的标识（与操作 1 完全相同，仅时间字段随版本缺失）：
+    height=1 hash="区块-甲" parent="起点-甲"
+      txs[0]="付款-甲"
+      txs[1]="付款-甲"
+    height=2 hash="区块-乙" parent="区块-甲"
+      txs[0]="付款-甲"
+      txs[1]="付款-😀"
+      txs[2]="付款-😀"
+      txs[3]="替换符-�"
+      txs[4]="替换符-�"
+
+操作 4：再次导出（转义写法被规范化；文本可变、数据不变）
+  再次导出：{"version":1,"tip":2,"blocks":[{"height":1,"hash":"区块-甲","parent":"起点-甲","txs":["付款-甲","付款-甲"]},{"height":2,"hash":"区块-乙","parent":"区块-甲","txs":["付款-甲","付款-😀","付款-😀","替换符-�","替换符-�"]}]}
+  与含转义的输入逐字节一致=false（预期 false：数据应按解码后的标识核对，而非字节）
+  规范化文本再恢复后再次导出，与上一次导出逐字节一致=true
+
+操作 5：尝试非法 UTF-8 原始字节（高度 2 的 hash 中含字节 0xFF）
+  被拒字段的原始字节（Go 引号语法）："b2-\xff"
+  Restore：err=indexroom: invalid snapshot: block at height 2: field "hash" has invalid UTF-8 or unpaired surrogate escapes
+  errors.Is(err, indexroom.ErrInvalidSnapshot)=true
+  拒绝后的状态（链顶、原交易查询保持原状；哨兵标识 0 次命中，说明高度 1 也未部分生效）：
+  链顶 tip=2
+  查询 "付款-甲"：TotalMatches=3
+    命中 height=1 block="区块-甲" tx="付款-甲" position=0
+    命中 height=1 block="区块-甲" tx="付款-甲" position=1
+    命中 height=2 block="区块-乙" tx="付款-甲" position=0
+  查询 "付款-😀"：TotalMatches=2
+    命中 height=2 block="区块-乙" tx="付款-😀" position=1
+    命中 height=2 block="区块-乙" tx="付款-😀" position=2
+  查询 "替换符-�"：TotalMatches=2
+    命中 height=2 block="区块-乙" tx="替换符-�" position=3
+    命中 height=2 block="区块-乙" tx="替换符-�" position=4
+  查询 "BAD-SHOULD-NOT-APPEAR"：TotalMatches=0
+
+操作 6：尝试孤立的高代理项转义（高度 2 的 txs[1]：\uD83D 后没有紧跟低代理项）
+  Restore：err=indexroom: invalid snapshot: block at height 2: field "txs" element 1 has invalid UTF-8 or unpaired surrogate escapes
+  errors.Is(err, indexroom.ErrInvalidSnapshot)=true
+  拒绝后的状态（与操作 5 之后完全一致，仍是操作 3/4 恢复的原链）：
+  链顶 tip=2
+  查询 "付款-甲"：TotalMatches=3
+    命中 height=1 block="区块-甲" tx="付款-甲" position=0
+    命中 height=1 block="区块-甲" tx="付款-甲" position=1
+    命中 height=2 block="区块-乙" tx="付款-甲" position=0
+  查询 "付款-😀"：TotalMatches=2
+    命中 height=2 block="区块-乙" tx="付款-😀" position=1
+    命中 height=2 block="区块-乙" tx="付款-😀" position=2
+  查询 "替换符-�"：TotalMatches=2
+    命中 height=2 block="区块-乙" tx="替换符-�" position=3
+    命中 height=2 block="区块-乙" tx="替换符-�" position=4
+  查询 "BAD-SHOULD-NOT-APPEAR"：TotalMatches=0
 ```
 
 ## 技术方向
