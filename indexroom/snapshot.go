@@ -560,20 +560,33 @@ func snapshotInt64(raw json.RawMessage, field string) (int64, error) {
 }
 
 // snapshotString decodes one required string field, rejecting null rather
-// than letting it pass as the empty string. The raw literal is also checked
-// for invalid UTF-8 bytes and unpaired or misordered \uXXXX surrogate
-// escapes, which the decoder would otherwise silently rewrite to U+FFFD;
-// height identifies the block the field belongs to in the error.
+// than letting it pass as the empty string; height identifies the block the
+// field belongs to in the error.
 func snapshotString(raw json.RawMessage, field string, height int64) (string, error) {
+	return decodeSnapshotString(raw, fmt.Sprintf("field %q", field),
+		fmt.Sprintf("field %q must not be null", field),
+		fmt.Sprintf("block at height %d: field %q has invalid UTF-8 or unpaired surrogate escapes", height, field))
+}
+
+// decodeSnapshotString decodes one raw JSON value as a snapshot string,
+// applying the rules hash, parent, and every transaction identifier share:
+// null is rejected rather than passing as the empty string, the value must
+// be a JSON string, and the raw literal is checked for invalid UTF-8 bytes
+// and unpaired or misordered \uXXXX surrogate escapes, which the decoder
+// would otherwise silently rewrite to U+FFFD. where prefixes a type error
+// with the value's position, and nullReason and encodingReason word the
+// other two failures, so each position keeps its own error text while the
+// checks themselves live in one place.
+func decodeSnapshotString(raw json.RawMessage, where, nullReason, encodingReason string) (string, error) {
 	if isSnapshotNull(raw) {
-		return "", invalidSnapshot("field %q must not be null", field)
+		return "", invalidSnapshot("%s", nullReason)
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", classifySnapshotErr(fmt.Errorf("field %q: %w", field, err))
+		return "", classifySnapshotErr(fmt.Errorf("%s: %w", where, err))
 	}
 	if !validSnapshotString(raw) {
-		return "", invalidSnapshot("block at height %d: field %q has invalid UTF-8 or unpaired surrogate escapes", height, field)
+		return "", invalidSnapshot("%s", encodingReason)
 	}
 	return s, nil
 }
@@ -697,15 +710,11 @@ func parseSnapshotTxs(dec *json.Decoder, height int64) ([]string, error) {
 		if err := dec.Decode(&raw); err != nil {
 			return nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err))
 		}
-		if isSnapshotNull(raw) {
-			return nil, invalidSnapshot("block at height %d: txs element %d must not be null", height, len(txs))
-		}
-		var tx string
-		if err := json.Unmarshal(raw, &tx); err != nil {
-			return nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err))
-		}
-		if !validSnapshotString(raw) {
-			return nil, invalidSnapshot("block at height %d: field %q element %d has invalid UTF-8 or unpaired surrogate escapes", height, "txs", len(txs))
+		tx, err := decodeSnapshotString(raw, "txs element",
+			fmt.Sprintf("block at height %d: txs element %d must not be null", height, len(txs)),
+			fmt.Sprintf("block at height %d: field %q element %d has invalid UTF-8 or unpaired surrogate escapes", height, "txs", len(txs)))
+		if err != nil {
+			return nil, err
 		}
 		txs = append(txs, tx)
 	}
