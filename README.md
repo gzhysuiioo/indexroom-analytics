@@ -18,7 +18,7 @@ go test ./...
 - `Index.Append` / `Index.Reorg`：摄取区块与重组，负时间整体拒绝且不改变已有链；哈希、父哈希或任一交易标识含非法 UTF-8 字节时同样整体拒绝，错误信息指出区块高度与字段（交易标识另指出从 0 开始的位置），保证快照可无损导出与恢复。`Append` 在链顶前进后仍可再次提交内容完全相同的旧区块（成功且无副作用），完整规则见下方[重复提交区块指南（Append）](#重复提交区块指南append)；`Reorg` 的分支范围、丢弃高度口径、失败原子性与完整用法见下方[重组指南（Reorg）](#重组指南reorg)。
 - `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；默认按高度、再按块内位置升序返回，`Order` 设为 `OrderDesc` 时整体倒序（高度与块内位置均从大到小）；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
 - `Index.QueryTimeStats`：按 `[Start, End)` 半开窗口与 `StepSeconds` 分段统计交易出现次数、不同标识数、含匹配交易的区块数，并给出整窗口去重汇总与缺失时间区块数；非法参数返回 `ErrInvalidArgument`。完整用法见下方[按时间窗口统计交易指南](#按时间窗口统计交易指南querytimestats)。
-- `Index.Export` / `Index.Restore`：快照版本 1（区块不含 `timestamp`）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）。`Restore` 保证**数据一致**并把再导出规范化为本功能的固定文本，不保留输入的字段顺序、空白与转义写法；它用一份完整快照整体替换主链，非法输入返回 `ErrInvalidSnapshot` 且不改变现有链。完整用法见下方[快照导出与恢复指南（Export/Restore）](#快照导出与恢复指南exportrestore)。
+- `Index.Export` / `Index.Restore`：快照版本 1（区块不含 `timestamp`）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）。`Restore` 保证**数据一致**并把再导出规范化为本功能的固定文本，不保留输入的字段顺序、空白与转义写法；它用一份完整快照整体替换主链，非法输入返回 `ErrInvalidSnapshot` 且不改变现有链，底层读取故障（含与完整快照字节同批到达的故障）则返回以 `indexroom: read snapshot:` 开头、保留原始读取错误的另一类错误。完整用法见下方[快照导出与恢复指南（Export/Restore）](#快照导出与恢复指南exportrestore)。
 
 ## 分页交易查询指南（QueryTxs）
 
@@ -1164,9 +1164,30 @@ func main() {
 
 ### 区分非法快照与读取输入的错误
 
-- **快照非法**：JSON 损坏或截断、对象后有多余数据、版本未知、字段缺失/类型错误/未知/重复、高度不连续、哈希为空或重复、父链接断裂、版本 2 时间戳缺失或既非 `null` 也非非负整数、**字符串标识（`hash`、`parent`、每个 `txs` 元素）含非法 UTF-8 原始字节或孤立/错序的 Unicode 代理项转义**等，统一返回可用 `errors.Is(err, indexroom.ErrInvalidSnapshot)` 识别的错误，具体原因附在错误信息中：一般问题指出所在位置（例如父链接断裂发生在哪个高度），字符串编码类错误还会指出所属高度与字段，交易标识再指出从 0 开始的位置（规则与示例见下方[字符串标识的编码规则](#字符串标识的编码规则合法写法与两类拒绝)）。
-- **读取输入失败**：底层 `io.Reader` 在读到完整文档前返回的错误（网络中断、存储故障等）**不是** `ErrInvalidSnapshot`，而是包装为 `indexroom: read snapshot: ...` 返回，**原始读取错误仍可用 `errors.Is` 识别**。
-- 两种失败都不会改变现有链：链顶、区块、哈希以及此前发出的分页游标全部保持原状，可以继续使用恢复前那份数据。
+`Restore` 有三种互斥的结果：**恢复成功**（`err == nil`，主链被快照整体替换）、**非法快照**（`errors.Is(err, indexroom.ErrInvalidSnapshot)`）、**读取失败**（错误信息以 `indexroom: read snapshot:` 开头，`errors.Is` 命中底层原始读取错误）。区分后两者的关键不是字节长什么样，而是**输入怎样结束**。
+
+**只有底层直接返回裸 `io.EOF` 才是正常结束**
+
+- 正常结束指底层 `io.Reader` 耗尽数据后返回**裸 `io.EOF` 哨兵本身**（即 `err == io.EOF`），而不是任何“`errors.Is(err, io.EOF)` 能匹配”的错误。`strings.Reader`、`bytes.Reader`、正常读到末尾的 `*os.File` 都是这种情况。
+- 裸 `io.EOF` 到达时，若已读到的字节组成一份完整合法快照，**恢复成功**；若 JSON 不完整（截断在对象、数组或某个值中间），流本身并没有故障，但内容不是一份完整快照，返回包装了 `unexpected end of input` 的 **`ErrInvalidSnapshot`**。即：同样是正常结束，内容完整与否决定成功还是非法快照——截断不会被算作读取故障。
+
+**这些“结束”都是读取失败，即使 `errors.Is` 命中 `io.EOF`**
+
+- 底层主动返回 `io.ErrUnexpectedEOF`（裸值或被包装，例如 `fmt.Errorf("storage cut: %w", io.ErrUnexpectedEOF)`）；
+- 返回**包装过的 `io.EOF`**（携带存储侧上下文，`errors.Is` 命中 `io.EOF`，但它不等于裸哨兵）；
+- 返回 `errors.Join(io.EOF, 自定义读取错误)` 这类合并错误。
+- 以上情形统一包装为 `indexroom: read snapshot: ...` 返回：**原始读取错误原样保留，可用 `errors.Is` 识别**（合并错误可以同时 `errors.Is(err, io.EOF)` 与 `errors.Is(err, 自定义故障)`），但它**不是** `ErrInvalidSnapshot`；绝不能仅凭 `errors.Is(err, io.EOF)` 就把它当作正常结束后的成功。
+
+**字节与故障同一次读取到达时，故障不能被字节抵消**
+
+- 一次读取既返回字节又报告故障时，故障会在这些字节之后单独送达解码器，不会被吞掉：**即使这批字节已经组成一份完整合法快照，恢复仍然失败**，不会先应用再报错。
+- 若这批已伴随故障的字节同时还暴露内容问题（如未知字段、重复字段、对象后多余数据），返回的是**读取失败**，而不是 `ErrInvalidSnapshot`——流已经故障，无法确认这批字节就是文档的全部，已收到的读取故障优先。
+- 这个优先关系**只适用于已经收到的故障**：如果内容问题先在一次没有故障的读取中被发现，恢复立即按**非法快照**结束，**不会**为了“也许后面还有读取错误”而继续取数据；要下一次读取才会到达的故障根本不会被消费。
+- **版本 1 与版本 2 在这里遵循完全相同的规则**：完整字节伴随合并 EOF 故障都是读取失败，同样字节在裸 `io.EOF` 下正常结束则都能恢复。
+
+**哪些内容问题属于非法快照**：JSON 损坏或截断、对象后有多余数据、版本未知、字段缺失/类型错误/未知/重复、高度不连续、哈希为空或重复、父链接断裂、版本 2 时间戳缺失或既非 `null` 也非非负整数、**字符串标识（`hash`、`parent`、每个 `txs` 元素）含非法 UTF-8 原始字节或孤立/错序的 Unicode 代理项转义**等，统一返回可用 `errors.Is(err, indexroom.ErrInvalidSnapshot)` 识别的错误，具体原因附在错误信息中：一般问题指出所在位置（例如父链接断裂发生在哪个高度），字符串编码类错误还会指出所属高度与字段，交易标识再指出从 0 开始的位置（规则与示例见下方[字符串标识的编码规则](#字符串标识的编码规则合法写法与两类拒绝)）。
+
+**失败不改链，成功才替换**：非法快照与读取失败都不会改变现有链——链顶、区块、哈希以及此前发出的分页游标全部保持原状，可以继续使用恢复前那份数据（见下方[恢复与分页游标](#恢复与分页游标)）；只有恢复成功时链才被快照整体替换。三种结果在同一份小快照上的可运行对照见下方[完整示例：正常结束、截断结束与伴随故障的输入对照](#完整示例正常结束截断结束与伴随故障的输入对照)。
 
 ### 字符串标识的编码规则：合法写法与两类拒绝
 
@@ -1515,6 +1536,353 @@ func main() {
 
 - **恢复失败**（快照被拒或读取出错）：链没有变化，失败前取得的游标仍可用于原链，按[分页查询的既有规则](#游标失效区分-errquerychanged-与-errinvalidargument)继续翻页。
 - **恢复成功**：旧游标不是整体作废，而是遵循同一套固定范围规则继续校验——固定范围内的区块内容变了（即使只是时间变化），或链顶降到该查询固定上界以下，续查返回 `ErrQueryChanged` 且没有可用页结果；此时应**从空游标重新开始查询**，不要把新页拼到旧结果后面。若恢复后的链在固定范围内与首页完全相同且链顶仍覆盖该范围，游标仍可正常续查。
+
+
+### 完整示例：正常结束、截断结束与伴随故障的输入对照
+
+下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/restorereader/main.go`](examples/restorereader/main.go)：
+
+```bash
+go run ./examples/restorereader
+```
+
+程序围绕**同一份两区块小快照**（版本 1、版本 2 两种布局）在一条三区块旧链上做对照，每次都打印 `Restore` 的返回错误、对四类哨兵的 `errors.Is` 结果、错误信息前缀，以及链顶、交易查询与恢复前游标：
+
+1. 完整合法快照以**裸 `io.EOF`** 正常结束 → 恢复成功，链顶由 3 降为 2、旧交易被整体替换，恢复前游标续查返回 `ErrQueryChanged`；
+2. 同一份快照截断后仍以**裸 `io.EOF`** 正常结束 → `ErrInvalidSnapshot`（`unexpected end of input`），链顶不变、恢复前游标仍能续查原链；
+3. 完整快照字节与故障**同一次读取**到达：`io.ErrUnexpectedEOF`、`errors.Join(io.EOF, 自定义故障)`、包装过的 `io.EOF` 三种形式全部是读取失败（第三种 `errors.Is` 能命中 `io.EOF`，但仍不是成功），链顶保持 3；
+4. 故障与未知字段同批出现时读取失败优先；同一份含未知字段的文档若先在一次无故障读取中被发现，则立即按 `ErrInvalidSnapshot` 结束，含故障的后续读取一次都不会发生；
+5. 版本 1、版本 2 各跑一遍“伴随故障失败 / 裸 EOF 成功”的对照，规则完全相同。
+
+```go
+// 快照恢复的“输入结束”语义示例：同一份小快照，在三种输入结束方式下对照
+// Index.Restore 的结果分类——
+//
+//  1. 完整合法快照在底层直接返回裸 io.EOF 时正常结束：恢复成功，主链被快照
+//     整体替换，恢复前取得的游标按既有规则返回 ErrQueryChanged；
+//  2. 截断的不完整 JSON 同样以裸 io.EOF 正常结束：流没有故障，但内容不是
+//     一份完整快照，返回 ErrInvalidSnapshot，链与恢复前游标保持原状；
+//  3. 完整快照字节与读取故障在同一次读取中一起到达（io.ErrUnexpectedEOF、
+//     包装过的 io.EOF、errors.Join(io.EOF, 自定义故障)）：故障不能被字节
+//     抵消，即使 errors.Is 能匹配 io.EOF，也属于读取失败而不是成功。
+//
+// 随后演示故障与内容问题（未知字段）的优先级：同一批已报告故障的字节即使
+// 同时暴露内容问题，也返回读取失败；但内容问题先在一次无故障读取中被发现
+// 时，立即以 ErrInvalidSnapshot 结束，不会继续读取去寻找后续故障。版本 1、
+// 版本 2 对以上规则行为一致。
+//
+// 运行：go run ./examples/restorereader
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/gzhysuiioo/indexroom-analytics/indexroom"
+)
+
+// errStorage 模拟与 EOF 无关的底层存储读取故障，调用方用 errors.Is 识别它。
+var errStorage = errors.New("simulated storage fault")
+
+// snapV1 与 snapV2 是同一份两区块小快照的两个版本布局，也是所有情形围绕的
+// 同一份数据；文本本身就是规范化紧凑写法。
+const snapV1 = `{"version":1,"tip":2,"blocks":` +
+	`[{"height":1,"hash":"n1","parent":"g","txs":["pay"]},` +
+	`{"height":2,"hash":"n2","parent":"n1","txs":["pay","new-tx"]}]}`
+
+const snapV2 = `{"version":2,"tip":2,"blocks":` +
+	`[{"height":1,"hash":"n1","parent":"g","txs":["pay"],"timestamp":100},` +
+	`{"height":2,"hash":"n2","parent":"n1","txs":["pay","new-tx"],"timestamp":null}]}`
+
+// contentBad 是一份含未知顶层字段的文档；它在“故障优先”与“先发现先拒绝”
+// 两个对照情形里使用完全相同的字节。
+const contentBad = `{"version":1,"tip":0,"blocks":[],"extra":0}`
+
+// queryIDs 同时覆盖旧链独有、新链独有与新旧共有的交易标识，一次查询即可
+// 看出链是否被替换。
+var queryIDs = []string{"old-tx", "new-tx", "pay"}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+// freshChain 构造每个情形共用的三区块旧链（全部无时间，导出为版本 1）。
+func freshChain() *indexroom.Index {
+	idx := indexroom.New()
+	must(idx.Append(indexroom.Block{Height: 1, Hash: "o1", Parent: "g", Txs: []string{"old-tx"}}))
+	must(idx.Append(indexroom.Block{Height: 2, Hash: "o2", Parent: "o1", Txs: []string{"old-tx"}}))
+	must(idx.Append(indexroom.Block{Height: 3, Hash: "o3", Parent: "o2", Txs: []string{"old-tx", "tail"}}))
+	return idx
+}
+
+func exportString(idx *indexroom.Index) string {
+	var buf bytes.Buffer
+	must(idx.Export(&buf))
+	return buf.String()
+}
+
+// queryPage 在固定范围 [1, 3]、每页 2 条下查询；cursor 为空取首页，否则
+// 续查恢复前取得的游标。
+func queryPage(idx *indexroom.Index, cursor string) indexroom.TxPage {
+	page, err := idx.QueryTxs(indexroom.TxQuery{
+		From: 1, To: 3, TxIDs: queryIDs, PageSize: 2, Cursor: cursor,
+	})
+	must(err)
+	return page
+}
+
+func hitsText(page indexroom.TxPage) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "ToHeight=%d TotalMatches=%d 命中：", page.ToHeight, page.TotalMatches)
+	if len(page.Hits) == 0 {
+		b.WriteString("<无>")
+		return b.String()
+	}
+	for i, hit := range page.Hits {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "%d/%s@%d", hit.Height, hit.TxID, hit.Position)
+	}
+	return b.String()
+}
+
+// oneShotReader 在第一次 Read 时把全部 data 连同 err 一起返回，之后一律
+// 返回裸 io.EOF，模拟底层“字节与故障同批到达、随后流正常结束”。
+type oneShotReader struct {
+	done bool
+	data []byte
+	err  error
+}
+
+func (r *oneShotReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	return n, r.err
+}
+
+// scriptChunk 是一次 Read 固定返回的字节与错误。
+type scriptChunk struct {
+	data string
+	err  error
+}
+
+// scriptReader 每个 chunk 恰好对应一次 Read，chunk 用完后返回裸 io.EOF；
+// faultReads 统计真正交付了故障的读取次数，用来证明恢复没有向前多读。
+type scriptReader struct {
+	chunks     []scriptChunk
+	faultReads int
+}
+
+func (r *scriptReader) Read(p []byte) (int, error) {
+	if len(r.chunks) == 0 {
+		return 0, io.EOF
+	}
+	chunk := r.chunks[0]
+	r.chunks = r.chunks[1:]
+	if chunk.err != nil {
+		r.faultReads++
+	}
+	n := copy(p, chunk.data)
+	return n, chunk.err
+}
+
+// wrappedEOF 是包装过的 io.EOF：errors.Is 命中 io.EOF，但它不是底层直接
+// 返回的那个裸哨兵。
+type wrappedEOF struct{}
+
+func (wrappedEOF) Error() string { return "storage layer reported end: " + io.EOF.Error() }
+func (wrappedEOF) Unwrap() error { return io.EOF }
+
+// reportRestore 打印恢复结果与错误分类：成功、ErrInvalidSnapshot，还是保留
+// 原始读取错误的读取失败。
+func reportRestore(err error) {
+	fmt.Printf("  Restore 返回 err=%v\n", oneLineErr(err))
+	if err == nil {
+		fmt.Println("  分类：恢复成功（err == nil）")
+		return
+	}
+	fmt.Printf("  errors.Is：ErrInvalidSnapshot=%v、io.EOF=%v、io.ErrUnexpectedEOF=%v、原始存储故障=%v\n",
+		errors.Is(err, indexroom.ErrInvalidSnapshot),
+		errors.Is(err, io.EOF),
+		errors.Is(err, io.ErrUnexpectedEOF),
+		errors.Is(err, errStorage))
+	fmt.Printf("  错误信息以 \"indexroom: read snapshot:\" 开头：%v\n",
+		strings.HasPrefix(err.Error(), "indexroom: read snapshot:"))
+}
+
+func oneLineErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), "\n", " | "))
+}
+
+func main() {
+	fmt.Println("准备：三个区块的旧链，与同一份两区块小快照")
+	base := freshChain()
+	fmt.Printf("  旧链：tip=%d %s\n", base.Tip, exportString(base))
+	first := queryPage(base, "")
+	fmt.Printf("  旧链固定范围 [1, 3] 首页（每页 2 条）%s，其余记录由游标续查\n", hitsText(first))
+	fmt.Printf("  小快照（版本 1）：%s\n", snapV1)
+	fmt.Printf("  小快照（版本 2）：%s\n\n", snapV2)
+
+	// 情形 1：完整合法快照 + 正常结束（strings.Reader 耗尽后直接返回裸
+	// io.EOF）。恢复成功，链被快照整体替换。
+	fmt.Println("情形 1：完整合法快照，底层直接返回裸 io.EOF（正常结束）")
+	idx := freshChain()
+	cursor := queryPage(idx, "").NextCursor
+	err := idx.Restore(strings.NewReader(snapV1))
+	reportRestore(err)
+	page := queryPage(idx, "")
+	fmt.Printf("  恢复后：tip=%d；空游标查询 %s\n", idx.Tip, hitsText(page))
+	fmt.Printf("  再次导出：%s\n", exportString(idx))
+	_, err = idx.QueryTxs(indexroom.TxQuery{
+		From: 1, To: 3, TxIDs: queryIDs, PageSize: 2, Cursor: cursor,
+	})
+	fmt.Printf("  恢复前游标续查：ErrQueryChanged=%v（链已被整体替换，应从空游标重新查询）\n\n",
+		errors.Is(err, indexroom.ErrQueryChanged))
+
+	// 情形 2：截断 JSON + 正常结束。同一份快照只送到第一区块之后，流以裸
+	// io.EOF 结束：没有读取故障，但文档不完整，属于非法快照。
+	fmt.Println("情形 2：截断的不完整 JSON，底层仍直接返回裸 io.EOF（正常结束）")
+	idx = freshChain()
+	cursor = queryPage(idx, "").NextCursor
+	half := snapV1[:strings.Index(snapV1, `{"height":2`)]
+	fmt.Printf("  截断前缀：%s\n", half)
+	err = idx.Restore(strings.NewReader(half))
+	reportRestore(err)
+	cont := queryPage(idx, cursor)
+	fmt.Printf("  链顶仍为 tip=%d；恢复前游标续查原链成功：%s\n\n", idx.Tip, hitsText(cont))
+
+	// 情形 3：完整合法字节与故障同一次读取到达。字节本身已组成完整快照，
+	// 但故障已被报告，恢复仍失败；三种故障形式都不是 ErrInvalidSnapshot。
+	fmt.Println("情形 3：完整快照字节与读取故障同批到达（故障不能被字节抵消）")
+	cases := []struct {
+		name  string
+		fault error
+	}{
+		{"3a 底层直接返回 io.ErrUnexpectedEOF", io.ErrUnexpectedEOF},
+		{"3b errors.Join(io.EOF, 自定义读取错误)", errors.Join(io.EOF, errStorage)},
+		{"3c 包装过的 io.EOF（errors.Is 命中 io.EOF，但不是裸哨兵）", wrappedEOF{}},
+	}
+	for _, tc := range cases {
+		idx = freshChain()
+		err = idx.Restore(&oneShotReader{data: []byte(snapV1), err: tc.fault})
+		fmt.Printf("  %s\n", tc.name)
+		reportRestore(err)
+		fmt.Printf("  链顶仍为 tip=%d，完整快照没有被应用\n", idx.Tip)
+	}
+	fmt.Println()
+
+	// 情形 4：故障与内容问题同时暴露时的优先级。
+	fmt.Println("情形 4：已收到的读取故障优先于同一批字节暴露的内容问题")
+	idx = freshChain()
+	err = idx.Restore(&oneShotReader{data: []byte(contentBad), err: errStorage})
+	fmt.Printf("  4a 同批字节既含未知字段又报告故障（字节：%s）\n", contentBad)
+	reportRestore(err)
+	fmt.Printf("  链顶仍为 tip=%d（返回读取失败，而不是 ErrInvalidSnapshot）\n", idx.Tip)
+
+	idx = freshChain()
+	script := &scriptReader{chunks: []scriptChunk{
+		{data: contentBad}, // 第一次读取：完整字节、无故障
+		{err: errStorage},  // 下一次读取才会交付故障
+	}}
+	err = idx.Restore(script)
+	fmt.Println("  4b 同样字节在无故障读取中先暴露未知字段（故障要下一次读取才发生）")
+	reportRestore(err)
+	fmt.Printf("  含故障的后续读取实际发生次数：%d（不继续读去寻找故障）；链顶仍为 tip=%d\n\n",
+		script.faultReads, idx.Tip)
+
+	// 情形 5：版本 1、版本 2 规则相同：伴随故障都是读取失败，同样字节在裸
+	// io.EOF 正常结束时都能恢复成功。
+	fmt.Println("情形 5：版本 1 与版本 2 遵循同一规则")
+	for _, doc := range []struct {
+		name string
+		text string
+	}{
+		{"版本 1", snapV1},
+		{"版本 2", snapV2},
+	} {
+		idx = freshChain()
+		err = idx.Restore(&oneShotReader{data: []byte(doc.text), err: errors.Join(io.EOF, errStorage)})
+		fmt.Printf("  %s 完整字节伴随 errors.Join(io.EOF, 故障)：err=%v；ErrInvalidSnapshot=%v；tip 仍为 %d\n",
+			doc.name, oneLineErr(err), errors.Is(err, indexroom.ErrInvalidSnapshot), idx.Tip)
+		err = idx.Restore(strings.NewReader(doc.text))
+		fmt.Printf("  %s 同样字节以裸 io.EOF 正常结束：err=%v；恢复成功，tip=%d\n", doc.name, err, idx.Tip)
+	}
+}
+```
+
+对应输出（`go run ./examples/restorereader` 的实际输出，每次运行逐字一致）：
+
+```text
+准备：三个区块的旧链，与同一份两区块小快照
+  旧链：tip=3 {"version":1,"tip":3,"blocks":[{"height":1,"hash":"o1","parent":"g","txs":["old-tx"]},{"height":2,"hash":"o2","parent":"o1","txs":["old-tx"]},{"height":3,"hash":"o3","parent":"o2","txs":["old-tx","tail"]}]}
+  旧链固定范围 [1, 3] 首页（每页 2 条）ToHeight=3 TotalMatches=3 命中：1/old-tx@0 2/old-tx@0，其余记录由游标续查
+  小快照（版本 1）：{"version":1,"tip":2,"blocks":[{"height":1,"hash":"n1","parent":"g","txs":["pay"]},{"height":2,"hash":"n2","parent":"n1","txs":["pay","new-tx"]}]}
+  小快照（版本 2）：{"version":2,"tip":2,"blocks":[{"height":1,"hash":"n1","parent":"g","txs":["pay"],"timestamp":100},{"height":2,"hash":"n2","parent":"n1","txs":["pay","new-tx"],"timestamp":null}]}
+
+情形 1：完整合法快照，底层直接返回裸 io.EOF（正常结束）
+  Restore 返回 err=<nil>
+  分类：恢复成功（err == nil）
+  恢复后：tip=2；空游标查询 ToHeight=2 TotalMatches=3 命中：1/pay@0 2/pay@0
+  再次导出：{"version":1,"tip":2,"blocks":[{"height":1,"hash":"n1","parent":"g","txs":["pay"]},{"height":2,"hash":"n2","parent":"n1","txs":["pay","new-tx"]}]}
+  恢复前游标续查：ErrQueryChanged=true（链已被整体替换，应从空游标重新查询）
+
+情形 2：截断的不完整 JSON，底层仍直接返回裸 io.EOF（正常结束）
+  截断前缀：{"version":1,"tip":2,"blocks":[{"height":1,"hash":"n1","parent":"g","txs":["pay"]},
+  Restore 返回 err=indexroom: invalid snapshot: unexpected end of input
+  errors.Is：ErrInvalidSnapshot=true、io.EOF=false、io.ErrUnexpectedEOF=false、原始存储故障=false
+  错误信息以 "indexroom: read snapshot:" 开头：false
+  链顶仍为 tip=3；恢复前游标续查原链成功：ToHeight=3 TotalMatches=3 命中：3/old-tx@0
+
+情形 3：完整快照字节与读取故障同批到达（故障不能被字节抵消）
+  3a 底层直接返回 io.ErrUnexpectedEOF
+  Restore 返回 err=indexroom: read snapshot: unexpected EOF
+  errors.Is：ErrInvalidSnapshot=false、io.EOF=false、io.ErrUnexpectedEOF=true、原始存储故障=false
+  错误信息以 "indexroom: read snapshot:" 开头：true
+  链顶仍为 tip=3，完整快照没有被应用
+  3b errors.Join(io.EOF, 自定义读取错误)
+  Restore 返回 err=indexroom: read snapshot: EOF | simulated storage fault
+  errors.Is：ErrInvalidSnapshot=false、io.EOF=true、io.ErrUnexpectedEOF=false、原始存储故障=true
+  错误信息以 "indexroom: read snapshot:" 开头：true
+  链顶仍为 tip=3，完整快照没有被应用
+  3c 包装过的 io.EOF（errors.Is 命中 io.EOF，但不是裸哨兵）
+  Restore 返回 err=indexroom: read snapshot: storage layer reported end: EOF
+  errors.Is：ErrInvalidSnapshot=false、io.EOF=true、io.ErrUnexpectedEOF=false、原始存储故障=false
+  错误信息以 "indexroom: read snapshot:" 开头：true
+  链顶仍为 tip=3，完整快照没有被应用
+
+情形 4：已收到的读取故障优先于同一批字节暴露的内容问题
+  4a 同批字节既含未知字段又报告故障（字节：{"version":1,"tip":0,"blocks":[],"extra":0}）
+  Restore 返回 err=indexroom: read snapshot: simulated storage fault
+  errors.Is：ErrInvalidSnapshot=false、io.EOF=false、io.ErrUnexpectedEOF=false、原始存储故障=true
+  错误信息以 "indexroom: read snapshot:" 开头：true
+  链顶仍为 tip=3（返回读取失败，而不是 ErrInvalidSnapshot）
+  4b 同样字节在无故障读取中先暴露未知字段（故障要下一次读取才发生）
+  Restore 返回 err=indexroom: invalid snapshot: unknown field "extra"
+  errors.Is：ErrInvalidSnapshot=true、io.EOF=false、io.ErrUnexpectedEOF=false、原始存储故障=false
+  错误信息以 "indexroom: read snapshot:" 开头：false
+  含故障的后续读取实际发生次数：0（不继续读去寻找故障）；链顶仍为 tip=3
+
+情形 5：版本 1 与版本 2 遵循同一规则
+  版本 1 完整字节伴随 errors.Join(io.EOF, 故障)：err=indexroom: read snapshot: EOF | simulated storage fault；ErrInvalidSnapshot=false；tip 仍为 3
+  版本 1 同样字节以裸 io.EOF 正常结束：err=<nil>；恢复成功，tip=2
+  版本 2 完整字节伴随 errors.Join(io.EOF, 故障)：err=indexroom: read snapshot: EOF | simulated storage fault；ErrInvalidSnapshot=false；tip 仍为 3
+  版本 2 同样字节以裸 io.EOF 正常结束：err=<nil>；恢复成功，tip=2
+```
 
 ### 完整示例：整体替换、非法拒绝与游标
 
