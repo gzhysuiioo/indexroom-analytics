@@ -283,19 +283,58 @@ func validateExpectedRevision(revision int64) error {
 	return nil
 }
 
+// isDecimalIntegerToken reports whether text is written as a decimal integer:
+// an optional sign followed only by decimal digits, with no decimal point or
+// exponent. It tests the token's notation, not its value, so a token that is a
+// perfectly legal JSON number but is not written as an integer — 1.5, 1e3,
+// 18446744073709551616.0 or 18446744073709551616e-20 (the latter two even
+// evaluate below 1) — is rejected as a format problem regardless of how large
+// or small its value happens to be, rather than as an out-of-range integer.
+// The digits may still overflow the target type; magnitude is a separate check
+// done afterwards from the raw text.
+func isDecimalIntegerToken(text string) bool {
+	s := text
+	if s == "" {
+		return false
+	}
+	// JSON numbers carry at most a leading minus sign (no plus); mirror that
+	// grammar rather than strconv's looser one.
+	if s[0] == '-' {
+		s = s[1:]
+	}
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // ParseExpectedRevision converts the raw decimal text of a submitted
 // expectedRevision into an int64 that still carries the submitted value. It
 // establishes only the token's integer type: floats, strings, booleans and
 // similar text get the integer-type error, while a decimal integer is returned
-// without platform-specific narrowing. The architecture range (the 32-bit
+// without platform-specific narrowing. Token notation is checked before
+// magnitude: strconv.ParseInt range-rejects a value such as
+// 18446744073709551616.0 or 18446744073709551616e-20 (a long integer part
+// followed by a decimal point or exponent) with ErrRange even though the token
+// is not written as an integer, so such a token must be caught as a format
+// problem first and quoted as submitted, never reported as an out-of-range
+// integer or accepted after conversion. The architecture range (the 32-bit
 // upper bound in particular) is enforced afterwards by
 // validateExpectedRevision inside each Validate* method, so the long-standing
 // field order (service name, then revision, then the remaining fields) is
 // preserved. The one value category that cannot reach that stage is a
-// magnitude too large even for int64: ParseInt rejects it with ErrRange and it
-// is reported as an expectedRevision range error from its raw text rather than
-// an overflowed number.
+// magnitude too large even for int64: a pure decimal integer ParseInt rejects
+// with ErrRange is reported as an expectedRevision range error from its raw
+// text rather than an overflowed number.
 func ParseExpectedRevision(text string) (int64, error) {
+	if !isDecimalIntegerToken(text) {
+		return 0, errInvalid(fmt.Sprintf("expectedRevision must be an integer, got %s", text))
+	}
 	n, err := strconv.ParseInt(text, 10, 64)
 	if err != nil {
 		if errors.Is(err, strconv.ErrRange) {
@@ -318,15 +357,26 @@ func sequenceRangeReason(raw string) string {
 // sequence into an int64 that carries the submitted value exactly. It
 // establishes only the token's integer type and representability, mirroring
 // ParseExpectedRevision: floats, strings, booleans and similar text get the
-// integer-type error, and a magnitude too large even for int64 — such as
-// 9223372036854775808, one past the signed range — is reported from its raw
-// text as a sequence range error rather than an overflowed number. Parsing
-// the raw token also keeps a non-integer token from failing the whole item's
-// JSON decode: it arrives here as text and becomes that item's own invalid
-// result, so later items in the batch still get their per-item outcome. The
-// positive-value rule (sequence is per-instance and starts at 1) stays with
-// ValidateHealth alongside the other content checks.
+// integer-type error. Token notation is checked before magnitude, since
+// strconv.ParseInt range-rejects a value such as 18446744073709551616.0 or
+// 18446744073709551616e-20 (a long integer part followed by a decimal point
+// or exponent; the latter evaluates to less than 1) with ErrRange even though
+// the token is not written as an integer. Such a token must report the
+// sequence integer-format problem quoting the submitted text — never the
+// range problem, an out-of-range integer, or an accepted value converted from
+// its numeric meaning. A pure decimal integer with a magnitude too large even
+// for int64 — such as 9223372036854775808, one past the signed range — is
+// reported from its raw text as a sequence range error rather than an
+// overflowed number. Parsing the raw token also keeps a non-integer token
+// from failing the whole item's JSON decode: it arrives here as text and
+// becomes that item's own invalid result, so later items in the batch still
+// get their per-item outcome. The positive-value rule (sequence is per
+// instance and starts at 1) stays with ValidateHealth alongside the other
+// content checks.
 func ParseSequence(text string) (int64, error) {
+	if !isDecimalIntegerToken(text) {
+		return 0, errInvalid(fmt.Sprintf("sequence must be an integer, got %s", text))
+	}
 	n, err := strconv.ParseInt(text, 10, 64)
 	if err != nil {
 		if errors.Is(err, strconv.ErrRange) {

@@ -31,6 +31,16 @@ func TestParseExpectedRevision(t *testing.T) {
 		{"1e3", 0, "expectedRevision must be an integer, got 1e3"},
 		{`"1"`, 0, "expectedRevision must be an integer"},
 		{"true", 0, "expectedRevision must be an integer"},
+		// A decimal point or exponent makes the token a format problem no matter
+		// how long (or how small) its integer part is: ParseInt reports ErrRange
+		// for these, but they are not written as integers and must keep the
+		// integer-type reason quoting the raw text.
+		{"18446744073709551616.0", 0, "expectedRevision must be an integer, got 18446744073709551616.0"},
+		{"18446744073709551616e-20", 0, "expectedRevision must be an integer, got 18446744073709551616e-20"},
+		{"18446744073709551616E3", 0, "expectedRevision must be an integer, got 18446744073709551616E3"},
+		{"9223372036854775807.0", 0, "expectedRevision must be an integer, got 9223372036854775807.0"},
+		{"0.0", 0, "expectedRevision must be an integer, got 0.0"},
+		{"+1", 0, "expectedRevision must be an integer, got +1"},
 		// A magnitude above int64 cannot be carried numerically; the raw text is
 		// reported as an out-of-range expectedRevision, not an overflowed value.
 		{"9223372036854775808", 0, "expectedRevision must be an integer between 0 and"},

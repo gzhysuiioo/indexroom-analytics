@@ -41,10 +41,19 @@ func TestParseSequence(t *testing.T) {
 		{"1e3", 0, "sequence must be an integer, got 1e3"},
 		{`"1"`, 0, "sequence must be an integer"},
 		{"true", 0, "sequence must be an integer"},
-		// 9223372036854775808 is one past the signed 64-bit maximum and cannot
-		// be carried numerically; the raw text is reported as an
-		// out-of-range sequence rather than an overflowed value that could
-		// narrow to a legal sequence.
+		// A decimal point or exponent makes the token a format problem no matter
+		// how long or small its integer part is — even when ParseInt returns
+		// ErrRange for the long integer part, and even when the value converts
+		// to less than 1. The raw text is quoted; it is never range-rejected or
+		// accepted by conversion.
+		{"18446744073709551616.0", 0, "sequence must be an integer, got 18446744073709551616.0"},
+		{"18446744073709551616e-20", 0, "sequence must be an integer, got 18446744073709551616e-20"},
+		{"18446744073709551616E3", 0, "sequence must be an integer, got 18446744073709551616E3"},
+		{"9223372036854775807.0", 0, "sequence must be an integer, got 9223372036854775807.0"},
+		{"0.0", 0, "sequence must be an integer, got 0.0"},
+		// 9223372036854775808 is one past the signed 64-bit maximum but is written
+		// as a decimal integer: the magnitude, not the notation, is wrong, so it
+		// keeps the range reason.
 		{"9223372036854775808", 0, "sequence must be an integer between 1 and"},
 		{"99999999999999999999999999", 0, "sequence must be an integer between 1 and"},
 	}

@@ -66,11 +66,17 @@ Field validation precedes the revision check: a blank `service` or a
 missing `expectedRevision` is `invalid`, and so is a value that is not an
 integer (`1.5`, a string, `true`) or that falls outside the build's integer
 range — `0..2147483647` on a 32-bit build, `0..9223372036854775807` on a
-64-bit build. A negative number is therefore invalid too, and the check uses
-the submitted value itself, so on a 32-bit build `4294967297` or
-`-4294967295` (both of which truncate to `1` when narrowed) is still rejected
-as out of range rather than matching revision 1; the reason names the
-`expectedRevision` range. `2147483648` stays a valid integer on a 64-bit
+64-bit build. The integer test is on the token's notation, not its converted
+value: any JSON number containing a decimal point or exponent — such as
+`18446744073709551616.0` or `18446744073709551616e-20` (the latter evaluates
+to less than 1), both valid JSON numbers — is the "must be an integer" format
+error quoting the submitted text exactly, no matter how large its integer part
+or whether it happens to equal an integer; only a token written entirely as a
+decimal integer can be out of range. A negative number is therefore invalid
+too, and the check uses the submitted value itself, so on a 32-bit build
+`4294967297` or `-4294967295` (both of which truncate to `1` when narrowed) is
+still rejected as out of range rather than matching revision 1; the reason
+names the `expectedRevision` range. `2147483648` stays a valid integer on a 64-bit
 build and yields a normal conflict. Then a revision mismatch is `conflict`
 (an unknown service is at revision 0), an unknown service with a matching
 revision is `not_found`, and a service with no healthy instance is
@@ -148,7 +154,7 @@ and the rotation position, and later requests in the batch still run.
 `health` 请求在 `register` 命令的同一批 `requests` 中记录一条离线健康观察，不做任何网络探测。规则如下：
 
 - `expectedRevision` 必须等于该服务当前的注册修订号；健康上报**不增加**修订号，上报前后修订号不变。
-- `sequence` 是**单个实例**的正整数序号，每个实例独立计数，不是整批请求共用的计数。合法范围为 `1..9223372036854775807`（有符号 64 位整数），按提交的原始数值判定：`1.5`、字符串、`true` 等非整数令牌，以及超出 int64 范围的整数（如 `9223372036854775808`）都返回 `invalid`，原因指出 `sequence` 的数值问题而不是让整条请求变成解码错误；该单项失败不影响批次后续请求的逐项结果。即使在 2^53 之上，相邻序号（如 `9007199254740992` 与 `9007199254740993`）仍被精确区分，输出的序号与提交值逐位一致，不做浮点舍入。
+- `sequence` 是**单个实例**的正整数序号，每个实例独立计数，不是整批请求共用的计数。合法范围为 `1..9223372036854775807`（有符号 64 位整数），按提交的原始文本判定：`1.5`、字符串、`true` 等非整数令牌，以及超出 int64 范围的整数（如 `9223372036854775808`）都返回 `invalid`，原因指出 `sequence` 的数值问题而不是让整条请求变成解码错误；该单项失败不影响批次后续请求的逐项结果。判断针对令牌写法而非换算后的数值：只要数字包含小数点或指数部分，无论整数部分多长、数值大小，或是否恰好等于某个整数，都是“必须是整数”的格式错误并原样引用提交文本——`18446744073709551616.0` 与 `18446744073709551616e-20`（后者实际数值小于 1）都不能被当成越界整数，也不能换算后接受；只有完整写成十进制整数的令牌才可能因数值超范围而报范围错误。即使在 2^53 之上，相邻序号（如 `9007199254740992` 与 `9007199254740993`）仍被精确区分，输出的序号与提交值逐位一致，不做浮点舍入。
 - 序号大于当前记录时更新健康状态；小于当前记录时返回 `stale`；等于当前记录时，只有健康状态和整理后的原因都相同才成功且不产生变更，否则返回 `conflict`。
 - 实例刚注册时健康状态为 `unknown`、序号为 0、无原因。
 - 不健康观察（`"healthy":false`）必须提供 `reason`，且去除两端空白后仍非空；健康观察（`"healthy":true`）会清空原因。原因先去除两端空白再存储，整理后的结果参与相同序号的重复判断。
@@ -212,7 +218,7 @@ echo '{"requests":[
 ### 请求字段与校验规则
 
 - `service`：服务名，去除两端空白后使用；整理后为空返回 `invalid`。
-- `expectedRevision`：必填的整数，合法范围为 `0..2147483647`（32 位程序）或 `0..9223372036854775807`（64 位程序），任何负数或超范围整数都按**提交的原始数值**判定为 `invalid`，原因指出 `expectedRevision` 的范围；因此 32 位程序提交 `4294967297`（截断后恰为 1）或 `-4294967295` 不会被当成 1，而 64 位程序中的 `2147483648` 仍是合法整数。新服务必须提交 `0`，创建成功后修订号为 `1`；已有服务必须提交该服务**当前**修订号，提交其他在合法范围内的值（包括对尚不存在的服务提交非 0 值）返回 `conflict`。
+- `expectedRevision`：必填的整数，合法范围为 `0..2147483647`（32 位程序）或 `0..9223372036854775807`（64 位程序），任何负数或超范围整数都按**提交的原始数值**判定为 `invalid`，原因指出 `expectedRevision` 的范围；因此 32 位程序提交 `4294967297`（截断后恰为 1）或 `-4294967295` 不会被当成 1，而 64 位程序中的 `2147483648` 仍是合法整数。整数与否按**令牌写法**判断，不看换算结果：数字只要包含小数点或指数部分（如 `1.5`、`18446744073709551616.0`、`18446744073709551616e-20`——它们虽是合法 JSON 数字，指数写法实际值甚至小于 1），一律返回该字段“必须是整数”的格式错误并原样保留提交文本，既不报整数范围错误，也不换算后接受；只有完整采用十进制整数写法而数值超出范围时才给范围错误。新服务必须提交 `0`，创建成功后修订号为 `1`；已有服务必须提交该服务**当前**修订号，提交其他在合法范围内的值（包括对尚不存在的服务提交非 0 值）返回 `conflict`。
 - `instances`：实例对象数组，每项含 `id` 与 `address`。注册提交的是**完整实例列表**：本次列表中未包含的已有实例会被移除。
   - 实例 `id` 先去除两端空白；整理后为空、或同一服务内整理后的标识重复，都返回 `invalid`。
   - `address` 先去除两端空白，之后必须是带端口的 `host:port`：主机支持域名、IPv4 和带方括号的 IPv6（如 `h1:8080`、`10.0.0.2:8081`、`[2001:db8::1]:9000`，裸 IPv6 必须加方括号）；端口必须是 1 到 65535 的十进制整数；地址内部不能含空白或控制字符。
