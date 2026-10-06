@@ -283,6 +283,37 @@ func ParseExpectedRevision(text string) (int64, error) {
 	return n, nil
 }
 
+// sequenceRangeReason is the invalid reason when a submitted sequence cannot
+// be carried by int64. raw carries the submitted digits so the message reports
+// the actual value even when it cannot be represented, which matters for the
+// boundary 9223372036854775808 (one past the maximum) and larger magnitudes.
+func sequenceRangeReason(raw string) string {
+	return fmt.Sprintf("sequence must be an integer between 1 and %d, got %s", int64(math.MaxInt64), raw)
+}
+
+// ParseSequence converts the raw decimal text of a health observation's
+// sequence into an int64 that carries the submitted value exactly. It
+// establishes only the token's integer type and representability, mirroring
+// ParseExpectedRevision: floats, strings, booleans and similar text get the
+// integer-type error, and a magnitude too large even for int64 — such as
+// 9223372036854775808, one past the signed range — is reported from its raw
+// text as a sequence range error rather than an overflowed number. Parsing
+// the raw token also keeps a non-integer token from failing the whole item's
+// JSON decode: it arrives here as text and becomes that item's own invalid
+// result, so later items in the batch still get their per-item outcome. The
+// positive-value rule (sequence is per-instance and starts at 1) stays with
+// ValidateHealth alongside the other content checks.
+func ParseSequence(text string) (int64, error) {
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, errInvalid(sequenceRangeReason(text))
+		}
+		return 0, errInvalid(fmt.Sprintf("sequence must be an integer, got %s", text))
+	}
+	return n, nil
+}
+
 // revisionFailure describes the common revision-gate result shared by health
 // observations and selections. It carries no operation-specific fields: each
 // operation maps it onto its own result so stale health sequences, missing

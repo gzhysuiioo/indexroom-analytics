@@ -262,6 +262,25 @@ func (p *registerProcessor) parseRevision(service string, raw json.RawMessage) (
 	return revision, true
 }
 
+// parseSequence decodes the raw sequence token for one health observation. A
+// decimal integer is returned as int64 carrying the submitted value exactly;
+// a non-integer token (a float, string or boolean) and a magnitude outside
+// the signed int64 range — including 9223372036854775808, one past the
+// maximum — become that item's own invalid result with a reason naming the
+// sequence problem, instead of failing the whole item's JSON decode with a
+// Go-level unmarshal error. Reading the token raw is what keeps the batch
+// per-item: one out-of-range sequence neither aborts the batch nor steals the
+// outcomes of later items. The positive-value rule is enforced afterwards by
+// the registry's ValidateHealth, alongside its other content checks.
+func (p *registerProcessor) parseSequence(service string, raw json.RawMessage) (int64, bool) {
+	sequence, err := indexroom.ParseSequence(string(raw))
+	if err != nil {
+		p.invalid(service, err.Error())
+		return 0, false
+	}
+	return sequence, true
+}
+
 // sessionRequestInput is the decoded content shared by select and
 // release_session requests: the trimmed service name, the parsed
 // expectedRevision (still int64, range-checked later by the registry before it
@@ -416,7 +435,7 @@ func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 		Service    string          `json:"service"`
 		InstanceID string          `json:"instanceId"`
 		Revision   json.RawMessage `json:"expectedRevision"`
-		Sequence   *int64          `json:"sequence"`
+		Sequence   json.RawMessage `json:"sequence"`
 		Healthy    *bool           `json:"healthy"`
 		Reason     *string         `json:"reason"`
 	}
@@ -430,7 +449,7 @@ func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 		p.invalid(service, "expectedRevision is required and must be a non-negative integer")
 		return
 	}
-	if req.Sequence == nil {
+	if len(req.Sequence) == 0 || strings.TrimSpace(string(req.Sequence)) == "null" {
 		p.invalid(service, "sequence is required and must be a positive integer")
 		return
 	}
@@ -443,13 +462,19 @@ func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 		reason = *req.Reason
 	}
 
-	// Parse the raw token (integer type); ValidateHealth then range-checks the
-	// int64 against the architecture before narrowing it to int.
+	// Parse the raw tokens (integer type); ValidateHealth then range-checks
+	// the revision against the architecture before narrowing it to int, while
+	// a non-integer or out-of-range sequence becomes this item's own invalid
+	// result carrying a sequence-specific reason rather than a decode error.
 	revision, ok := p.parseRevision(service, req.Revision)
 	if !ok {
 		return
 	}
-	update, err := p.registry.ValidateHealth(service, req.InstanceID, revision, *req.Sequence, *req.Healthy, reason)
+	sequence, ok := p.parseSequence(service, req.Sequence)
+	if !ok {
+		return
+	}
+	update, err := p.registry.ValidateHealth(service, req.InstanceID, revision, sequence, *req.Healthy, reason)
 	if err != nil {
 		p.invalid(service, err.Error())
 		return
