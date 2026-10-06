@@ -1036,11 +1036,22 @@ func allDigits(s string) bool {
 }
 
 // isDomainName validates a dotted hostname with alphanumeric/hyphen labels.
+// A host may end in exactly one dot — the root label of a fully qualified
+// domain name (e.g. "api.example."). That dot is notation rather than body:
+// it does not count toward the 253-character body limit and must not be read
+// as an empty label. An empty body ("."), a doubled dot inside the body, or
+// more than one trailing dot leaves an empty label after the single root dot
+// is peeled off and is rejected; every remaining label keeps the usual
+// character, length and hyphen-position rules.
 func isDomainName(host string) bool {
-	if len(host) > 253 {
+	body := host
+	if strings.HasSuffix(body, ".") {
+		body = body[:len(body)-1]
+	}
+	if body == "" || len(body) > 253 {
 		return false
 	}
-	for _, label := range strings.Split(host, ".") {
+	for _, label := range strings.Split(body, ".") {
 		n := len(label)
 		if n == 0 || n > 63 {
 			return false
