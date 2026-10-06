@@ -57,6 +57,23 @@ func New() *Index {
 // once it runs, must observe the complete new chain.
 var reorgAppliedHookLocked func(newTip int64)
 
+// appendStoredHookLocked is a test-only rendezvous invoked from Append after a
+// candidate extending the current tip has been validated and fully stored,
+// while index.mu is still held and before the successful call returns. It is
+// nil in production; interleaving regression tests park an accepted append
+// here with h4 already on the old tip, so a Reorg issued at that instant is
+// forced to wait and, once it takes the lock, must discard the just-appended
+// height along with the rest of the old suffix.
+var appendStoredHookLocked func(newTip int64)
+
+// appendRejectedHookLocked is a test-only rendezvous invoked from Append after
+// a candidate has been rejected as ingestion (the first-block rule aside),
+// while index.mu is still held and before the error is returned. It is nil in
+// production; interleaving regression tests park a stale-parent append here
+// with the new main chain already in effect, so the rejection result can be
+// inspected while a concurrent Reorg call is still in flight.
+var appendRejectedHookLocked func(height int64)
+
 // Append accepts a block only when it extends the current tip, keeping the
 // chain linear. Re-submitting a block identical to one already on the main
 // chain is a successful no-op. A block whose hash, parent, or any transaction
@@ -88,23 +105,40 @@ func (index *Index) appendLocked(block Block) error {
 		index.storeLocked(block)
 		return nil
 	}
+	// Every later rejection goes through rejectAppendLocked so interleaving
+	// tests can park the rejecting call before its error returns; with no hook
+	// installed it is just the ordinary ingestion error.
 	if old, exists := index.Blocks[block.Height]; exists {
 		if sameBlock(old, block) {
 			return nil
 		}
-		return errInvalid("height already indexed with different content")
+		return index.rejectAppendLocked(block, "height already indexed with different content")
 	}
 	if block.Height != index.Tip+1 {
-		return errInvalid("block height must extend the current tip")
+		return index.rejectAppendLocked(block, "block height must extend the current tip")
 	}
 	if block.Parent != index.Blocks[index.Tip].Hash {
-		return errInvalid("parent does not match the current tip")
+		return index.rejectAppendLocked(block, "parent does not match the current tip")
 	}
 	if _, exists := index.ByHash[block.Hash]; exists {
-		return errInvalid("hash already indexed at another height")
+		return index.rejectAppendLocked(block, "hash already indexed at another height")
 	}
 	index.storeLocked(block)
+	if appendStoredHookLocked != nil {
+		appendStoredHookLocked(index.Tip)
+	}
 	return nil
+}
+
+// rejectAppendLocked reports an ingestion rejection, firing the test-only
+// rendezvous while index.mu is still held first. The returned value is an
+// ordinary ingestion error: it never satisfies errors.Is for
+// ErrInvalidArgument, which is reserved for query-argument problems.
+func (index *Index) rejectAppendLocked(block Block, reason string) error {
+	if appendRejectedHookLocked != nil {
+		appendRejectedHookLocked(block.Height)
+	}
+	return errInvalid(reason)
 }
 
 // Reorg replaces the tip range with an alternate branch and reports the
