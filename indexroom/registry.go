@@ -579,6 +579,44 @@ func (r *Registry) ApplyHealth(upd HealthUpdate) HealthOutcome {
 	}
 }
 
+// validateSessionRequest is the content validation shared by select and
+// release_session. It trims the service name and range-checks the raw
+// expectedRevision before it is narrowed to int, then normalizes the session
+// key:
+//
+//   - a nil key means the field was absent: an ordinary rotating selection is
+//     legal for select (keyRequired == false), while release_session rejects
+//     it with missingKeyReason because its key is mandatory;
+//   - a present key is trimmed; keys equal after trimming name one session
+//     within a service, and a blank-after-trim key is invalid with a reason
+//     naming the sessionKey problem.
+//
+// The order mirrors every other request kind — service name, then the
+// revision range, then the remaining content field — so content validity is
+// fully established before any revision comparison against the registry.
+// Null and non-string key tokens are a JSON concern handled by callers before
+// this helper runs and never arrive here as a *string.
+func validateSessionRequest(service string, revision int64, sessionKey *string, keyRequired bool, missingKeyReason string) (name string, rev int, key string, err error) {
+	name, err = validateServiceName(service)
+	if err != nil {
+		return "", 0, "", err
+	}
+	if err = validateExpectedRevision(revision); err != nil {
+		return "", 0, "", err
+	}
+	if sessionKey == nil {
+		if keyRequired {
+			return "", 0, "", errInvalid(missingKeyReason)
+		}
+		return name, int(revision), "", nil
+	}
+	key = strings.TrimSpace(*sessionKey)
+	if key == "" {
+		return "", 0, "", errInvalid("sessionKey must not be empty")
+	}
+	return name, int(revision), key, nil
+}
+
 // ValidateSelection trims and validates one select request without touching
 // the registry. Content validity is established before any revision check.
 func (r *Registry) ValidateSelection(service string, revision int64) (Selection, error) {
@@ -592,21 +630,11 @@ func (r *Registry) ValidateSelection(service string, revision int64) (Selection,
 // expectedRevision, range-checked before it is narrowed to int. Content
 // validity is established before any revision check.
 func (r *Registry) ValidateSelectionWithSession(service string, revision int64, sessionKey *string) (Selection, error) {
-	name, err := validateServiceName(service)
+	name, rev, key, err := validateSessionRequest(service, revision, sessionKey, false, "")
 	if err != nil {
 		return Selection{}, err
 	}
-	if err := validateExpectedRevision(revision); err != nil {
-		return Selection{}, err
-	}
-	key := ""
-	if sessionKey != nil {
-		key = strings.TrimSpace(*sessionKey)
-		if key == "" {
-			return Selection{}, errInvalid("sessionKey must not be empty")
-		}
-	}
-	return Selection{Service: name, Revision: int(revision), SessionKey: key}, nil
+	return Selection{Service: name, Revision: rev, SessionKey: key}, nil
 }
 
 // ValidateSessionRelease trims and validates one release_session request
@@ -618,21 +646,12 @@ func (r *Registry) ValidateSelectionWithSession(service string, revision int64, 
 // revision range, then the key — and content validity is fully established
 // before any revision comparison against the registry.
 func (r *Registry) ValidateSessionRelease(service string, revision int64, sessionKey *string) (SessionRelease, error) {
-	name, err := validateServiceName(service)
+	const missingKeyReason = "sessionKey is required and must be a non-empty string"
+	name, rev, key, err := validateSessionRequest(service, revision, sessionKey, true, missingKeyReason)
 	if err != nil {
 		return SessionRelease{}, err
 	}
-	if err := validateExpectedRevision(revision); err != nil {
-		return SessionRelease{}, err
-	}
-	if sessionKey == nil {
-		return SessionRelease{}, errInvalid("sessionKey is required and must be a non-empty string")
-	}
-	key := strings.TrimSpace(*sessionKey)
-	if key == "" {
-		return SessionRelease{}, errInvalid("sessionKey must not be empty")
-	}
-	return SessionRelease{Service: name, Revision: int(revision), SessionKey: key}, nil
+	return SessionRelease{Service: name, Revision: rev, SessionKey: key}, nil
 }
 
 // Select chooses one healthy instance for the service once the shared revision
