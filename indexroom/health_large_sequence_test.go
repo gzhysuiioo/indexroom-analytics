@@ -41,6 +41,19 @@ func TestParseSequence(t *testing.T) {
 		{"1e3", 0, "sequence must be an integer, got 1e3"},
 		{`"1"`, 0, "sequence must be an integer"},
 		{"true", 0, "sequence must be an integer"},
+		// A decimal point or exponent makes the token non-integer notation
+		// regardless of its numeric value: an integer part too long for int64
+		// (18446744073709551616 is 2^64) is a format problem rather than an
+		// out-of-range integer, and an exponent whose value is below 1 is not
+		// converted to zero (which would read as "not positive") or accepted.
+		// Both quote the number exactly as submitted.
+		{"18446744073709551616.0", 0, "sequence must be an integer, got 18446744073709551616.0"},
+		{"18446744073709551616e-20", 0, "sequence must be an integer, got 18446744073709551616e-20"},
+		{"-18446744073709551616e-20", 0, "sequence must be an integer, got -18446744073709551616e-20"},
+		{"18446744073709551616E0", 0, "sequence must be an integer, got 18446744073709551616E0"},
+		// Exponent notation equalling the maximum legal sequence is still the
+		// wrong notation and must not be accepted as that integer.
+		{"9223372036854775807e0", 0, "sequence must be an integer, got 9223372036854775807e0"},
 		// 9223372036854775808 is one past the signed 64-bit maximum and cannot
 		// be carried numerically; the raw text is reported as an
 		// out-of-range sequence rather than an overflowed value that could

@@ -2,7 +2,6 @@
 package indexroom
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -283,6 +282,53 @@ func validateExpectedRevision(revision int64) error {
 	return nil
 }
 
+// isDecimalIntegerText reports whether text is written as a decimal integer:
+// an optional sign followed by one or more decimal digits, with no decimal
+// point, exponent part or any other character. JSON number tokens are the
+// expected input (whitespace never appears inside a raw token), but the check
+// does not assume JSON, so a quoted string or a boolean literal fails it too.
+//
+// The shape must be established before strconv.ParseInt: ParseInt reports
+// ErrRange as soon as its digit run overflows, which happens before it looks
+// at a trailing '.' or exponent marker. A token such as
+// 18446744073709551616.0 or 18446744073709551616e-20 would therefore surface
+// as a range error even though it is a non-integer notation regardless of
+// its numeric value; it must be reported as an integer-format problem instead.
+func isDecimalIntegerText(text string) bool {
+	i := 0
+	if len(text) > 0 && (text[0] == '+' || text[0] == '-') {
+		i = 1
+	}
+	if i == len(text) {
+		return false
+	}
+	for ; i < len(text); i++ {
+		if text[i] < '0' || text[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parseIntegerToken converts the raw text of a field that must be written as a
+// decimal integer, establishing notation first and int64 representability
+// second. A non-integer token — a number with a decimal point or exponent
+// part (whatever its value, including one that happens to equal an integer),
+// a string, a boolean or any other text — fails with the field's integer-type
+// reason, quoting the token exactly as submitted. Only a token actually
+// written in integer notation whose magnitude cannot be carried by int64 gets
+// the range reason; the callers supply both reason builders.
+func parseIntegerToken(text, typeReason, rangeReason string) (int64, error) {
+	if !isDecimalIntegerText(text) {
+		return 0, errInvalid(typeReason)
+	}
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return 0, errInvalid(rangeReason)
+	}
+	return n, nil
+}
+
 // ParseExpectedRevision converts the raw decimal text of a submitted
 // expectedRevision into an int64 that still carries the submitted value. It
 // establishes only the token's integer type: floats, strings, booleans and
@@ -291,19 +337,19 @@ func validateExpectedRevision(revision int64) error {
 // upper bound in particular) is enforced afterwards by
 // validateExpectedRevision inside each Validate* method, so the long-standing
 // field order (service name, then revision, then the remaining fields) is
-// preserved. The one value category that cannot reach that stage is a
-// magnitude too large even for int64: ParseInt rejects it with ErrRange and it
-// is reported as an expectedRevision range error from its raw text rather than
-// an overflowed number.
+// preserved. A token carrying a decimal point or exponent is a notation
+// problem even when its integer part overflows (18446744073709551616.0 parses
+// as a JSON number but is not integer notation) or when its value is tiny
+// (18446744073709551616e-20 is below 1): neither becomes a range rejection or
+// an accepted conversion. The one value category that gets the range reason is
+// an integer-notation magnitude too large even for int64, reported from its
+// raw text rather than as an overflowed number.
 func ParseExpectedRevision(text string) (int64, error) {
-	n, err := strconv.ParseInt(text, 10, 64)
-	if err != nil {
-		if errors.Is(err, strconv.ErrRange) {
-			return 0, errInvalid(expectedRevisionRangeReason(text))
-		}
-		return 0, errInvalid(fmt.Sprintf("expectedRevision must be an integer, got %s", text))
-	}
-	return n, nil
+	return parseIntegerToken(
+		text,
+		fmt.Sprintf("expectedRevision must be an integer, got %s", text),
+		expectedRevisionRangeReason(text),
+	)
 }
 
 // sequenceRangeReason is the invalid reason when a submitted sequence cannot
@@ -317,24 +363,25 @@ func sequenceRangeReason(raw string) string {
 // ParseSequence converts the raw decimal text of a health observation's
 // sequence into an int64 that carries the submitted value exactly. It
 // establishes only the token's integer type and representability, mirroring
-// ParseExpectedRevision: floats, strings, booleans and similar text get the
-// integer-type error, and a magnitude too large even for int64 — such as
-// 9223372036854775808, one past the signed range — is reported from its raw
-// text as a sequence range error rather than an overflowed number. Parsing
-// the raw token also keeps a non-integer token from failing the whole item's
-// JSON decode: it arrives here as text and becomes that item's own invalid
-// result, so later items in the batch still get their per-item outcome. The
-// positive-value rule (sequence is per-instance and starts at 1) stays with
-// ValidateHealth alongside the other content checks.
+// ParseExpectedRevision: a number with a decimal point or exponent part is a
+// notation problem whatever its value — 18446744073709551616.0 has an
+// overflowed integer part and 18446744073709551616e-20 is below 1, but both
+// are "sequence must be an integer" with the submitted text, never a range
+// rejection or an accepted conversion — and strings, booleans and similar
+// text get the same integer-type error. Only integer notation with a
+// magnitude too large even for int64 — such as 9223372036854775808, one past
+// the signed range — is reported from its raw text as a sequence range error.
+// Parsing the raw token also keeps a non-integer token from failing the whole
+// item's JSON decode: it arrives here as text and becomes that item's own
+// invalid result, so later items in the batch still get their per-item
+// outcome. The positive-value rule (sequence is per-instance and starts at 1)
+// stays with ValidateHealth alongside the other content checks.
 func ParseSequence(text string) (int64, error) {
-	n, err := strconv.ParseInt(text, 10, 64)
-	if err != nil {
-		if errors.Is(err, strconv.ErrRange) {
-			return 0, errInvalid(sequenceRangeReason(text))
-		}
-		return 0, errInvalid(fmt.Sprintf("sequence must be an integer, got %s", text))
-	}
-	return n, nil
+	return parseIntegerToken(
+		text,
+		fmt.Sprintf("sequence must be an integer, got %s", text),
+		sequenceRangeReason(text),
+	)
 }
 
 // revisionFailure describes the common revision-gate result shared by health

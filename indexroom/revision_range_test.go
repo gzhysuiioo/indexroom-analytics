@@ -31,8 +31,20 @@ func TestParseExpectedRevision(t *testing.T) {
 		{"1e3", 0, "expectedRevision must be an integer, got 1e3"},
 		{`"1"`, 0, "expectedRevision must be an integer"},
 		{"true", 0, "expectedRevision must be an integer"},
-		// A magnitude above int64 cannot be carried numerically; the raw text is
-		// reported as an out-of-range expectedRevision, not an overflowed value.
+		// A decimal point or exponent makes the token non-integer notation
+		// regardless of its value: even an integer part too long for int64
+		// (18446744073709551616 is 2^64) and an exponent whose value is below 1
+		// stay an integer-format rejection with the submitted text, never a
+		// range error or an accepted conversion.
+		{"18446744073709551616.0", 0, "expectedRevision must be an integer, got 18446744073709551616.0"},
+		{"18446744073709551616e-20", 0, "expectedRevision must be an integer, got 18446744073709551616e-20"},
+		{"-18446744073709551616e-20", 0, "expectedRevision must be an integer, got -18446744073709551616e-20"},
+		{"18446744073709551616E0", 0, "expectedRevision must be an integer, got 18446744073709551616E0"},
+		// Exponent notation that happens to equal an in-range integer is still
+		// the wrong notation; it must not parse to that integer.
+		{"9223372036854775807e0", 0, "expectedRevision must be an integer, got 9223372036854775807e0"},
+		// Pure integer notation above int64 keeps the range reason: the digits
+		// carry no decimal point or exponent, so the value is simply too large.
 		{"9223372036854775808", 0, "expectedRevision must be an integer between 0 and"},
 		{"-9223372036854775809", 0, "expectedRevision must be an integer between 0 and"},
 	}
