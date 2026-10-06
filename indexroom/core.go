@@ -57,6 +57,17 @@ func New() *Index {
 // once it runs, must observe the complete new chain.
 var reorgAppliedHookLocked func(newTip int64)
 
+// appendStoredHookLocked is a test-only rendezvous invoked from appendLocked
+// right after an Append has fully recorded its accepted block — the block is
+// in Blocks and ByHash and Tip has advanced — while index.mu is still held
+// and before the call returns. It fires for the Append path only, never for
+// stores performed inside Reorg. It is nil in production; Append/Reorg
+// interleaving tests park a successful append here so the block is committed
+// but the call has not returned, forcing a concurrent Reorg to acquire the
+// lock against exactly that intermediate state instead of relying on
+// scheduling luck.
+var appendStoredHookLocked func(height int64)
+
 // Append accepts a block only when it extends the current tip, keeping the
 // chain linear. Re-submitting a block identical to one already on the main
 // chain is a successful no-op. A block whose hash, parent, or any transaction
@@ -86,6 +97,9 @@ func (index *Index) appendLocked(block Block) error {
 			return errInvalid("first block must be at height 1")
 		}
 		index.storeLocked(block)
+		if appendStoredHookLocked != nil {
+			appendStoredHookLocked(block.Height)
+		}
 		return nil
 	}
 	if old, exists := index.Blocks[block.Height]; exists {
@@ -104,6 +118,9 @@ func (index *Index) appendLocked(block Block) error {
 		return errInvalid("hash already indexed at another height")
 	}
 	index.storeLocked(block)
+	if appendStoredHookLocked != nil {
+		appendStoredHookLocked(block.Height)
+	}
 	return nil
 }
 
