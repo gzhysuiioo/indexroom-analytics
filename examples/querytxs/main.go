@@ -1,5 +1,6 @@
 // 分页交易查询（Index.QueryTxs）完整示例：第一页、继续翻页、范围固定、
-// 筛选语义、空页、倒序读取、ErrInvalidArgument 与 ErrQueryChanged 的处理。
+// 筛选语义、空页、倒序读取、时间窗口筛选、ErrInvalidArgument 与
+// ErrQueryChanged 的处理。
 //
 // 运行：go run ./examples/querytxs
 package main
@@ -16,6 +17,9 @@ func mustAppend(index *indexroom.Index, block indexroom.Block) {
 		panic(err)
 	}
 }
+
+// unix 返回指向给定 Unix 秒的指针，用于设置区块时间或时间窗口边界。
+func unix(sec int64) *int64 { return &sec }
 
 func printPage(title string, page indexroom.TxPage) {
 	fmt.Println(title + "：")
@@ -180,6 +184,125 @@ func main() {
 	printPage("再次从空游标重新开始", restartTip)
 
 	demonstrateDescending()
+	demonstrateTimeWindow()
+}
+
+// demonstrateTimeWindow 在独立索引上展示可选区块时间窗口：时间筛选与高度范围、
+// 交易标识筛选共同生效；次序仍由高度与块内位置决定；缺失时间不命中、真实零秒
+// 按窗口判断；续查必须沿用同一窗口，改变启用状态或任一边界都是
+// ErrInvalidArgument；固定范围内原本因时间未命中的区块变化仍是 ErrQueryChanged。
+func demonstrateTimeWindow() {
+	fmt.Println("---- 时间窗口筛选（TimeStart/TimeEnd: [Start, End)）----")
+	// 规格示例：高度 1 至 4 的时间依次为 105、缺失、100、110，交易依次为
+	// [a,b,a]、[a]、[a]、[a]。
+	index := indexroom.New()
+	mustAppend(index, indexroom.Block{Height: 1, Hash: "w1", Parent: "genesis", Txs: []string{"a", "b", "a"}, Time: unix(105)})
+	mustAppend(index, indexroom.Block{Height: 2, Hash: "w2", Parent: "w1", Txs: []string{"a"}})
+	mustAppend(index, indexroom.Block{Height: 3, Hash: "w3", Parent: "w2", Txs: []string{"a"}, Time: unix(100)})
+	mustAppend(index, indexroom.Block{Height: 4, Hash: "w4", Parent: "w3", Txs: []string{"a"}, Time: unix(110)})
+
+	// 启用窗口：TimeStart 与 TimeEnd 同时给出，含起点、排除终点 [100,110)。
+	// 高度 2 没有时间不命中；高度 4 时间正好等于终点 110 被排除。
+	// 两个字段都留 nil 表示不启用筛选，这与起点恰好为零的窗口不同。
+	query := indexroom.TxQuery{
+		TxIDs: []string{"a"}, TimeStart: unix(100), TimeEnd: unix(110), PageSize: 2,
+	}
+	page1, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("窗口 [100,110) 筛选 a，每页 2 条：第1页", page1)
+
+	// 继续翻页：是否启用窗口及窗口本身必须与第一页一致；PageSize 仍可调整。
+	query.Cursor = page1.NextCursor
+	query.PageSize = 10
+	page2, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("同窗口继续（本页改每页 10 条）", page2)
+	fmt.Println("  两页 TotalMatches 都是 3（高度1两次、高度3一次）、MatchedBlocks 都是 2、ToHeight 仍是 4")
+	fmt.Println("  次序只按高度与块内位置：高度1时间105 仍排在高度3时间100 之前，没有改成按时间排序")
+	fmt.Println()
+
+	// 真实零秒是有效时间，缺失时间不是：窗口 [0,1) 只保留高度 1 那块
+	// 真实时间为零的区块。
+	zeroIndex := indexroom.New()
+	mustAppend(zeroIndex, indexroom.Block{Height: 1, Hash: "z1", Parent: "genesis", Txs: []string{"a"}, Time: unix(0)})
+	mustAppend(zeroIndex, indexroom.Block{Height: 2, Hash: "z2", Parent: "z1", Txs: []string{"a"}})
+	zeroWin, err := zeroIndex.QueryTxs(indexroom.TxQuery{TimeStart: unix(0), TimeEnd: unix(1)})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("窗口 [0,1)：命中 %d 条（真实零秒命中，缺失时间不命中）；", zeroWin.TotalMatches)
+	disabled, err := zeroIndex.QueryTxs(indexroom.TxQuery{})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("不启用窗口命中 %d 条（缺失时间也保留）\n", disabled.TotalMatches)
+
+	// 合法窗口没有命中时仍是成功的空页，没有后续游标。
+	empty, err := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, TimeStart: unix(1000), TimeEnd: unix(2000)})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("窗口 [1000,2000) 无命中：err=%v 命中=%d 有后续游标=%v\n\n",
+		err, len(empty.Hits), empty.NextCursor != "")
+
+	// 非法窗口：只给一个边界、边界为负、起点不小于终点，都是
+	// ErrInvalidArgument，且没有可用页结果。
+	invalid := []struct {
+		name  string
+		query indexroom.TxQuery
+	}{
+		{"只给起点", indexroom.TxQuery{TimeStart: unix(100)}},
+		{"只给终点", indexroom.TxQuery{TimeEnd: unix(110)}},
+		{"负起点", indexroom.TxQuery{TimeStart: unix(-1), TimeEnd: unix(110)}},
+		{"负终点", indexroom.TxQuery{TimeStart: unix(0), TimeEnd: unix(-1)}},
+		{"起点不小于终点", indexroom.TxQuery{TimeStart: unix(110), TimeEnd: unix(110)}},
+	}
+	for _, tc := range invalid {
+		page, err := index.QueryTxs(tc.query)
+		fmt.Printf("%s：ErrInvalidArgument=%v 可用命中数=%d\n",
+			tc.name, errors.Is(err, indexroom.ErrInvalidArgument), len(page.Hits))
+	}
+	fmt.Println()
+
+	// 续查改变窗口（含从启用改为不启用）返回 ErrInvalidArgument，没有可用页；
+	// 要改窗口必须从空游标重新查询。
+	first, err := index.QueryTxs(indexroom.TxQuery{
+		TxIDs: []string{"a"}, TimeStart: unix(100), TimeEnd: unix(110), PageSize: 1,
+	})
+	if err != nil {
+		panic(err)
+	}
+	changedEnd, err := index.QueryTxs(indexroom.TxQuery{
+		TxIDs: []string{"a"}, TimeStart: unix(100), TimeEnd: unix(111),
+		PageSize: 1, Cursor: first.NextCursor,
+	})
+	fmt.Printf("续查改终点：ErrInvalidArgument=%v 可用命中数=%d\n",
+		errors.Is(err, indexroom.ErrInvalidArgument), len(changedEnd.Hits))
+	disabledCont, err := index.QueryTxs(indexroom.TxQuery{
+		TxIDs: []string{"a"}, PageSize: 1, Cursor: first.NextCursor,
+	})
+	fmt.Printf("续查去掉窗口：ErrInvalidArgument=%v 可用命中数=%d\n",
+		errors.Is(err, indexroom.ErrInvalidArgument), len(disabledCont.Hits))
+
+	// 固定范围内任一区块内容变化，包括原本因时间而未命中的区块（这里给
+	// 缺失时间的高度 2 补上窗口外时间 120），续查仍是 ErrQueryChanged。
+	if _, err := index.Reorg([]indexroom.Block{
+		{Height: 2, Hash: "w2", Parent: "w1", Txs: []string{"a"}, Time: unix(120)},
+		{Height: 3, Hash: "w3", Parent: "w2", Txs: []string{"a"}, Time: unix(100)},
+		{Height: 4, Hash: "w4", Parent: "w3", Txs: []string{"a"}, Time: unix(110)},
+	}); err != nil {
+		panic(err)
+	}
+	changedPage, err := index.QueryTxs(indexroom.TxQuery{
+		TxIDs: []string{"a"}, TimeStart: unix(100), TimeEnd: unix(110),
+		PageSize: 1, Cursor: first.NextCursor,
+	})
+	fmt.Printf("原本未命中的高度2内容变化：ErrQueryChanged=%v 可用命中数=%d\n",
+		errors.Is(err, indexroom.ErrQueryChanged), len(changedPage.Hits))
 }
 
 // demonstrateDescending 在独立索引上展示倒序读取：如何选择倒序、跨页继续、

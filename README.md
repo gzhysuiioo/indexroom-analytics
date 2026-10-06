@@ -16,7 +16,7 @@ go test ./...
 
 - `indexroom.Block` 的 `Time *int64` 字段携带非负 Unix 秒数；`nil` 表示未提供时间，与时间为 0 严格区分。
 - `Index.Append` / `Index.Reorg`：摄取区块与重组，负时间整体拒绝且不改变已有链；哈希、父哈希或任一交易标识含非法 UTF-8 字节时同样整体拒绝，错误信息指出区块高度与字段（交易标识另指出从 0 开始的位置），保证快照可无损导出与恢复。`Append` 在链顶前进后仍可再次提交内容完全相同的旧区块（成功且无副作用），完整规则见下方[重复提交区块指南（Append）](#重复提交区块指南append)；`Reorg` 的分支范围、丢弃高度口径、失败原子性与完整用法见下方[重组指南（Reorg）](#重组指南reorg)。
-- `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；默认按高度、再按块内位置升序返回，`Order` 设为 `OrderDesc` 时整体倒序（高度与块内位置均从大到小）；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
+- `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；默认按高度、再按块内位置升序返回，`Order` 设为 `OrderDesc` 时整体倒序（高度与块内位置均从大到小）；`TimeStart`/`TimeEnd` 可同时给出非负 Unix 秒，叠加 `[Start, End)` 半开时间窗口筛选（含起点、排除终点，与 `QueryTimeStats` 一致；缺失区块时间不命中，真实零秒按窗口判断），两者都不传表示不启用时间筛选；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
 - `Index.QueryTimeStats`：按 `[Start, End)` 半开窗口与 `StepSeconds` 分段统计交易出现次数、不同标识数、含匹配交易的区块数，并给出整窗口去重汇总与缺失时间区块数；非法参数返回 `ErrInvalidArgument`。完整用法见下方[按时间窗口统计交易指南](#按时间窗口统计交易指南querytimestats)。
 - `Index.Export` / `Index.Restore`：快照版本 1（区块不含 `timestamp`）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）。`Restore` 保证**数据一致**并把再导出规范化为本功能的固定文本，不保留输入的字段顺序、空白与转义写法；它用一份完整快照整体替换主链，非法输入返回 `ErrInvalidSnapshot` 且不改变现有链；底层读取失败（包括与完整快照字节一起送达的故障）不是 `ErrInvalidSnapshot`，而是包装为 `indexroom: read snapshot: ...` 并保留原始读取错误，同样不改变现有链。完整用法见下方[快照导出与恢复指南（Export/Restore）](#快照导出与恢复指南exportrestore)。
 
@@ -24,14 +24,14 @@ go test ./...
 
 `Index.QueryTxs(query TxQuery) (TxPage, error)` 围绕一个或多个交易标识读取这些标识在主链上的**每一次出现**。默认按"高度、再按块内位置"升序；`Order` 设为 `OrderDesc` 时在整个固定范围内倒序——高度从大到小，同一区块内的位置也从大到小。次序只由高度与原有块内位置决定，区块时间是否缺失、相同或随高度下降都不影响次序。查询只读，可与摄取并发调用，每次调用都看到一个完整的链状态。
 
-- `TxQuery`：`From`/`To` 为闭区间高度，`TxIDs` 为筛选标识集合，`PageSize` 为每页条数（0 取 `DefaultPageSize=100`，最大 `MaxPageSize=1000`），`Order` 为读取方向（零值 `OrderAsc` 升序，`OrderDesc` 倒序），`Cursor` 为续查游标。
+- `TxQuery`：`From`/`To` 为闭区间高度，`TxIDs` 为筛选标识集合，`PageSize` 为每页条数（0 取 `DefaultPageSize=100`，最大 `MaxPageSize=1000`），`Order` 为读取方向（零值 `OrderAsc` 升序，`OrderDesc` 倒序），`TimeStart`/`TimeEnd` 为可选时间窗口（两个 `*int64`，同时给出才启用，半开 `[Start, End)`，单位为非负 Unix 秒），`Cursor` 为续查游标。
 - `TxHit`：一次命中，字段为 `Height`、`BlockHash`、`TxID`、`Position`（块内从 0 开始的位置；**倒序不会重新编号**）。
 - `TxPage`：本页 `Hits`，以及对整个固定范围的统计 `TotalMatches`（匹配出现总次数）、`MatchedBlocks`（含匹配交易的区块数）、`ToHeight`（第一页固定下来的实际上界）和 `NextCursor`。统计是整个固定范围的统计，**不随方向或页大小改变**。
 
 ### 如何取得第一页、继续读取、何时结束
 
 1. **第一页**：`Cursor` 传空字符串即首次查询。`From` 为 0 时默认从高度 1 开始；`To` 为 0 时取首次查询看到的链顶。需要先看靠近链顶的记录时，把 `Order` 设为 `OrderDesc`（见下方[倒序读取](#倒序读取orderdesc)）。
-2. **继续读取**：把上一页返回的 `NextCursor` 原样填回 `TxQuery.Cursor` 再次调用。游标是服务返回的**不透明字符串**，不要解析或拼接。续查时高度范围、`TxIDs` 与读取方向 `Order` 必须与第一页等价或一致；`PageSize` 可以逐页调整。
+2. **继续读取**：把上一页返回的 `NextCursor` 原样填回 `TxQuery.Cursor` 再次调用。游标是服务返回的**不透明字符串**，不要解析或拼接。续查时高度范围、`TxIDs`、读取方向 `Order` 以及是否启用时间窗口和窗口本身必须与第一页等价或一致；`PageSize` 可以逐页调整。
 3. **结束**：返回页的 `NextCursor` 为空即最后一页。范围内没有匹配交易时不是错误，而是成功返回一个空页（`Hits` 为空、无游标）。
 
 重复出现的交易**不会合并**：同一标识在不同区块、或同一区块内出现多次，就返回多条 `TxHit`。筛选按字符串精确匹配，`TxIDs` 的**顺序与重复项不影响匹配**（`["a","a"]` 与 `["a"]` 等价）；但大小写与首尾空白仍按原字符串区分（`"A"`、`" a "` 都不会匹配 `"a"`）。
@@ -44,7 +44,7 @@ go test ./...
 ### 游标失效：区分 ErrQueryChanged 与 ErrInvalidArgument
 
 - **`ErrQueryChanged`（链数据变了）**：固定范围内任一区块的内容发生改变——即使区块哈希不变、**只改变了时间**——或链顶退到固定结束高度以下，续查都会返回该错误，且**没有可用的页结果**。此时只能**从空游标重新开始第一页**，绝不能把新结果拼接到旧结果后面。
-- **`ErrInvalidArgument`（请求本身不合法）**：续查更改高度范围或筛选集合、**续查方向与游标不一致**（正序游标配 `OrderDesc`，或倒序游标配 `OrderAsc`/不传 `Order`）、传入非法 `Order` 值、游标损坏、或把游标交给另一个索引实例（游标带实例签名，跨实例无效）。它与链数据变化无关，用 `errors.Is` 与 `ErrQueryChanged` 区分；请先修正请求再重试。方向不一致的续查同样**不返回任何可用页结果**。
+- **`ErrInvalidArgument`（请求本身不合法）**：续查更改高度范围或筛选集合、**续查方向与游标不一致**（正序游标配 `OrderDesc`，或倒序游标配 `OrderAsc`/不传 `Order`）、**续查改变时间筛选的启用状态或窗口任一边界**、只给时间窗口一个边界、时间边界为负、起点不小于终点、传入非法 `Order` 值、游标损坏、或把游标交给另一个索引实例（游标带实例签名，跨实例无效）。它与链数据变化无关，用 `errors.Is` 与 `ErrQueryChanged` 区分；请先修正请求再重试。方向或窗口不一致的续查同样**不返回任何可用页结果**。
 
 ### 倒序读取（OrderDesc）
 
@@ -56,6 +56,19 @@ go test ./...
 - **空结果**：空链、起始高度超过链顶、或筛选无命中时，倒序也成功返回空页与空的后续游标。
 
 例如高度 1 至 3 的交易依次是 `[a,b,a]`、`[a,c]`、`[b,a]`，筛选 `a`、每页 2 条时：第一页依次给出**高度 3 位置 1、高度 2 位置 0**，第二页依次给出**高度 1 位置 2、高度 1 位置 0**，随后结束翻页；两页的 `TotalMatches` 都是 4、`MatchedBlocks` 都是 3。
+
+### 时间窗口筛选（TimeStart/TimeEnd）
+
+- **启用方式**：`TxQuery.TimeStart` 与 `TxQuery.TimeEnd` 同时给出非 `nil` 的 `*int64`，即按**半开窗口 `[Start, End)`** 筛选区块时间（非负 Unix 秒，**包含起点、排除终点**），语义与 `QueryTimeStats` 一致。两个字段都不传（均为 `nil`）时**不启用**时间筛选，行为与过去完全一致，原有调用与有效游标不受影响。
+- **未启用与起点为零是两回事**：调用方必须能区分"没有时间筛选"（两个指针都为 `nil`）与"窗口起点恰好为零"（`TimeStart` 指向 0、`TimeEnd` 指向更大的值）。只给一个边界（只给起点或只给终点）是 `ErrInvalidArgument`。
+- **缺失时间不命中，真实零秒按窗口判断**：启用窗口后，`Time` 为 `nil`（没有时间）的区块**永不命中**；时间为 0 是真实时间戳，按数值与窗口比较（例如窗口 `[0,1)` 会保留它）。这与摄取、快照中"缺失时间不是 0"的区分一致。
+- **三类条件共同生效**：一次出现必须**同时**落在高度范围、时间窗口内、且标识通过 `TxIDs` 筛选才被保留。时间窗口只决定哪些出现被保留，**不改变读取次序**——结果仍按高度与原有块内位置正序或倒序读取，不能改成按时间排序；同一标识的重复出现既**不合并也不重新编号**，`Position` 仍是块内从 0 开始的真实位置。时间允许随高度下降、允许相等，均按实际值判断。
+- **统计口径**：`TotalMatches` 与 `MatchedBlocks` 描述**固定高度范围内通过全部条件**（标识 + 时间窗口）的出现次数与区块数，每页保持一致；`ToHeight` 仍表示第一页固定下来的高度上界，与是否启用窗口无关。合法窗口没有命中时不是错误：成功返回空页（`Hits` 为空、无后续游标）。
+- **参数错误**：只提供一个边界、起点或终点为负、起点不小于终点，都返回 `ErrInvalidArgument` 且**不提供可用页**。
+- **继续翻页沿用同一窗口**：续查必须沿用"是否启用时间筛选"及完全相同的窗口；在启用与不启用之间切换、或改变任一边界，都返回 `ErrInvalidArgument` 且没有可用页，调用方需**从空游标重新查询**。`PageSize` 仍可逐页调整。
+- **范围变化判定不变**：固定范围内**任一**区块内容变化（包括原本因时间不在窗口内而未命中的区块、缺失时间变成已知时间等）续查仍返回 `ErrQueryChanged` 且没有可用页，必须从空游标重新开始，不能把新结果接到旧结果后面。
+
+例如高度一至四的时间依次为 105、缺失、100、110，交易依次为 `[a,b,a]`、`[a]`、`[a]`、`[a]`。筛选 `a` 与窗口 `[100,110)`、正序每页两条时：第一页返回**高度一的位置零和位置二**（时间 105 在窗口内；同一区块两次出现都保留），第二页返回**高度三的位置零**（时间 100 在窗口内）；高度二缺失时间不命中、高度四时间 110 正好等于被排除的终点。总出现次数 `TotalMatches=3`、匹配区块数 `MatchedBlocks=2`，高度上界 `ToHeight` 仍为 4。
 
 ### 完整示例
 
@@ -69,7 +82,8 @@ go run ./examples/querytxs
 
 ```go
 // 分页交易查询（Index.QueryTxs）完整示例：第一页、继续翻页、范围固定、
-// 筛选语义、空页、倒序读取、ErrInvalidArgument 与 ErrQueryChanged 的处理。
+// 筛选语义、空页、倒序读取、时间窗口筛选、ErrInvalidArgument 与
+// ErrQueryChanged 的处理。
 //
 // 运行：go run ./examples/querytxs
 package main
@@ -86,6 +100,9 @@ func mustAppend(index *indexroom.Index, block indexroom.Block) {
 		panic(err)
 	}
 }
+
+// unix 返回指向给定 Unix 秒的指针，用于设置区块时间或时间窗口边界。
+func unix(sec int64) *int64 { return &sec }
 
 func printPage(title string, page indexroom.TxPage) {
 	fmt.Println(title + "：")
@@ -250,6 +267,125 @@ func main() {
 	printPage("再次从空游标重新开始", restartTip)
 
 	demonstrateDescending()
+	demonstrateTimeWindow()
+}
+
+// demonstrateTimeWindow 在独立索引上展示可选区块时间窗口：时间筛选与高度范围、
+// 交易标识筛选共同生效；次序仍由高度与块内位置决定；缺失时间不命中、真实零秒
+// 按窗口判断；续查必须沿用同一窗口，改变启用状态或任一边界都是
+// ErrInvalidArgument；固定范围内原本因时间未命中的区块变化仍是 ErrQueryChanged。
+func demonstrateTimeWindow() {
+	fmt.Println("---- 时间窗口筛选（TimeStart/TimeEnd: [Start, End)）----")
+	// 规格示例：高度 1 至 4 的时间依次为 105、缺失、100、110，交易依次为
+	// [a,b,a]、[a]、[a]、[a]。
+	index := indexroom.New()
+	mustAppend(index, indexroom.Block{Height: 1, Hash: "w1", Parent: "genesis", Txs: []string{"a", "b", "a"}, Time: unix(105)})
+	mustAppend(index, indexroom.Block{Height: 2, Hash: "w2", Parent: "w1", Txs: []string{"a"}})
+	mustAppend(index, indexroom.Block{Height: 3, Hash: "w3", Parent: "w2", Txs: []string{"a"}, Time: unix(100)})
+	mustAppend(index, indexroom.Block{Height: 4, Hash: "w4", Parent: "w3", Txs: []string{"a"}, Time: unix(110)})
+
+	// 启用窗口：TimeStart 与 TimeEnd 同时给出，含起点、排除终点 [100,110)。
+	// 高度 2 没有时间不命中；高度 4 时间正好等于终点 110 被排除。
+	// 两个字段都留 nil 表示不启用筛选，这与起点恰好为零的窗口不同。
+	query := indexroom.TxQuery{
+		TxIDs: []string{"a"}, TimeStart: unix(100), TimeEnd: unix(110), PageSize: 2,
+	}
+	page1, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("窗口 [100,110) 筛选 a，每页 2 条：第1页", page1)
+
+	// 继续翻页：是否启用窗口及窗口本身必须与第一页一致；PageSize 仍可调整。
+	query.Cursor = page1.NextCursor
+	query.PageSize = 10
+	page2, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("同窗口继续（本页改每页 10 条）", page2)
+	fmt.Println("  两页 TotalMatches 都是 3（高度1两次、高度3一次）、MatchedBlocks 都是 2、ToHeight 仍是 4")
+	fmt.Println("  次序只按高度与块内位置：高度1时间105 仍排在高度3时间100 之前，没有改成按时间排序")
+	fmt.Println()
+
+	// 真实零秒是有效时间，缺失时间不是：窗口 [0,1) 只保留高度 1 那块
+	// 真实时间为零的区块。
+	zeroIndex := indexroom.New()
+	mustAppend(zeroIndex, indexroom.Block{Height: 1, Hash: "z1", Parent: "genesis", Txs: []string{"a"}, Time: unix(0)})
+	mustAppend(zeroIndex, indexroom.Block{Height: 2, Hash: "z2", Parent: "z1", Txs: []string{"a"}})
+	zeroWin, err := zeroIndex.QueryTxs(indexroom.TxQuery{TimeStart: unix(0), TimeEnd: unix(1)})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("窗口 [0,1)：命中 %d 条（真实零秒命中，缺失时间不命中）；", zeroWin.TotalMatches)
+	disabled, err := zeroIndex.QueryTxs(indexroom.TxQuery{})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("不启用窗口命中 %d 条（缺失时间也保留）\n", disabled.TotalMatches)
+
+	// 合法窗口没有命中时仍是成功的空页，没有后续游标。
+	empty, err := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, TimeStart: unix(1000), TimeEnd: unix(2000)})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("窗口 [1000,2000) 无命中：err=%v 命中=%d 有后续游标=%v\n\n",
+		err, len(empty.Hits), empty.NextCursor != "")
+
+	// 非法窗口：只给一个边界、边界为负、起点不小于终点，都是
+	// ErrInvalidArgument，且没有可用页结果。
+	invalid := []struct {
+		name  string
+		query indexroom.TxQuery
+	}{
+		{"只给起点", indexroom.TxQuery{TimeStart: unix(100)}},
+		{"只给终点", indexroom.TxQuery{TimeEnd: unix(110)}},
+		{"负起点", indexroom.TxQuery{TimeStart: unix(-1), TimeEnd: unix(110)}},
+		{"负终点", indexroom.TxQuery{TimeStart: unix(0), TimeEnd: unix(-1)}},
+		{"起点不小于终点", indexroom.TxQuery{TimeStart: unix(110), TimeEnd: unix(110)}},
+	}
+	for _, tc := range invalid {
+		page, err := index.QueryTxs(tc.query)
+		fmt.Printf("%s：ErrInvalidArgument=%v 可用命中数=%d\n",
+			tc.name, errors.Is(err, indexroom.ErrInvalidArgument), len(page.Hits))
+	}
+	fmt.Println()
+
+	// 续查改变窗口（含从启用改为不启用）返回 ErrInvalidArgument，没有可用页；
+	// 要改窗口必须从空游标重新查询。
+	first, err := index.QueryTxs(indexroom.TxQuery{
+		TxIDs: []string{"a"}, TimeStart: unix(100), TimeEnd: unix(110), PageSize: 1,
+	})
+	if err != nil {
+		panic(err)
+	}
+	changedEnd, err := index.QueryTxs(indexroom.TxQuery{
+		TxIDs: []string{"a"}, TimeStart: unix(100), TimeEnd: unix(111),
+		PageSize: 1, Cursor: first.NextCursor,
+	})
+	fmt.Printf("续查改终点：ErrInvalidArgument=%v 可用命中数=%d\n",
+		errors.Is(err, indexroom.ErrInvalidArgument), len(changedEnd.Hits))
+	disabledCont, err := index.QueryTxs(indexroom.TxQuery{
+		TxIDs: []string{"a"}, PageSize: 1, Cursor: first.NextCursor,
+	})
+	fmt.Printf("续查去掉窗口：ErrInvalidArgument=%v 可用命中数=%d\n",
+		errors.Is(err, indexroom.ErrInvalidArgument), len(disabledCont.Hits))
+
+	// 固定范围内任一区块内容变化，包括原本因时间而未命中的区块（这里给
+	// 缺失时间的高度 2 补上窗口外时间 120），续查仍是 ErrQueryChanged。
+	if _, err := index.Reorg([]indexroom.Block{
+		{Height: 2, Hash: "w2", Parent: "w1", Txs: []string{"a"}, Time: unix(120)},
+		{Height: 3, Hash: "w3", Parent: "w2", Txs: []string{"a"}, Time: unix(100)},
+		{Height: 4, Hash: "w4", Parent: "w3", Txs: []string{"a"}, Time: unix(110)},
+	}); err != nil {
+		panic(err)
+	}
+	changedPage, err := index.QueryTxs(indexroom.TxQuery{
+		TxIDs: []string{"a"}, TimeStart: unix(100), TimeEnd: unix(110),
+		PageSize: 1, Cursor: first.NextCursor,
+	})
+	fmt.Printf("原本未命中的高度2内容变化：ErrQueryChanged=%v 可用命中数=%d\n",
+		errors.Is(err, indexroom.ErrQueryChanged), len(changedPage.Hits))
 }
 
 // demonstrateDescending 在独立索引上展示倒序读取：如何选择倒序、跨页继续、
@@ -396,6 +532,29 @@ To=0 固定到首次查询看到的链顶：ToHeight=4（当前 tip=4）
 倒序游标配正序请求：ErrInvalidArgument=true 可用命中数=0
 
 空链倒序：err=<nil> 命中=0 游标为空=true；筛选无命中倒序：命中=0 TotalMatches=0
+---- 时间窗口筛选（TimeStart/TimeEnd: [Start, End)）----
+窗口 [100,110) 筛选 a，每页 2 条：第1页：
+  命中 height=1 block=w1 tx="a" position=0
+  命中 height=1 block=w1 tx="a" position=2
+  TotalMatches=3 MatchedBlocks=2 ToHeight=4 有后续游标=true
+同窗口继续（本页改每页 10 条）：
+  命中 height=3 block=w3 tx="a" position=0
+  TotalMatches=3 MatchedBlocks=2 ToHeight=4 有后续游标=false
+  两页 TotalMatches 都是 3（高度1两次、高度3一次）、MatchedBlocks 都是 2、ToHeight 仍是 4
+  次序只按高度与块内位置：高度1时间105 仍排在高度3时间100 之前，没有改成按时间排序
+
+窗口 [0,1)：命中 1 条（真实零秒命中，缺失时间不命中）；不启用窗口命中 2 条（缺失时间也保留）
+窗口 [1000,2000) 无命中：err=<nil> 命中=0 有后续游标=false
+
+只给起点：ErrInvalidArgument=true 可用命中数=0
+只给终点：ErrInvalidArgument=true 可用命中数=0
+负起点：ErrInvalidArgument=true 可用命中数=0
+负终点：ErrInvalidArgument=true 可用命中数=0
+起点不小于终点：ErrInvalidArgument=true 可用命中数=0
+
+续查改终点：ErrInvalidArgument=true 可用命中数=0
+续查去掉窗口：ErrInvalidArgument=true 可用命中数=0
+原本未命中的高度2内容变化：ErrQueryChanged=true 可用命中数=0
 ```
 
 ## 按时间窗口统计交易指南（QueryTimeStats）

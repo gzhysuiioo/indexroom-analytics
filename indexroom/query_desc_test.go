@@ -472,7 +472,7 @@ func TestScanPageLockedDescWindow(t *testing.T) {
 	for _, pageSize := range []int{1, 3, DefaultPageSize, MaxPageSize} {
 		var windowed []TxHit
 		for offset := int64(0); ; {
-			hits, total, gotBlocks := index.scanPageLocked(from, to, newTxFilter(nil), OrderDesc, offset, pageSize)
+			hits, total, gotBlocks := index.scanPageLocked(from, to, newTxFilter(nil), timeWindow{}, OrderDesc, offset, pageSize)
 			if total != int64(len(wantAll)) || gotBlocks != matchedBlocks {
 				t.Fatalf("pageSize=%d offset=%d: totals=%d/%d want %d/%d",
 					pageSize, offset, total, gotBlocks, len(wantAll), matchedBlocks)

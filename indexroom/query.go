@@ -82,9 +82,22 @@ type TxQuery struct {
 	// decreasing height/position. A continuation must repeat the first
 	// page's order, otherwise QueryTxs returns ErrInvalidArgument.
 	Order TxOrder
+	// TimeStart and TimeEnd optionally bound the searched block timestamps as
+	// a half-open window [TimeStart, TimeEnd), reusing QueryTimeStats
+	// semantics: non-negative Unix seconds, start included, end excluded.
+	// Both pointers nil disables time filtering, so an unused window stays
+	// distinct from a window whose start is genuinely zero; providing exactly
+	// one bound is ErrInvalidArgument. While enabled, a block without a
+	// timestamp never matches, while a real timestamp of zero is judged like
+	// any other value. The filter only selects which occurrences survive:
+	// ordering still depends solely on height and block position. A
+	// continuation must repeat whether the filter is enabled and the exact
+	// same window, otherwise QueryTxs returns ErrInvalidArgument.
+	TimeStart *int64
+	TimeEnd   *int64
 	// Cursor continues an earlier query; empty asks for the first page. On
-	// continuation the height range, TxIDs and Order must equal the first
-	// page's.
+	// continuation the height range, TxIDs, Order and time window must equal
+	// the first page's.
 	Cursor string
 }
 
@@ -128,12 +141,20 @@ type TxPage struct {
 // likewise decreasing. Ordering depends only on height and position — never
 // on block timestamps — and ascending queries behave exactly as before.
 //
+// TimeStart and TimeEnd together enable an optional timestamp window
+// [TimeStart, TimeEnd) with the same semantics as QueryTimeStats: it
+// intersects the height range and the TxIDs filter rather than replacing
+// them, timestamps need not be monotonic, a missing timestamp never
+// matches, and a real zero is judged normally. Time filtering never changes
+// the order, the block positions, or the deduplication of occurrences.
+//
 // The first page (empty Cursor) pins the filtered range and returns a
 // continuation cursor while more results remain. Continuations reuse the
 // pinned range — blocks appended above it are invisible to the query — and
 // succeed as long as every block inside the range still matches the first
-// page; otherwise they fail with ErrQueryChanged. The order is pinned too:
-// a cursor minted in one direction may not be continued in the other.
+// page; otherwise they fail with ErrQueryChanged. The order, the time
+// filter's enabled state and its window are pinned too: a cursor minted in
+// one direction or with one window may not be continued with another.
 func (index *Index) QueryTxs(query TxQuery) (TxPage, error) {
 	pageSize, err := normalizePageSize(query.PageSize)
 	if err != nil {
@@ -142,10 +163,60 @@ func (index *Index) QueryTxs(query TxQuery) (TxPage, error) {
 	if !query.Order.valid() {
 		return TxPage{}, fmt.Errorf("%w: order must be OrderAsc or OrderDesc", ErrInvalidArgument)
 	}
-	if query.Cursor != "" {
-		return index.continueQuery(query, pageSize)
+	window, err := normalizeTimeWindow(query.TimeStart, query.TimeEnd)
+	if err != nil {
+		return TxPage{}, err
 	}
-	return index.firstQuery(query, pageSize)
+	if query.Cursor != "" {
+		return index.continueQuery(query, pageSize, window)
+	}
+	return index.firstQuery(query, pageSize, window)
+}
+
+// timeWindow is the canonical form of TxQuery's optional timestamp window.
+// enabled is false only when both bounds are absent, so an unused window
+// stays distinct from [0, end); when enabled, start and end hold non-negative
+// Unix seconds with start < end.
+type timeWindow struct {
+	enabled bool
+	start   int64
+	end     int64
+}
+
+// normalizeTimeWindow validates the optional half-open window: both bounds
+// must be absent together, neither may be negative, and the start must be
+// below the end. Exactly one bound, a negative bound, or a non-empty window
+// of zero or negative width is ErrInvalidArgument.
+func normalizeTimeWindow(startPtr, endPtr *int64) (timeWindow, error) {
+	if (startPtr == nil) != (endPtr == nil) {
+		return timeWindow{}, fmt.Errorf("%w: time window needs both start and end or neither", ErrInvalidArgument)
+	}
+	if startPtr == nil {
+		return timeWindow{}, nil
+	}
+	if *startPtr < 0 {
+		return timeWindow{}, fmt.Errorf("%w: time window start must not be negative", ErrInvalidArgument)
+	}
+	if *endPtr < 0 {
+		return timeWindow{}, fmt.Errorf("%w: time window end must not be negative", ErrInvalidArgument)
+	}
+	if *startPtr >= *endPtr {
+		return timeWindow{}, fmt.Errorf("%w: time window start must be below end", ErrInvalidArgument)
+	}
+	return timeWindow{enabled: true, start: *startPtr, end: *endPtr}, nil
+}
+
+// contains reports whether a block timestamp survives the window: an
+// enabled window rejects missing timestamps, while start is included and end
+// excluded. A disabled window matches regardless of the timestamp.
+func (w timeWindow) contains(when *int64) bool {
+	if !w.enabled {
+		return true
+	}
+	if when == nil {
+		return false
+	}
+	return *when >= w.start && *when < w.end
 }
 
 func normalizePageSize(size int) (int, error) {
@@ -177,7 +248,7 @@ func normalizeRange(from, to int64) (int64, int64, error) {
 	return from, to, nil
 }
 
-func (index *Index) firstQuery(query TxQuery, pageSize int) (TxPage, error) {
+func (index *Index) firstQuery(query TxQuery, pageSize int, window timeWindow) (TxPage, error) {
 	from, to, err := normalizeRange(query.From, query.To)
 	if err != nil {
 		return TxPage{}, err
@@ -198,11 +269,11 @@ func (index *Index) firstQuery(query TxQuery, pageSize int) (TxPage, error) {
 		queryTxsHookLocked(from, to, false)
 	}
 	filter := newTxFilter(query.TxIDs)
-	hits, total, blocks := index.scanPageLocked(from, to, filter, query.Order, 0, pageSize)
-	return index.buildPageLocked(query.To, filter, from, to, hits, total, blocks, 0, pageSize, query.Order), nil
+	hits, total, blocks := index.scanPageLocked(from, to, filter, window, query.Order, 0, pageSize)
+	return index.buildPageLocked(query.To, filter, window, from, to, hits, total, blocks, 0, pageSize, query.Order), nil
 }
 
-func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
+func (index *Index) continueQuery(query TxQuery, pageSize int, window timeWindow) (TxPage, error) {
 	payload, err := index.decodeCursor(query.Cursor)
 	if err != nil {
 		return TxPage{}, err
@@ -228,6 +299,13 @@ func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
 	if query.Order != payload.Order {
 		return TxPage{}, fmt.Errorf("%w: read order differs from the first page", ErrInvalidArgument)
 	}
+	// The time window is pinned like the other conditions: enabling it on a
+	// cursor minted without one (or the reverse), or shifting either bound,
+	// rejects the continuation before the chain is examined. The caller must
+	// restart from an empty cursor.
+	if window != payload.window() {
+		return TxPage{}, fmt.Errorf("%w: time window differs from the first page", ErrInvalidArgument)
+	}
 
 	index.mu.Lock()
 	defer index.mu.Unlock()
@@ -244,11 +322,11 @@ func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
 	}
 	// Re-scan the still-identical pinned range: the cursor records the
 	// absolute offset, but no full match list is kept between pages.
-	hits, total, blocks := index.scanPageLocked(payload.From, payload.To, filter, payload.Order, payload.Off, pageSize)
+	hits, total, blocks := index.scanPageLocked(payload.From, payload.To, filter, window, payload.Order, payload.Off, pageSize)
 	if payload.Off > total {
 		return TxPage{}, fmt.Errorf("%w: cursor offset is beyond the pinned results", ErrQueryChanged)
 	}
-	return index.buildPageLocked(query.To, filter, payload.From, payload.To, hits, total, blocks, payload.Off, pageSize, payload.Order), nil
+	return index.buildPageLocked(query.To, filter, window, payload.From, payload.To, hits, total, blocks, payload.Off, pageSize, payload.Order), nil
 }
 
 // buildPageLocked assembles one page from a page-sized scan and mints the
@@ -256,7 +334,7 @@ func (index *Index) continueQuery(query TxQuery, pageSize int) (TxPage, error) {
 // whole pinned range; hits holds only the window [offset, offset+pageSize)
 // in the scan's order. reqTo is the caller's verbatim To (zero for
 // tip-bound queries). The caller must hold index.mu.
-func (index *Index) buildPageLocked(reqTo int64, filter txFilter, from, to int64, hits []TxHit, total, blocks, offset int64, pageSize int, order TxOrder) TxPage {
+func (index *Index) buildPageLocked(reqTo int64, filter txFilter, window timeWindow, from, to int64, hits []TxHit, total, blocks, offset int64, pageSize int, order TxOrder) TxPage {
 	page := TxPage{
 		Hits:          hits,
 		TotalMatches:  total,
@@ -264,7 +342,7 @@ func (index *Index) buildPageLocked(reqTo int64, filter txFilter, from, to int64
 		ToHeight:      to,
 	}
 	if offset+int64(len(hits)) < total {
-		page.NextCursor = index.encodeCursor(cursorPayload{
+		payload := cursorPayload{
 			V:     1,
 			From:  from,
 			ReqTo: reqTo,
@@ -273,7 +351,12 @@ func (index *Index) buildPageLocked(reqTo int64, filter txFilter, from, to int64
 			FP:    hex.EncodeToString(index.fingerprintLocked(from, to)),
 			Order: order,
 			Off:   offset + int64(len(hits)),
-		})
+		}
+		if window.enabled {
+			start, end := window.start, window.end
+			payload.TimeStart, payload.TimeEnd = &start, &end
+		}
+		page.NextCursor = index.encodeCursor(payload)
 	}
 	return page
 }
@@ -285,8 +368,10 @@ func (index *Index) buildPageLocked(reqTo int64, filter txFilter, from, to int64
 // whole range holds. OrderAsc walks increasing heights then increasing
 // positions; OrderDesc walks decreasing heights then decreasing positions.
 // total, blocks and the recorded positions are the same in either order.
+// An occurrence survives only when it passes both the identifier filter and
+// the block's timestamp window; the window never participates in ordering.
 // The caller must hold index.mu.
-func (index *Index) scanPageLocked(from, to int64, filter txFilter, order TxOrder, offset int64, pageSize int) (hits []TxHit, total, blocks int64) {
+func (index *Index) scanPageLocked(from, to int64, filter txFilter, window timeWindow, order TxOrder, offset int64, pageSize int) (hits []TxHit, total, blocks int64) {
 	hits = make([]TxHit, 0, pageSize)
 	height, step := from, int64(1)
 	if order == OrderDesc {
@@ -294,6 +379,11 @@ func (index *Index) scanPageLocked(from, to int64, filter txFilter, order TxOrde
 	}
 	for ; from <= height && height <= to; height += step {
 		block := index.Blocks[height]
+		if !window.contains(block.Time) {
+			// A block outside the timestamp window contributes no
+			// occurrences, whatever transactions it holds.
+			continue
+		}
 		matched := false
 		position, pStep := 0, 1
 		end := len(block.Txs)
@@ -353,15 +443,33 @@ func (index *Index) fingerprintLocked(from, to int64) []byte {
 }
 
 // cursorPayload is the signed state carried between pages of one query.
+//
+// TimeStart and TimeEnd are both absent for a query without a timestamp
+// window and both present for one with one, mirroring TxQuery; a window
+// starting at zero still carries an explicit zero pointer, so it can never
+// be confused with the disabled case.
 type cursorPayload struct {
-	V     int     `json:"v"`
-	From  int64   `json:"from"`
-	ReqTo int64   `json:"reqTo"`
-	To    int64   `json:"to"`
-	Set   string  `json:"set"`
-	FP    string  `json:"fp"`
-	Order TxOrder `json:"ord"`
-	Off   int64   `json:"off"`
+	V         int     `json:"v"`
+	From      int64   `json:"from"`
+	ReqTo     int64   `json:"reqTo"`
+	To        int64   `json:"to"`
+	Set       string  `json:"set"`
+	FP        string  `json:"fp"`
+	Order     TxOrder `json:"ord"`
+	Off       int64   `json:"off"`
+	TimeStart *int64  `json:"tStart,omitempty"`
+	TimeEnd   *int64  `json:"tEnd,omitempty"`
+}
+
+// window reconstructs the pinned timestamp window. A signed payload is only
+// ever minted by buildPageLocked with both pointers present together;
+// malformed combinations fail closed as a disabled-window mismatch rather
+// than panicking.
+func (p cursorPayload) window() timeWindow {
+	if p.TimeStart == nil || p.TimeEnd == nil {
+		return timeWindow{}
+	}
+	return timeWindow{enabled: true, start: *p.TimeStart, end: *p.TimeEnd}
 }
 
 const cursorPrefix = "q1"

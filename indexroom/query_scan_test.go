@@ -62,7 +62,7 @@ func TestScanPageLockedRetainsOnlyPageWindow(t *testing.T) {
 	for _, pageSize := range []int{1, 2, 7, DefaultPageSize, MaxPageSize} {
 		var windowed []TxHit
 		for offset := int64(0); ; {
-			hits, total, gotBlocks := index.scanPageLocked(from, to, newTxFilter(nil), OrderAsc, offset, pageSize)
+			hits, total, gotBlocks := index.scanPageLocked(from, to, newTxFilter(nil), timeWindow{}, OrderAsc, offset, pageSize)
 			if total != int64(len(all)) {
 				t.Fatalf("pageSize=%d offset=%d: total=%d, want whole-range %d", pageSize, offset, total, len(all))
 			}
@@ -90,7 +90,7 @@ func TestScanPageLockedRetainsOnlyPageWindow(t *testing.T) {
 
 	// A selective filter keeps the same contract on the filtered answer.
 	filtered, filteredBlocks := referenceScan(index, from, to, []string{"keep", "t1"})
-	hits, total, gotBlocks := index.scanPageLocked(from, to, newTxFilter([]string{"t1", "keep", "keep"}), OrderAsc, 3, 5)
+	hits, total, gotBlocks := index.scanPageLocked(from, to, newTxFilter([]string{"t1", "keep", "keep"}), timeWindow{}, OrderAsc, 3, 5)
 	if total != int64(len(filtered)) || gotBlocks != filteredBlocks {
 		t.Fatalf("filtered totals=%d/%d, want %d/%d", total, gotBlocks, len(filtered), filteredBlocks)
 	}
@@ -103,13 +103,13 @@ func TestScanPageLockedRetainsOnlyPageWindow(t *testing.T) {
 
 	// An offset beyond the matches keeps whole-range statistics but returns no
 	// records; the continuation caller turns this into ErrQueryChanged.
-	hits, total, gotBlocks = index.scanPageLocked(from, to, newTxFilter(nil), OrderAsc, int64(len(all))+10, 4)
+	hits, total, gotBlocks = index.scanPageLocked(from, to, newTxFilter(nil), timeWindow{}, OrderAsc, int64(len(all))+10, 4)
 	if len(hits) != 0 || total != int64(len(all)) || gotBlocks != matchedBlocks {
 		t.Fatalf("beyond-end scan: hits=%d total=%d blocks=%d", len(hits), total, gotBlocks)
 	}
 
 	// An empty range retains nothing and reports zero statistics.
-	hits, total, gotBlocks = index.scanPageLocked(100, 200, newTxFilter(nil), OrderAsc, 0, 10)
+	hits, total, gotBlocks = index.scanPageLocked(100, 200, newTxFilter(nil), timeWindow{}, OrderAsc, 0, 10)
 	if len(hits) != 0 || cap(hits) > 10 || total != 0 || gotBlocks != 0 {
 		t.Fatalf("empty-range scan: hits=%v total=%d blocks=%d", hits, total, gotBlocks)
 	}
