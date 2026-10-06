@@ -85,6 +85,14 @@ type registerService struct {
 }
 
 // registerResult is the per-item outcome.
+//
+// ExpectedRevision/ActualRevision stay plain ints so decoded output keeps its
+// shape; their JSON presence is governed separately by reportRevision. A
+// registration-revision conflict must emit both as explicit integers even when
+// one is 0 (a brand-new service is at revision 0; a request can submit 0
+// against an existing service), while success and every other failure kind
+// (invalid, not_found, stale, no_healthy, and health's same-sequence content
+// conflict) omit both. MarshalJSON is what turns that gate into pointer fields.
 type registerResult struct {
 	Service          string `json:"service"`
 	OK               bool   `json:"ok"`
@@ -97,6 +105,33 @@ type registerResult struct {
 	Sequence         int64  `json:"sequence,omitempty"`
 	InstanceID       string `json:"instanceId,omitempty"`
 	Address          string `json:"address,omitempty"`
+
+	// reportRevision marks a registration-revision conflict, the only result
+	// that carries the two revision comparison fields. It is not part of the
+	// JSON itself.
+	reportRevision bool `json:"-"`
+}
+
+// MarshalJSON emits the per-item result, exposing expectedRevision and
+// actualRevision as explicit integers iff the item is a registration-revision
+// conflict. The fields are shadowed on the embedded copy by pointer fields at a
+// shallower depth: nil keeps them omitted (so non-revision failures look
+// exactly as before), while a non-nil pointer serializes 0 as 0 rather than
+// dropping it through omitempty.
+func (r registerResult) MarshalJSON() ([]byte, error) {
+	type shadow registerResult
+	type wire struct {
+		shadow
+		ExpectedRevision *int `json:"expectedRevision,omitempty"`
+		ActualRevision   *int `json:"actualRevision,omitempty"`
+	}
+	w := wire{shadow: shadow(r)}
+	if r.reportRevision {
+		expected, actual := r.ExpectedRevision, r.ActualRevision
+		w.ExpectedRevision = &expected
+		w.ActualRevision = &actual
+	}
+	return json.Marshal(w)
 }
 
 // registerOutput is the full register output.
@@ -404,8 +439,11 @@ func (p *registerProcessor) parseExcludeIDs(service string, raw json.RawMessage)
 // reject records a business-rule failure (conflict, not_found, stale or
 // no_healthy), keeping each operation's distinct result fields. Health
 // rejections additionally carry the current sequence; register and select
-// pass 0 so it stays omitted.
-func (p *registerProcessor) reject(service string, kind indexroom.OutcomeKind, reason string, revision, expected, actual int, sequence int64) {
+// pass 0 so it stays omitted. mismatch marks a registration-revision
+// conflict, the only failure that reports expectedRevision and actualRevision;
+// it is false for health's same-sequence content conflict and for the
+// non-conflict failure kinds, all of which keep those two fields omitted.
+func (p *registerProcessor) reject(service string, kind indexroom.OutcomeKind, reason string, revision, expected, actual int, sequence int64, mismatch bool) {
 	p.failed = true
 	p.results = append(p.results, registerResult{
 		Service:          service,
@@ -416,6 +454,7 @@ func (p *registerProcessor) reject(service string, kind indexroom.OutcomeKind, r
 		ExpectedRevision: expected,
 		ActualRevision:   actual,
 		Sequence:         sequence,
+		reportRevision:   mismatch,
 	})
 }
 
@@ -467,7 +506,7 @@ func (p *registerProcessor) registerRequest(raw json.RawMessage, service string)
 
 	outcome := p.registry.Apply(registration)
 	if !outcome.OK {
-		p.reject(outcome.Service, outcome.Kind, outcome.Reason, outcome.Revision, outcome.Expected, outcome.Actual, 0)
+		p.reject(outcome.Service, outcome.Kind, outcome.Reason, outcome.Revision, outcome.Expected, outcome.Actual, 0, outcome.RevisionMismatch)
 		return
 	}
 	p.succeed(registerResult{
@@ -530,7 +569,7 @@ func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 
 	outcome := p.registry.ApplyHealth(update)
 	if !outcome.OK {
-		p.reject(outcome.Service, outcome.Kind, outcome.Reason, outcome.Revision, outcome.Expected, outcome.Actual, outcome.Sequence)
+		p.reject(outcome.Service, outcome.Kind, outcome.Reason, outcome.Revision, outcome.Expected, outcome.Actual, outcome.Sequence, outcome.RevisionMismatch)
 		return
 	}
 	p.succeed(registerResult{
@@ -576,7 +615,7 @@ func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 
 	outcome := p.registry.Select(selection)
 	if !outcome.OK {
-		p.reject(outcome.Service, outcome.Kind, outcome.Reason, outcome.Revision, outcome.Expected, outcome.Actual, 0)
+		p.reject(outcome.Service, outcome.Kind, outcome.Reason, outcome.Revision, outcome.Expected, outcome.Actual, 0, outcome.RevisionMismatch)
 		return
 	}
 	p.succeed(registerResult{
@@ -614,7 +653,7 @@ func (p *registerProcessor) releaseSessionRequest(raw json.RawMessage, service s
 
 	outcome := p.registry.ReleaseSession(release)
 	if !outcome.OK {
-		p.reject(outcome.Service, outcome.Kind, outcome.Reason, outcome.Revision, outcome.Expected, outcome.Actual, 0)
+		p.reject(outcome.Service, outcome.Kind, outcome.Reason, outcome.Revision, outcome.Expected, outcome.Actual, 0, outcome.RevisionMismatch)
 		return
 	}
 	p.succeed(registerResult{

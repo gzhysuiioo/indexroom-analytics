@@ -77,6 +77,25 @@ revision is `not_found`, and a service with no healthy instance is
 `no_healthy`. Every failure states the reason and current revision and leaves
 the rotation position intact.
 
+A conflict whose cause is the registration revision mismatch carries both
+`expectedRevision` and `actualRevision` as JSON integers: the value the item
+submitted and the service's current revision when that item was processed.
+Zero is a real value and is always printed, so a missing field can never be
+mistaken for it — submitting `0` against a service at revision 1 shows
+`"expectedRevision":0,"actualRevision":1`, and submitting `2` for an unknown
+service shows `"expectedRevision":2,"actualRevision":0` (with `revision` still
+`0`). The two fields are reported for register replacement, health, select and
+release_session, and each reflects the state at that item's turn (an earlier
+successful replacement that bumps the revision is visible to a later conflict).
+They are omitted on success and on every non-revision failure — `invalid`,
+`not_found`, `stale`, `no_healthy`, and the separate health conflict that
+reuses an already accepted sequence with different health content (that
+conflict still reports the current health `sequence` and reason; it is not a
+registration-state mismatch). An unknown service reached with
+`expectedRevision` 0 still creates the service on a register request and is
+`not_found` on the other request kinds, and an invalid field is still reported
+as `invalid` ahead of any revision mismatch.
+
 A `select` request may carry an optional `sessionKey` string to pin the
 request to a per-service session. The key's first successful selection rotates
 normally and remembers the chosen instance; later requests with the same key

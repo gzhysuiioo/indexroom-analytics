@@ -84,6 +84,13 @@ type Outcome struct {
 	Reason   string
 	Expected int
 	Actual   int
+
+	// RevisionMismatch reports whether this outcome is a conflict caused by the
+	// registration revision comparison. Only then do Expected and Actual carry
+	// the item's submitted expectedRevision and the service's current revision,
+	// and both must be reported even when one is 0. It is false on success and
+	// on every other failure kind, whose zero-valued revisions are not data.
+	RevisionMismatch bool
 }
 
 // HealthOutcome is the result of applying one health update against the registry.
@@ -98,6 +105,12 @@ type HealthOutcome struct {
 	Expected   int
 	Actual     int
 	Sequence   int64
+
+	// RevisionMismatch distinguishes the two conflict origins a health update
+	// can produce. It is true only for the registration revision comparison; a
+	// same-sequence/different-content conflict leaves it false and so reports
+	// the current sequence without the two revision comparison fields.
+	RevisionMismatch bool
 }
 
 // Selection is a validated request that chooses one healthy target instance.
@@ -139,6 +152,11 @@ type SelectOutcome struct {
 	InstanceID string
 	Address    string
 	Sequence   int64
+
+	// RevisionMismatch is true only for a registration revision conflict; a
+	// select's other failures (not_found, no_healthy) omit the two revision
+	// comparison fields.
+	RevisionMismatch bool
 }
 
 // SessionRelease is a validated request that drops one session binding.
@@ -170,6 +188,10 @@ type ReleaseOutcome struct {
 	Revision int
 	Expected int
 	Actual   int
+
+	// RevisionMismatch is true only for a registration revision conflict; a
+	// not_found for an unknown service omits the two revision comparison fields.
+	RevisionMismatch bool
 }
 
 // Registry is an in-memory service instance registry.
@@ -331,6 +353,14 @@ type revisionFailure struct {
 	revision int // current revision (0 for an unknown service)
 	expected int
 	actual   int
+
+	// revisionMismatch marks the conflict that comes from the registration
+	// revision comparison. Such a conflict reports both submitted and current
+	// revisions even when one of them is 0 (a brand-new service is at revision
+	// 0; a request can submit 0 against an existing service). It stays false for
+	// the not_found branch the same gate produces, so zero values there do not
+	// masquerade as a reported revision comparison.
+	revisionMismatch bool
 }
 
 // checkServiceRevision applies the gate the health and select operations share.
@@ -350,11 +380,12 @@ func (r *Registry) checkServiceRevision(service string, expected int) (*serviceS
 	}
 	if expected != actual {
 		return nil, &revisionFailure{
-			kind:     OutcomeConflict,
-			reason:   fmt.Sprintf("service %q is at revision %d, not %d", service, actual, expected),
-			revision: actual,
-			expected: expected,
-			actual:   actual,
+			kind:             OutcomeConflict,
+			reason:           fmt.Sprintf("service %q is at revision %d, not %d", service, actual, expected),
+			revision:         actual,
+			expected:         expected,
+			actual:           actual,
+			revisionMismatch: true,
 		}
 	}
 	if !exists {
@@ -372,13 +403,14 @@ func (r *Registry) checkServiceRevision(service string, expected int) (*serviceS
 // they remain omitted exactly as health's own revision failures always have.
 func (f *revisionFailure) asHealth(service string) HealthOutcome {
 	return HealthOutcome{
-		Service:  service,
-		OK:       false,
-		Kind:     f.kind,
-		Reason:   f.reason,
-		Revision: f.revision,
-		Expected: f.expected,
-		Actual:   f.actual,
+		Service:          service,
+		OK:               false,
+		Kind:             f.kind,
+		Reason:           f.reason,
+		Revision:         f.revision,
+		Expected:         f.expected,
+		Actual:           f.actual,
+		RevisionMismatch: f.revisionMismatch,
 	}
 }
 
@@ -386,13 +418,14 @@ func (f *revisionFailure) asHealth(service string) HealthOutcome {
 // never fabricates an instance id, address or sequence on rejection.
 func (f *revisionFailure) asSelect(service string) SelectOutcome {
 	return SelectOutcome{
-		Service:  service,
-		OK:       false,
-		Kind:     f.kind,
-		Reason:   f.reason,
-		Revision: f.revision,
-		Expected: f.expected,
-		Actual:   f.actual,
+		Service:          service,
+		OK:               false,
+		Kind:             f.kind,
+		Reason:           f.reason,
+		Revision:         f.revision,
+		Expected:         f.expected,
+		Actual:           f.actual,
+		RevisionMismatch: f.revisionMismatch,
 	}
 }
 
@@ -400,13 +433,14 @@ func (f *revisionFailure) asSelect(service string) SelectOutcome {
 // result. It carries no target fields: a release never selects an instance.
 func (f *revisionFailure) asRelease(service string) ReleaseOutcome {
 	return ReleaseOutcome{
-		Service:  service,
-		OK:       false,
-		Kind:     f.kind,
-		Reason:   f.reason,
-		Revision: f.revision,
-		Expected: f.expected,
-		Actual:   f.actual,
+		Service:          service,
+		OK:               false,
+		Kind:             f.kind,
+		Reason:           f.reason,
+		Revision:         f.revision,
+		Expected:         f.expected,
+		Actual:           f.actual,
+		RevisionMismatch: f.revisionMismatch,
 	}
 }
 
@@ -449,13 +483,14 @@ func (r *Registry) Apply(reg Registration) Outcome {
 	if !exists {
 		if reg.Revision != 0 {
 			return Outcome{
-				Service:  reg.Service,
-				OK:       false,
-				Kind:     OutcomeConflict,
-				Reason:   fmt.Sprintf("service %q does not exist yet; expected revision must be 0, got %d", reg.Service, reg.Revision),
-				Expected: reg.Revision,
-				Actual:   0,
-				Revision: 0,
+				Service:          reg.Service,
+				OK:               false,
+				Kind:             OutcomeConflict,
+				Reason:           fmt.Sprintf("service %q does not exist yet; expected revision must be 0, got %d", reg.Service, reg.Revision),
+				Expected:         reg.Revision,
+				Actual:           0,
+				Revision:         0,
+				RevisionMismatch: true,
 			}
 		}
 		st = &serviceState{revision: 1, instances: make(map[string]*instanceState, len(reg.Instances))}
@@ -467,13 +502,14 @@ func (r *Registry) Apply(reg Registration) Outcome {
 	}
 	if reg.Revision != st.revision {
 		return Outcome{
-			Service:  reg.Service,
-			OK:       false,
-			Kind:     OutcomeConflict,
-			Reason:   fmt.Sprintf("service %q is at revision %d, not %d", reg.Service, st.revision, reg.Revision),
-			Expected: reg.Revision,
-			Actual:   st.revision,
-			Revision: st.revision,
+			Service:          reg.Service,
+			OK:               false,
+			Kind:             OutcomeConflict,
+			Reason:           fmt.Sprintf("service %q is at revision %d, not %d", reg.Service, st.revision, reg.Revision),
+			Expected:         reg.Revision,
+			Actual:           st.revision,
+			Revision:         st.revision,
+			RevisionMismatch: true,
 		}
 	}
 	changed := !sameInstances(st.instances, reg.Instances)
