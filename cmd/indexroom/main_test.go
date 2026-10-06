@@ -42,6 +42,22 @@ func runRegisterWith(t *testing.T, input string) (string, int) {
 	return buf.String(), code
 }
 
+// hasRevisionPair reports whether r carries a registration-revision
+// conflict's expectedRevision/actualRevision pair, including when either value
+// is 0 — an explicit 0 must stay present in the JSON rather than looking like
+// an omitted field.
+func hasRevisionPair(r registerResult, expected, actual int) bool {
+	return r.ExpectedRevision != nil && *r.ExpectedRevision == expected &&
+		r.ActualRevision != nil && *r.ActualRevision == actual
+}
+
+// omitsRevisionPair reports that r carries neither revision comparison field,
+// as success, invalid, not_found, stale, no_healthy and a same-sequence
+// health-content conflict all do.
+func omitsRevisionPair(r registerResult) bool {
+	return r.ExpectedRevision == nil && r.ActualRevision == nil
+}
+
 func TestRegisterSuccess(t *testing.T) {
 	input := `{"requests":[
 		{"service":"b","expectedRevision":0,"instances":[{"id":"b2","address":"h2:2"},{"id":"b1","address":"h1:1"}]},
@@ -110,7 +126,7 @@ func TestRegisterFailuresDoNotAbort(t *testing.T) {
 		t.Fatalf("result 0: %+v", r)
 	}
 	// 1: conflict, expected 5 actual 1
-	if r := got.Results[1]; r.OK || r.Error != "conflict" || r.ExpectedRevision != 5 || r.ActualRevision != 1 || r.Revision != 1 {
+	if r := got.Results[1]; r.OK || r.Error != "conflict" || !hasRevisionPair(r, 5, 1) || r.Revision != 1 {
 		t.Fatalf("result 1: %+v", r)
 	}
 	// 2: update to rev 2
@@ -125,8 +141,8 @@ func TestRegisterFailuresDoNotAbort(t *testing.T) {
 	if r := got.Results[4]; r.OK || r.Error != "invalid" || r.Revision != 2 {
 		t.Fatalf("result 4: %+v", r)
 	}
-	// 5: conflict on a brand-new service
-	if r := got.Results[5]; r.OK || r.Error != "conflict" || r.ExpectedRevision != 1 || r.ActualRevision != 0 || r.Revision != 0 {
+	// 5: conflict on a brand-new service; actual revision 0 is still an explicit value
+	if r := got.Results[5]; r.OK || r.Error != "conflict" || !hasRevisionPair(r, 1, 0) || r.Revision != 0 {
 		t.Fatalf("result 5: %+v", r)
 	}
 	// Only the successful registrations are reflected.
@@ -330,7 +346,7 @@ func TestHealthFailures(t *testing.T) {
 		t.Fatalf("result 4: %+v", r)
 	}
 	// 5: wrong revision -> conflict
-	if r := got.Results[5]; r.OK || r.Error != "conflict" || r.ExpectedRevision != 2 || r.ActualRevision != 1 {
+	if r := got.Results[5]; r.OK || r.Error != "conflict" || !hasRevisionPair(r, 2, 1) {
 		t.Fatalf("result 5: %+v", r)
 	}
 	// 6: healthy seq 6 succeeds (state still healthy from result 1)
@@ -524,15 +540,15 @@ func TestSelectFailures(t *testing.T) {
 		t.Fatalf("results: %+v", got.Results)
 	}
 	// 2: wrong revision on existing service -> conflict expected 9 actual 1.
-	if r := got.Results[2]; r.OK || r.Error != "conflict" || r.ExpectedRevision != 9 || r.ActualRevision != 1 || r.Revision != 1 {
+	if r := got.Results[2]; r.OK || r.Error != "conflict" || !hasRevisionPair(r, 9, 1) || r.Revision != 1 {
 		t.Fatalf("result 2: %+v", r)
 	}
 	// 3: unknown service expected 0 -> not_found, revision 0.
 	if r := got.Results[3]; r.OK || r.Error != "not_found" || r.Revision != 0 || r.InstanceID != "" {
 		t.Fatalf("result 3: %+v", r)
 	}
-	// 4: unknown service expected 2 -> conflict actual 0.
-	if r := got.Results[4]; r.OK || r.Error != "conflict" || r.ExpectedRevision != 2 || r.ActualRevision != 0 || r.Revision != 0 {
+	// 4: unknown service expected 2 -> conflict actual 0 (0 still explicit).
+	if r := got.Results[4]; r.OK || r.Error != "conflict" || !hasRevisionPair(r, 2, 0) || r.Revision != 0 {
 		t.Fatalf("result 4: %+v", r)
 	}
 	// 6: service exists with zero instances -> no_healthy, revision 1.
@@ -723,7 +739,7 @@ func TestSelectAddressReplacementNoHealthyThenRecovery(t *testing.T) {
 	}
 	// A health report against the old revision conflicts even though its
 	// sequence (99) exceeds the old accepted one (20); it names both revisions.
-	if r := got.Results[6]; r.OK || r.Error != "conflict" || r.Reason == "" || r.ExpectedRevision != 1 || r.ActualRevision != 2 || r.Revision != 2 {
+	if r := got.Results[6]; r.OK || r.Error != "conflict" || r.Reason == "" || !hasRevisionPair(r, 1, 2) || r.Revision != 2 {
 		t.Fatalf("stale-revision health report: %+v", r)
 	}
 	// The conflicting report did not heal the new address: still no_healthy.
@@ -1033,7 +1049,7 @@ func TestRejectedReplacementKeepsAcceptedStateAndRotation(t *testing.T) {
 	// comparison is reported. The valid prefix (i1's new address) must not be
 	// applied either.
 	if r := got.Results[4]; r.OK || r.Error != "invalid" || r.Revision != 1 ||
-		r.ExpectedRevision != 0 || r.ActualRevision != 0 ||
+		!omitsRevisionPair(r) ||
 		r.InstanceID != "" || r.Address != "" {
 		t.Fatalf("result 4 invalid rejection: %+v", r)
 	}
@@ -1050,7 +1066,7 @@ func TestRejectedReplacementKeepsAcceptedStateAndRotation(t *testing.T) {
 	// states the expected and current revisions; no new address is accepted.
 	if r := got.Results[6]; r.OK || r.Error != "conflict" ||
 		r.Reason != `service "svc" is at revision 1, not 5` ||
-		r.Revision != 1 || r.ExpectedRevision != 5 || r.ActualRevision != 1 {
+		r.Revision != 1 || !hasRevisionPair(r, 5, 1) {
 		t.Fatalf("result 6 conflict: %+v", r)
 	}
 	// 7: past the end the rotation wraps to the smallest healthy id, returning
@@ -1195,15 +1211,15 @@ func TestEmptyListReplacementKeepsRotationAndDropsHealth(t *testing.T) {
 	// their sequences exceed the old accepted ones; each names the request and
 	// current revisions and restores no eligibility.
 	if r := got.Results[10]; r.OK || r.Error != "conflict" || r.Reason == "" ||
-		r.ExpectedRevision != 1 || r.ActualRevision != 3 || r.Revision != 3 {
+		!hasRevisionPair(r, 1, 3) || r.Revision != 3 {
 		t.Fatalf("result 10 stale-revision report: %+v", r)
 	}
 	if r := got.Results[11]; r.OK || r.Error != "conflict" || r.Reason == "" ||
-		r.ExpectedRevision != 2 || r.ActualRevision != 3 || r.Revision != 3 {
+		!hasRevisionPair(r, 2, 3) || r.Revision != 3 {
 		t.Fatalf("result 11 stale-revision report: %+v", r)
 	}
 	if r := got.Results[12]; r.OK || r.Error != "conflict" || r.Reason == "" ||
-		r.ExpectedRevision != 1 || r.ActualRevision != 3 || r.Revision != 3 {
+		!hasRevisionPair(r, 1, 3) || r.Revision != 3 {
 		t.Fatalf("result 12 stale-revision report: %+v", r)
 	}
 	// 13: the conflicting reports healed nothing — still no_healthy, and this
@@ -1289,7 +1305,7 @@ func TestRejectedConflictReplacementKeepsRotationPosition(t *testing.T) {
 		t.Fatalf("first select: %+v", r)
 	}
 	if r := got.Results[4]; r.OK || r.Error != "conflict" ||
-		r.Revision != 1 || r.ExpectedRevision != 7 || r.ActualRevision != 1 {
+		r.Revision != 1 || !hasRevisionPair(r, 7, 1) {
 		t.Fatalf("conflicting replacement: %+v", r)
 	}
 	// The conflict left the cursor just after i1: i2 is next, not i1 again.
@@ -1336,7 +1352,7 @@ func TestRejectedInvalidReplacementKeepsRotationPosition(t *testing.T) {
 	// Wrong revision AND invalid content: invalid wins; the reason is the
 	// address problem, with no expected/actual revision comparison reported.
 	if r := got.Results[4]; r.OK || r.Error != "invalid" || r.Revision != 1 ||
-		r.ExpectedRevision != 0 || r.ActualRevision != 0 {
+		!omitsRevisionPair(r) {
 		t.Fatalf("invalid replacement: %+v", r)
 	}
 	if !strings.Contains(got.Results[4].Reason, `instance address "bad-address" is not a host:port address`) {
@@ -1522,7 +1538,7 @@ func TestSelectSessionKeyInvalidPrecedesRevision(t *testing.T) {
 	// 3: blank sessionKey wins over the wrong revision: invalid, no revision
 	// comparison reported, and no binding created.
 	if r := got.Results[3]; r.OK || r.Error != "invalid" || r.Revision != 1 ||
-		r.ExpectedRevision != 0 || r.ActualRevision != 0 {
+		!omitsRevisionPair(r) {
 		t.Fatalf("invalid sessionKey: %+v", r)
 	}
 	if !strings.Contains(got.Results[3].Reason, "sessionKey") {
@@ -1764,7 +1780,7 @@ func TestSelectSessionKeyAddressReplacementNoHealthyKeepsBinding(t *testing.T) {
 	// sequence 99 exceeds anything accepted before; it names both revisions and
 	// must not heal the new address.
 	if r := got.Results[9]; r.OK || r.Error != "conflict" || r.Reason == "" ||
-		r.ExpectedRevision != 1 || r.ActualRevision != 2 || r.Revision != 2 {
+		!hasRevisionPair(r, 1, 2) || r.Revision != 2 {
 		t.Fatalf("old-revision health report: %+v", r)
 	}
 	// 10: with a unknown (the conflicting report healed nothing) and b, c
@@ -2714,7 +2730,7 @@ func TestInvalidAddressWhitespaceOrControlRejectedAtomically(t *testing.T) {
 	// invalid result carries neither the conflict's revision pair nor target
 	// instance fields.
 	if r := got.Results[2]; r.OK || r.Error != "invalid" || r.Revision != 1 ||
-		r.ExpectedRevision != 0 || r.ActualRevision != 0 ||
+		!omitsRevisionPair(r) ||
 		r.InstanceID != "" || r.Address != "" {
 		t.Fatalf("whitespace address with a wrong revision must be invalid at revision 1: %+v", r)
 	}
@@ -2724,7 +2740,7 @@ func TestInvalidAddressWhitespaceOrControlRejectedAtomically(t *testing.T) {
 	// 3: an interior control character is invalid at the matching revision; the
 	// valid change to i1 sitting earlier in the same list must not leak through.
 	if r := got.Results[3]; r.OK || r.Error != "invalid" || r.Revision != 1 ||
-		r.ExpectedRevision != 0 || r.ActualRevision != 0 ||
+		!omitsRevisionPair(r) ||
 		r.InstanceID != "" || r.Address != "" {
 		t.Fatalf("control-character address must invalidate the whole item: %+v", r)
 	}
@@ -3034,7 +3050,7 @@ func TestReleaseSessionFailures(t *testing.T) {
 	}
 	// 5: valid fields, mismatching revision: conflict with both revisions.
 	if r := got.Results[5]; r.OK || r.Error != "conflict" || r.Revision != 1 ||
-		r.ExpectedRevision != 9 || r.ActualRevision != 1 {
+		!hasRevisionPair(r, 9, 1) {
 		t.Fatalf("revision conflict: %+v", r)
 	}
 	// 6: unknown service at expectedRevision 0 is not_found.

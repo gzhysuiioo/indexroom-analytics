@@ -135,7 +135,7 @@ func TestRegisterResubmittedIdenticalListKeepsSessionRotationAndRevision(t *test
 	// conflict, with the reason and both revisions, and no false success.
 	if r := got.Results[10]; r.OK || r.Error != "conflict" ||
 		r.Reason != `service "svc" is at revision 1, not 2` ||
-		r.Revision != 1 || r.ExpectedRevision != 2 || r.ActualRevision != 1 {
+		r.Revision != 1 || !hasRevisionPair(r, 2, 1) {
 		t.Fatalf("result 10 identical content with wrong revision must conflict: %+v", r)
 	}
 

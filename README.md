@@ -77,6 +77,21 @@ revision is `not_found`, and a service with no healthy instance is
 `no_healthy`. Every failure states the reason and current revision and leaves
 the rotation position intact.
 
+A registration-revision `conflict` always carries both `expectedRevision` and
+`actualRevision` as JSON integers: the value that item submitted and the
+service's current revision while that item was handled. Zero is a real value
+on either side and is printed explicitly, never omitted — submitting 0 to a
+service at revision 1 yields `"expectedRevision":0,"actualRevision":1`, and
+submitting 2 to an unknown service yields `"expectedRevision":2,"actualRevision":0`
+with `revision` still 0, so a caller distinguishes a present zero from a
+missing field without parsing the reason. This applies to register
+replacements, health reports, target selection and session-release alike.
+Those two fields appear **only** on a registration-revision conflict:
+successful results and `invalid`, `not_found`, `stale` and `no_healthy`
+results omit them, and so does health's other conflict — reusing an already
+accepted sequence with different health content — which reports the current
+sequence and a reason instead and must not be read as a registration mismatch.
+
 A `select` request may carry an optional `sessionKey` string to pin the
 request to a per-service session. The key's first successful selection rotates
 normally and remembers the chosen instance; later requests with the same key
@@ -142,6 +157,7 @@ and the rotation position, and later requests in the batch still run.
 - 每次调用都从空注册表开始，示例所需的注册和观察必须放在同一批请求中。
 - 注册替换与观察的关系：替换实例列表时，实例标识和地址都没变的实例保留健康记录；地址改变或删除后重新加入的实例回到 `unknown`、序号 0、无原因，新地址只有在当前修订号下上报健康结果后才能被选择。旧修订号的观察即使序号更大也返回 `conflict`，不能把旧地址的健康结果带到新修订号。
 - 错误分类：字段无效（如 `service` 为空、`expectedRevision` 为负数或超出本程序整数范围（32 位 `0..2147483647`、64 位 `0..9223372036854775807`）、`sequence` 不是整数、非正或超出 `1..9223372036854775807`、不健康但原因为空白）返回 `invalid`；修订号不符返回 `conflict`；修订号匹配但服务或实例不存在返回 `not_found`。字段检查先于修订号判断。
+- 修订号不符的 `conflict` 结果同时携带 `expectedRevision` 与 `actualRevision` 两个 JSON 整数，分别是该项提交值和处理该项时服务的当前修订号；零也是有效数值并明确输出（当前修订号为 1 而提交 0 时为 `0` 和 `1`；对未知服务提交 2 时为 `2` 和 `0`，`revision` 仍为 0），因此无需解析原因文字即可区分字段缺失与数值零。相同序号不同内容的 `conflict` 属于另一类：报告当前健康序号和原因，继续省略这两个修订号字段，不能与注册状态不符混淆。成功结果以及 `invalid`、`not_found`、`stale`、`no_healthy` 也都省略这两个字段。
 
 ### 完整示例
 
@@ -208,6 +224,7 @@ echo '{"requests":[
 - 重复提交整理后标识和地址都相同的列表会成功，但结果中**不出现 `changed`**，修订号保持原值。
 - `instances: []` 是合法的空数组，可以清空实例列表；服务仍然存在（修订号匹配的查询仍能找到它），修订号照常按内容是否改变计算。`instances: null` 不能当成空数组，返回原因为 `instances must be an array` 的 `invalid`。
 - 每个失败项都带有失败原因（`reason`）和处理该项时的当前修订号（`revision`），失败不会覆盖原有列表；批次中的后续请求仍按输入顺序继续处理，因此一次失败后改用正确修订号提交即可成功更新。批次中只要含失败项，进程退出状态即为 1；全部成功才为 0。
+- 修订号不符的 `conflict` 结果另外同时给出 `expectedRevision`（该项提交值）和 `actualRevision`（处理该项时的当前修订号），两者始终是 JSON 整数，零也明确输出：当前为 1 而提交 0 时两者是 0 和 1；对未知服务提交 2 时是 2 和 0。成功结果与 `invalid` 等其他失败不输出这两个字段。
 
 ### 替换对健康记录的影响
 
@@ -526,7 +543,7 @@ echo '{"requests":[
 - `service`：服务名，先去除两端空白；整理后为空返回 `invalid`。解除只作用于该服务，其他服务下的同名会话键不受影响。
 - `expectedRevision`：必填整数，合法性要求与其他请求完全一致（32 位程序 `0..2147483647`、64 位程序 `0..9223372036854775807`）。
 - `sessionKey`：**必填**。先去除两端空白；缺失、显式 `null`、非字符串或整理后为空都返回 `invalid`，原因明确指出 `sessionKey` 问题（整理后相同的键是同一个会话）。
-- **字段检查先于修订号判断**：字段全部合法后，修订号不匹配返回 `conflict`（携带 `expectedRevision` 与 `actualRevision`）；未知服务在 `expectedRevision` 为 0 时返回 `not_found`。失败报告处理该项时的当前修订号和具体原因，保留全部绑定和轮询位置，批次后续请求继续执行。
+- **字段检查先于修订号判断**：字段全部合法后，修订号不匹配返回 `conflict`（携带 `expectedRevision` 与 `actualRevision`，零也明确输出）；未知服务在 `expectedRevision` 为 0 时返回 `not_found`。失败报告处理该项时的当前修订号和具体原因，保留全部绑定和轮询位置，批次后续请求继续执行。
 
 ### 成功语义与不变量
 

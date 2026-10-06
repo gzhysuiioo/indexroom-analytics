@@ -216,7 +216,7 @@ func TestReleaseSessionConflictAfterExcludeRebind(t *testing.T) {
 	// current one and stating a reason — and choosing no target.
 	if r := got.Results[7]; r.OK || r.Error != "conflict" ||
 		r.Reason == "" || r.Revision != 1 ||
-		r.ExpectedRevision != 9 || r.ActualRevision != 1 ||
+		!hasRevisionPair(r, 9, 1) ||
 		r.InstanceID != "" || r.Address != "" || r.Sequence != 0 {
 		t.Fatalf("result 7 wrong-revision release must conflict: %+v", r)
 	}

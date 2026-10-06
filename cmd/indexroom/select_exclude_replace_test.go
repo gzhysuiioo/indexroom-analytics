@@ -193,7 +193,7 @@ func TestSelectExcludeFailuresAfterReplacementKeepPosition(t *testing.T) {
 	// stating the expected and actual revisions and reporting the current one.
 	if r := got.Results[8]; r.OK || r.Error != "conflict" ||
 		r.Reason != `service "svc" is at revision 2, not 1` ||
-		r.Revision != 2 || r.ExpectedRevision != 1 || r.ActualRevision != 2 {
+		r.Revision != 2 || !hasRevisionPair(r, 1, 2) {
 		t.Fatalf("result 8 stale-revision select must conflict: %+v", r)
 	}
 	// 9: the correct revision with every healthy instance excluded is

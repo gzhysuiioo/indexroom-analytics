@@ -43,7 +43,7 @@ func assertRangeInvalid(t *testing.T, r registerResult, currentRevision int, sub
 	if r.Revision != currentRevision {
 		t.Fatalf("revision should report the current revision %d, got %d (%+v)", currentRevision, r.Revision, r)
 	}
-	if r.ExpectedRevision != 0 || r.ActualRevision != 0 {
+	if !omitsRevisionPair(r) {
 		t.Fatalf("range failure must not report a revision comparison: %+v", r)
 	}
 }
@@ -166,8 +166,9 @@ func TestRegisterExpectedRevisionBoundaries(t *testing.T) {
 	if r.OK || r.Error != "conflict" || r.Revision != 0 {
 		t.Fatalf("bound value should reach the revision comparison: %+v", r)
 	}
-	if strconv.FormatInt(int64(r.ExpectedRevision), 10) != bound || r.ActualRevision != 0 {
-		t.Fatalf("conflict should preserve expected %s, got %+v", bound, r)
+	if r.ExpectedRevision == nil || strconv.FormatInt(int64(*r.ExpectedRevision), 10) != bound ||
+		r.ActualRevision == nil || *r.ActualRevision != 0 {
+		t.Fatalf("conflict should preserve expected %s and explicit actual 0, got %+v", bound, r)
 	}
 
 	// One more than the bound is invalid on every architecture. On 64-bit that
@@ -303,7 +304,7 @@ func TestRegisterOutOfRangeFieldPrecedence(t *testing.T) {
 		if r.OK || r.Error != "invalid" || !strings.Contains(r.Reason, sub) {
 			t.Fatalf("result %d: want invalid containing %q, got %+v", i, sub, r)
 		}
-		if r.ExpectedRevision != 0 || r.ActualRevision != 0 {
+		if !omitsRevisionPair(r) {
 			t.Fatalf("result %d must not report a revision comparison: %+v", i, r)
 		}
 	}
@@ -374,7 +375,7 @@ func TestRegisterLargeInRangeRevisionOn64Bit(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		r := got.Results[i]
 		if r.OK || r.Error != "conflict" ||
-			r.ExpectedRevision != wantExpected || r.ActualRevision != 1 || r.Revision != 1 {
+			!hasRevisionPair(r, wantExpected, 1) || r.Revision != 1 {
 			t.Fatalf("result %d should be a normal conflict preserving %s: %+v", i, large, r)
 		}
 	}
