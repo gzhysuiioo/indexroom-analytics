@@ -532,10 +532,10 @@ func finishSnapshotBlock(fields map[string]json.RawMessage) (Block, error) {
 	if block.Height, err = snapshotInt64(fields["height"], "height"); err != nil {
 		return block, err
 	}
-	if block.Hash, err = snapshotString(fields["hash"], "hash", block.Height); err != nil {
+	if block.Hash, err = decodeSnapshotString(fields["hash"], snapshotFieldLoc(block.Height, "hash")); err != nil {
 		return block, err
 	}
-	if block.Parent, err = snapshotString(fields["parent"], "parent", block.Height); err != nil {
+	if block.Parent, err = decodeSnapshotString(fields["parent"], snapshotFieldLoc(block.Height, "parent")); err != nil {
 		return block, err
 	}
 	txs, err := parseSnapshotTxs(json.NewDecoder(bytes.NewReader(fields["txs"])), block.Height)
@@ -559,21 +559,68 @@ func snapshotInt64(raw json.RawMessage, field string) (int64, error) {
 	return v, nil
 }
 
-// snapshotString decodes one required string field, rejecting null rather
-// than letting it pass as the empty string. The raw literal is also checked
-// for invalid UTF-8 bytes and unpaired or misordered \uXXXX surrogate
-// escapes, which the decoder would otherwise silently rewrite to U+FFFD;
-// height identifies the block the field belongs to in the error.
-func snapshotString(raw json.RawMessage, field string, height int64) (string, error) {
+// snapshotStringLoc pinpoints one required string identifier in the snapshot
+// — a block's hash or parent, or one element of its transaction list — so
+// the shared decoding rules can word each rejection for that position.
+type snapshotStringLoc struct {
+	height  int64  // height of the block the identifier belongs to
+	field   string // "hash", "parent", or "txs"
+	element int    // zero-based position inside txs; -1 for a plain field
+}
+
+// snapshotFieldLoc locates a block's hash or parent field.
+func snapshotFieldLoc(height int64, field string) snapshotStringLoc {
+	return snapshotStringLoc{height: height, field: field, element: -1}
+}
+
+// snapshotTxLoc locates one transaction identifier inside a block's txs
+// list by its zero-based position.
+func snapshotTxLoc(height int64, element int) snapshotStringLoc {
+	return snapshotStringLoc{height: height, field: "txs", element: element}
+}
+
+// nullErr rejects a JSON null where the identifier is required.
+func (loc snapshotStringLoc) nullErr() error {
+	if loc.element >= 0 {
+		return invalidSnapshot("block at height %d: txs element %d must not be null", loc.height, loc.element)
+	}
+	return invalidSnapshot("field %q must not be null", loc.field)
+}
+
+// decodeErr reports a value that is not a JSON string at all.
+func (loc snapshotStringLoc) decodeErr(err error) error {
+	if loc.element >= 0 {
+		return classifySnapshotErr(fmt.Errorf("txs element: %w", err))
+	}
+	return classifySnapshotErr(fmt.Errorf("field %q: %w", loc.field, err))
+}
+
+// encodingErr rejects invalid UTF-8 bytes or unpaired or misordered
+// surrogate escapes in the raw string literal.
+func (loc snapshotStringLoc) encodingErr() error {
+	if loc.element >= 0 {
+		return invalidSnapshot("block at height %d: field %q element %d has invalid UTF-8 or unpaired surrogate escapes", loc.height, loc.field, loc.element)
+	}
+	return invalidSnapshot("block at height %d: field %q has invalid UTF-8 or unpaired surrogate escapes", loc.height, loc.field)
+}
+
+// decodeSnapshotString decodes one required string identifier from its raw
+// value, applying the rules hash, parent, and every transaction identifier
+// share: null is rejected rather than passing as the empty string, the value
+// must be a JSON string, and the raw literal is checked for invalid UTF-8
+// bytes and unpaired or misordered \uXXXX surrogate escapes, which the
+// decoder would otherwise silently rewrite to U+FFFD. loc words each
+// rejection for the identifier's position in the document.
+func decodeSnapshotString(raw json.RawMessage, loc snapshotStringLoc) (string, error) {
 	if isSnapshotNull(raw) {
-		return "", invalidSnapshot("field %q must not be null", field)
+		return "", loc.nullErr()
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", classifySnapshotErr(fmt.Errorf("field %q: %w", field, err))
+		return "", loc.decodeErr(err)
 	}
 	if !validSnapshotString(raw) {
-		return "", invalidSnapshot("block at height %d: field %q has invalid UTF-8 or unpaired surrogate escapes", height, field)
+		return "", loc.encodingErr()
 	}
 	return s, nil
 }
@@ -679,10 +726,11 @@ func parseSnapshotTimestamp(raw json.RawMessage) (*int64, error) {
 }
 
 // parseSnapshotTxs reads one txs array, preserving duplicates and empty
-// identifiers exactly as written. A null element is rejected, naming the
-// block's height and the element's zero-based position, and so is an
-// element whose raw string carries invalid UTF-8 bytes or unpaired or
-// misordered surrogate escapes.
+// identifiers exactly as written. Each element follows the same string rules
+// as hash and parent — null is rejected, the value must be a string, and the
+// raw literal must carry valid UTF-8 with no unpaired or misordered
+// surrogate escapes — with errors naming the block's height and the
+// element's zero-based position.
 func parseSnapshotTxs(dec *json.Decoder, height int64) ([]string, error) {
 	tok, err := dec.Token()
 	if err != nil {
@@ -697,15 +745,9 @@ func parseSnapshotTxs(dec *json.Decoder, height int64) ([]string, error) {
 		if err := dec.Decode(&raw); err != nil {
 			return nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err))
 		}
-		if isSnapshotNull(raw) {
-			return nil, invalidSnapshot("block at height %d: txs element %d must not be null", height, len(txs))
-		}
-		var tx string
-		if err := json.Unmarshal(raw, &tx); err != nil {
-			return nil, classifySnapshotErr(fmt.Errorf("txs element: %w", err))
-		}
-		if !validSnapshotString(raw) {
-			return nil, invalidSnapshot("block at height %d: field %q element %d has invalid UTF-8 or unpaired surrogate escapes", height, "txs", len(txs))
+		tx, err := decodeSnapshotString(raw, snapshotTxLoc(height, len(txs)))
+		if err != nil {
+			return nil, err
 		}
 		txs = append(txs, tx)
 	}
