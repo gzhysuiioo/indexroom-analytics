@@ -57,6 +57,22 @@ func New() *Index {
 // once it runs, must observe the complete new chain.
 var reorgAppliedHookLocked func(newTip int64)
 
+// appendArrivalHook is a test-only rendezvous invoked from Append BEFORE the
+// index lock is taken and before any validation or mutation. It is nil in
+// production; concurrent-append regression tests park every contender at the
+// gate until all submissions of one round have arrived, then serialize them
+// in a content-chosen (but semantically arbitrary) order, so the
+// simultaneous-append guarantee is exercised deterministically instead of
+// relying on scheduling luck.
+var appendArrivalHook func(block Block)
+
+// appendEnteredHookLocked is the matching in-lock rendezvous, invoked once
+// the gated contender has acquired index.mu and before validation runs. It is
+// nil in production; tests park the chosen first contender here while the
+// others block on the mutex, then let it commit — forcing the exact instant
+// at which one candidate becomes the main-chain block.
+var appendEnteredHookLocked func(block Block)
+
 // Append accepts a block only when it extends the current tip, keeping the
 // chain linear. Re-submitting a block identical to one already on the main
 // chain is a successful no-op. A block whose hash, parent, or any transaction
@@ -64,8 +80,14 @@ var reorgAppliedHookLocked func(newTip int64)
 // height and field (and the zero-based tx position); a rejected append leaves
 // the index untouched.
 func (index *Index) Append(block Block) error {
+	if appendArrivalHook != nil {
+		appendArrivalHook(block)
+	}
 	index.mu.Lock()
 	defer index.mu.Unlock()
+	if appendEnteredHookLocked != nil {
+		appendEnteredHookLocked(block)
+	}
 	return index.appendLocked(block)
 }
 
