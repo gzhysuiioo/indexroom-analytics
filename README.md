@@ -89,6 +89,24 @@ session), bindings are independent per service, and an explicit `null`, a
 non-string or a blank-after-trim key is `invalid` with a reason naming the
 `sessionKey` problem. Failed selections never create or rewrite a binding.
 
+A `select` request may also carry an optional `excludeInstanceIds` array of
+strings naming instances this one request must not choose — for example when
+the caller already tried one instance for this attempt and wants another
+healthy target. The exclusion scopes only that request: excluded instances
+stay registered with their health records and remain eligible for later
+requests submitted without the list. Ids are trimmed before matching,
+duplicates count as one, and unknown ids are ignored; an omitted field or an
+empty array selects exactly as before. An explicit `null`, a non-array value,
+a non-string element or a blank-after-trim id is `invalid` with a reason
+naming the `excludeInstanceIds` problem, checked before the revision
+comparison. The rotation still continues just after the last actually rotated
+id — excluding that id does not reset the position — and a session whose
+bound instance is excluded falls back to the filtered rotation, rebinding
+only its own key on success. When every healthy instance is excluded the
+result is `no_healthy` with a reason saying the exclusion removed them all;
+the failure fabricates no target and moves neither the cursor nor any
+binding.
+
 A `release_session` request carries `service`, `expectedRevision` and a
 **required** `sessionKey` and drops that one session binding in that one
 service, so the key's next selection joins the normal rotation again. A
@@ -420,6 +438,84 @@ echo '{"requests":[
 15. `user-42` 最后再选择：依旧复用 `i2`、序号 1。普通轮询在第 14 项经过 `i1` 不会改写会话绑定。
 
 末尾的 `services` 列表与逐项结果一一对应：`i1` 为 `healthy`、序号 3，`i2` 为 `healthy`、序号 1；`i1` 的不健康原因已被第 12 项的健康观察清空，因此列表中没有原因字段，实例按标识升序排列。整批选择期间注册修订号始终是 1，健康序号只由第 2、3、8、12 项 `health` 请求推进，`select` 不改变注册修订号或任何健康记录；成功的选择结果没有 `changed` 字段，失败项（第 10 项）没有目标实例字段。本批次含有失败项，进程退出状态为 1，即使其后第 11–15 项全部成功也一样。输出只包含程序实际公开的字段：会话绑定和轮询位置没有查询接口，只能像本示例这样通过后续选择的返回来观察。
+
+## 选择时排除实例（`select` 请求的 `excludeInstanceIds`）中文说明
+
+`select` 请求可以携带可选的字符串数组 `excludeInstanceIds`，用于本次请求已经尝试过一个实例、希望继续选择其他健康目标的情况。规则如下：
+
+- 排除只影响这一项请求：被排除的实例仍保留注册状态和原有健康记录，后续未提交排除列表的普通请求仍可选择它。未提供该字段或提供空数组 `[]` 时，沿用现有选择行为。
+- 列表必须是字符串数组。标识先去除两端空白，再与注册后的实例标识对应；重复标识按同一个标识处理，尚未注册的标识可以忽略。显式 `null`、非数组、数组中的非字符串或整理后为空的标识，都使该项返回 `invalid`，原因明确指出 `excludeInstanceIds` 的问题；字段校验仍先于修订号判断，列表里其他合法标识不能使失败请求部分生效。
+- 选择只能返回当前健康且未被本次排除的实例。沿用按实例标识升序轮询的规则，从最近一次实际轮询选中的标识之后继续，末尾没有候选时才回到最小标识；排除最后选中的实例也不能重置轮询位置。例如当前位置在 `a`，`a`、`b`、`c` 都健康，本次排除 `b` 应选中 `c`，随后不带排除列表的普通选择应得到 `a`，再下一次得到 `b`。成功结果继续返回所选实例当前地址和最新健康序号，注册修订号不因筛选而变化。
+- 带 `sessionKey` 的选择同样服从这份列表：绑定实例健康且未被排除时照常复用，不推进轮询；绑定实例被排除时，按当前轮询位置选择其他健康目标，仅成功后替换该键的绑定并推进轮询，其他会话保留原有绑定。
+- 服务存在且修订号匹配，但筛选后没有健康目标时仍返回 `no_healthy`；如果原本有健康实例而全部被排除，原因明确说明这一点。失败不返回实例标识、地址或健康序号，不改写任何绑定和轮询位置，批次后续请求继续按各自的排除范围处理。
+
+### 完整示例
+
+下面用三个健康实例（`a`/`b`/`c`）展示：排除只影响当次请求、轮询位置不因排除而重置、会话绑定实例被排除时回退轮询并改写绑定，以及非法列表与全部排除两种失败形态：
+
+```bash
+echo '{"requests":[
+  {"type":"register","service":"svc","expectedRevision":0,"instances":[
+    {"id":"a","address":"h1:8080"},
+    {"id":"b","address":"h2:8080"},
+    {"id":"c","address":"h3:8080"}
+  ]},
+  {"type":"health","service":"svc","instanceId":"a","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"health","service":"svc","instanceId":"b","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"health","service":"svc","instanceId":"c","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"select","service":"svc","expectedRevision":1},
+  {"type":"select","service":"svc","expectedRevision":1,"excludeInstanceIds":["b"]},
+  {"type":"select","service":"svc","expectedRevision":1},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"user-42"},
+  {"type":"select","service":"svc","expectedRevision":1,"sessionKey":"user-42","excludeInstanceIds":["b"]},
+  {"type":"select","service":"svc","expectedRevision":1,"excludeInstanceIds":null},
+  {"type":"select","service":"svc","expectedRevision":1,"excludeInstanceIds":["a","b","c"]},
+  {"type":"select","service":"svc","expectedRevision":1}
+]}' | go run ./cmd/indexroom register
+```
+
+输出（逐项说明见后）：
+
+```json
+{
+  "results": [
+    {"service":"svc","ok":true,"changed":true,"revision":1},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"a","address":"h1:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"c","address":"h3:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"a","address":"h1:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"b","address":"h2:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"c","address":"h3:8080"},
+    {"service":"svc","ok":false,"revision":1,"error":"invalid","reason":"excludeInstanceIds must be an array of strings, not null"},
+    {"service":"svc","ok":false,"revision":1,"error":"no_healthy","reason":"service \"svc\" has no healthy instance available: all healthy instances are excluded by excludeInstanceIds"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"a","address":"h1:8080"}
+  ],
+  "services": [
+    {"service":"svc","revision":1,"instances":[
+      {"id":"a","address":"h1:8080","health":"healthy","sequence":1},
+      {"id":"b","address":"h2:8080","health":"healthy","sequence":1},
+      {"id":"c","address":"h3:8080","health":"healthy","sequence":1}
+    ]}
+  ]
+}
+```
+
+逐项说明：
+
+1. 注册服务 `svc`，含 `a`、`b`、`c` 三个实例，修订号为 1。
+2–4. 三个实例各接受序号 1 的健康观察，全部 `healthy`；健康上报不增加修订号。
+5. 普通选择从最小标识开始，选中 `a`，轮询位置停在 `a`。
+6. 本次排除 `b`：从位置 `a` 之后继续，候选只剩 `a`、`c`，于是选中 `c`，轮询位置推进到 `c`。`b` 的注册状态和健康记录不受影响。
+7. 不带排除列表的普通选择越过末尾回到 `a`，证明第 6 项的排除没有重置轮询位置，也没有移除 `b`。
+8. 会话键 `user-42` 首次选择参与正常轮询，从位置 `a` 之后选中 `b`，记住绑定 `user-42 → b`。
+9. 同一会话本次排除 `b`：绑定实例被排除，不能复用，按当前轮询位置（`b` 之后）在未被排除的 `a`、`c` 中选中 `c`；成功后该键的绑定改写为 `user-42 → c`，轮询位置推进到 `c`，其他会话的绑定不受影响。
+10. `excludeInstanceIds:null` 不是数组，返回 `invalid`，原因明确指出 `excludeInstanceIds` 问题，`revision` 报告当前修订号 1；失败项没有目标实例字段，也不移动轮询位置、不改写绑定。
+11. 排除 `a`、`b`、`c`：三个实例原本都健康但全部被排除，返回 `no_healthy`，原因明确说明所有健康实例都被 `excludeInstanceIds` 排除；失败同样不移动轮询位置。
+12. 普通选择从最近一次实际轮询位置 `c` 之后继续，越过末尾回到 `a`；第 10、11 项的失败没有改变任何状态。
+
+末尾的 `services` 列表显示三个实例仍为 `healthy`、序号 1，注册修订号始终为 1：排除只是当次请求的筛选，不改变注册和健康记录。本批次含失败项（第 10、11 项），进程退出状态为 1。
 
 ## 解除单个会话绑定（`release_session` 请求）中文说明
 

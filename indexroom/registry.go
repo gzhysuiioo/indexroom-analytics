@@ -107,10 +107,17 @@ type HealthOutcome struct {
 // first successful selection remembers the chosen instance for the key and
 // later requests with the same key reuse that instance while it stays
 // registered and healthy.
+//
+// ExcludeIDs is the normalized (trimmed, deduplicated) excludeInstanceIds
+// list, empty when the request carries none. It scopes only this one request:
+// the listed ids are skipped as targets but stay registered with their health
+// records untouched, so a later request without the list may choose them
+// again. Ids that are not registered are simply ignored.
 type Selection struct {
 	Service    string
 	Revision   int
 	SessionKey string
+	ExcludeIDs []string
 }
 
 // SelectOutcome is the result of choosing one healthy instance.
@@ -651,7 +658,7 @@ func validateSessionRequest(service string, revision int64, sessionKey *string, 
 // ValidateSelection trims and validates one select request without touching
 // the registry. Content validity is established before any revision check.
 func (r *Registry) ValidateSelection(service string, revision int64) (Selection, error) {
-	return r.ValidateSelectionWithSession(service, revision, nil)
+	return r.ValidateSelectionWithExclusions(service, revision, nil, nil)
 }
 
 // ValidateSelectionWithSession is ValidateSelection with an optional session
@@ -661,11 +668,56 @@ func (r *Registry) ValidateSelection(service string, revision int64) (Selection,
 // expectedRevision, range-checked before it is narrowed to int. Content
 // validity is established before any revision check.
 func (r *Registry) ValidateSelectionWithSession(service string, revision int64, sessionKey *string) (Selection, error) {
+	return r.ValidateSelectionWithExclusions(service, revision, sessionKey, nil)
+}
+
+// ValidateSelectionWithExclusions is ValidateSelectionWithSession with an
+// optional excludeInstanceIds list. A nil or empty list means an ordinary
+// selection with no exclusions. Each id is trimmed before use and duplicate
+// ids count as one; an id that is blank after trimming is invalid with a
+// reason naming the excludeInstanceIds problem. Ids unknown to the registry
+// are not an error — they simply exclude nothing. revision is the raw
+// submitted expectedRevision, range-checked before it is narrowed to int.
+// Content validity is fully established before any revision check, so a
+// malformed list fails the item as invalid even when its revision would also
+// conflict, and no valid id in the list can make the failed item partially
+// take effect.
+func (r *Registry) ValidateSelectionWithExclusions(service string, revision int64, sessionKey *string, excludeIDs []string) (Selection, error) {
 	name, rev, key, err := validateSessionRequest(service, revision, sessionKey, false, "")
 	if err != nil {
 		return Selection{}, err
 	}
-	return Selection{Service: name, Revision: rev, SessionKey: key}, nil
+	excludes, err := normalizeExcludeIDs(excludeIDs)
+	if err != nil {
+		return Selection{}, err
+	}
+	return Selection{Service: name, Revision: rev, SessionKey: key, ExcludeIDs: excludes}, nil
+}
+
+// normalizeExcludeIDs trims and deduplicates one excludeInstanceIds list.
+// Each id is trimmed of surrounding whitespace before it names an instance;
+// ids equal after trimming name the same instance and are kept once. An id
+// that is blank after trimming is invalid with a reason naming the
+// excludeInstanceIds problem. A nil or empty list normalizes to nil, which
+// selects exactly as if the field had never been submitted.
+func normalizeExcludeIDs(raw []string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]bool, len(raw))
+	ids := make([]string, 0, len(raw))
+	for _, id := range raw {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return nil, errInvalid("excludeInstanceIds must not contain an empty instance id")
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // ValidateSessionRelease trims and validates one release_session request
@@ -714,18 +766,38 @@ func (r *Registry) ValidateSessionRelease(service string, revision int64, sessio
 // The first selection for a key behaves exactly like an ordinary rotation
 // success and additionally records the binding. Failed selections (including
 // no_healthy) create no binding, rewrite none and move no cursor.
+//
+// A request carrying excludeInstanceIds skips the listed ids for this one
+// request only: an excluded instance keeps its registration and health record
+// and a later request without the list may choose it again. The exclusion
+// filters the healthy candidate set before the rotation runs, so the rotation
+// still continues just after the last actually rotated id — excluding that id
+// does not reset the position, the next non-excluded healthy id after it is
+// chosen, and only when none follows does the rotation wrap to the smallest
+// candidate. A bound session whose instance is excluded falls back to this
+// filtered rotation exactly as if the instance were unhealthy, rebinding only
+// that key on success while every other session keeps its binding. When the
+// service has healthy instances but every one of them is excluded, the
+// no_healthy reason says the exclusion removed them all; when there is no
+// healthy instance at all, the reason is the ordinary one. Either failure
+// fabricates no target and moves nothing.
 func (r *Registry) Select(sel Selection) SelectOutcome {
 	st, fail := r.checkServiceRevision(sel.Service, sel.Revision)
 	if fail != nil {
 		return fail.asSelect(sel.Service)
 	}
 
-	// A bound session reuses its instance while it is registered and healthy;
-	// the reuse reflects the instance's current address and sequence and does
-	// not advance the rotation.
+	excluded := make(map[string]bool, len(sel.ExcludeIDs))
+	for _, id := range sel.ExcludeIDs {
+		excluded[id] = true
+	}
+
+	// A bound session reuses its instance while it is registered, healthy and
+	// not excluded by this request; the reuse reflects the instance's current
+	// address and sequence and does not advance the rotation.
 	if sel.SessionKey != "" {
 		if id, bound := st.sessions[sel.SessionKey]; bound {
-			if cur, ok := st.instances[id]; ok && cur.health == HealthHealthy {
+			if cur, ok := st.instances[id]; ok && cur.health == HealthHealthy && !excluded[id] {
 				return SelectOutcome{
 					Service:    sel.Service,
 					OK:         true,
@@ -745,20 +817,31 @@ func (r *Registry) Select(sel Selection) SelectOutcome {
 		}
 	}
 	sort.Strings(healthy)
-	if len(healthy) == 0 {
+
+	candidates := healthy[:0]
+	for _, id := range healthy {
+		if !excluded[id] {
+			candidates = append(candidates, id)
+		}
+	}
+	if len(candidates) == 0 {
+		reason := fmt.Sprintf("service %q has no healthy instance available", sel.Service)
+		if len(healthy) > 0 {
+			reason = fmt.Sprintf("service %q has no healthy instance available: all healthy instances are excluded by excludeInstanceIds", sel.Service)
+		}
 		return SelectOutcome{
 			Service:  sel.Service,
 			OK:       false,
 			Kind:     OutcomeNoHealthy,
-			Reason:   fmt.Sprintf("service %q has no healthy instance available", sel.Service),
+			Reason:   reason,
 			Revision: st.revision,
 		}
 	}
 
-	chosen := healthy[0]
+	chosen := candidates[0]
 	if st.cursorSet {
-		chosen = healthy[0]
-		for _, id := range healthy {
+		chosen = candidates[0]
+		for _, id := range candidates {
 			if id > st.cursor {
 				chosen = id
 				break

@@ -55,6 +55,9 @@ func usage() {
 	fmt.Println("A select request may carry an optional \"sessionKey\" string: requests in the")
 	fmt.Println("same service with the same trimmed key reuse the instance first chosen for")
 	fmt.Println("that key while it stays registered and healthy, without moving the rotation.")
+	fmt.Println("A select request may also carry an optional \"excludeInstanceIds\" array of")
+	fmt.Println("strings: the listed instances are skipped for that one request only, keeping")
+	fmt.Println("their registration and health records, and stay eligible for later requests.")
 	fmt.Println("A release_session request carries service, expectedRevision and a required")
 	fmt.Println("sessionKey; it drops that key's binding in the named service so the next")
 	fmt.Println("selection with the key joins the rotation again. It chooses no target, moves")
@@ -286,10 +289,14 @@ func (p *registerProcessor) parseSequence(service string, raw json.RawMessage) (
 // expectedRevision (still int64, range-checked later by the registry before it
 // is narrowed to int), and the optional session key (nil when the field was
 // omitted). Explicit null and non-string keys are rejected while decoding.
+// excludeIDs is the raw excludeInstanceIds token, kept undecoded here: only
+// select interprets it, and its per-element checks live with the select
+// handler so release_session keeps ignoring the field.
 type sessionRequestInput struct {
 	service    string
 	revision   int64
 	sessionKey *string
+	excludeIDs json.RawMessage
 }
 
 // readSessionRequest decodes one select/release_session item, centralizing the
@@ -315,6 +322,7 @@ func (p *registerProcessor) readSessionRequest(raw json.RawMessage, service, sha
 		Service  string          `json:"service"`
 		Revision json.RawMessage `json:"expectedRevision"`
 		Session  json.RawMessage `json:"sessionKey"`
+		Exclude  json.RawMessage `json:"excludeInstanceIds"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		p.invalidf(service, shapeReason, err)
@@ -350,7 +358,47 @@ func (p *registerProcessor) readSessionRequest(raw json.RawMessage, service, sha
 	if !ok {
 		return sessionRequestInput{}, false
 	}
-	return sessionRequestInput{service: service, revision: revision, sessionKey: sessionKey}, true
+	return sessionRequestInput{service: service, revision: revision, sessionKey: sessionKey, excludeIDs: req.Exclude}, true
+}
+
+// parseExcludeIDs decodes the raw excludeInstanceIds token of one select
+// request. An omitted field (and only that) yields a nil list, which selects
+// exactly as before; an explicit null, a non-array token or a non-string
+// element becomes this item's own invalid result with a reason naming the
+// excludeInstanceIds problem, so one malformed list neither aborts the batch
+// nor partially applies alongside the valid ids it also carried. The elements
+// are returned as submitted — trimming, deduplication and the blank-id rule
+// belong to the registry's validator, which runs them before any revision
+// comparison just like the sessionKey checks. It reports false after
+// appending the item's invalid result, which stamps the service's current
+// revision.
+func (p *registerProcessor) parseExcludeIDs(service string, raw json.RawMessage) ([]string, bool) {
+	if len(raw) == 0 {
+		return nil, true
+	}
+	if strings.TrimSpace(string(raw)) == "null" {
+		p.invalid(service, "excludeInstanceIds must be an array of strings, not null")
+		return nil, false
+	}
+	if !isJSONArray(raw) {
+		p.invalid(service, "excludeInstanceIds must be an array of strings")
+		return nil, false
+	}
+	var elements []json.RawMessage
+	if err := json.Unmarshal(raw, &elements); err != nil {
+		p.invalidf(service, "excludeInstanceIds must be an array of strings: %v", err)
+		return nil, false
+	}
+	ids := make([]string, 0, len(elements))
+	for _, element := range elements {
+		var id string
+		if err := json.Unmarshal(element, &id); err != nil {
+			p.invalid(service, "excludeInstanceIds must contain only strings")
+			return nil, false
+		}
+		ids = append(ids, id)
+	}
+	return ids, true
 }
 
 // reject records a business-rule failure (conflict, not_found, stale or
@@ -497,6 +545,8 @@ func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 // A selection performs no network access and never alters registrations or
 // health records; it only advances the service's healthy-instance rotation
 // and, for requests carrying a sessionKey, maintains that session's binding.
+// An optional excludeInstanceIds array of strings skips the listed instances
+// for this one request without touching their registration or health records.
 func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 	in, ok := p.readSessionRequest(raw, service,
 		"select request must be an object with service and expectedRevision: %v")
@@ -504,10 +554,21 @@ func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 		return
 	}
 
+	// The exclude list is decoded after the shared session/revision token
+	// handling and validated by the registry before any revision comparison,
+	// so a malformed list is this item's own invalid result and never a
+	// conflict, and the valid ids it also carried cannot partially apply.
+	excludeIDs, ok := p.parseExcludeIDs(in.service, in.excludeIDs)
+	if !ok {
+		return
+	}
+
 	// readSessionRequest delivered the parsed revision and the key as decoded
-	// (nil for an omitted key); ValidateSelectionWithSession repeats the shared
-	// service/revision/key content checks via the registry and trims the key.
-	selection, err := p.registry.ValidateSelectionWithSession(in.service, in.revision, in.sessionKey)
+	// (nil for an omitted key); ValidateSelectionWithExclusions repeats the
+	// shared service/revision/key content checks via the registry, trims the
+	// key, and normalizes the exclude list (trimming, deduplicating and
+	// rejecting blank ids).
+	selection, err := p.registry.ValidateSelectionWithExclusions(in.service, in.revision, in.sessionKey, excludeIDs)
 	if err != nil {
 		p.invalid(in.service, err.Error())
 		return
