@@ -388,46 +388,84 @@ func (p *registerProcessor) healthRequest(raw json.RawMessage, service string) {
 	})
 }
 
-// selectRequest processes one select request, appending its outcome.
-// A selection performs no network access and never alters registrations or
-// health records; it only advances the service's healthy-instance rotation
-// and, for requests carrying a sessionKey, maintains that session's binding.
-func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
-	var req struct {
-		Service  string          `json:"service"`
-		Revision json.RawMessage `json:"expectedRevision"`
-		Session  json.RawMessage `json:"sessionKey"`
-	}
+// sessionRequestFields is the raw input shape shared by the select and
+// release_session requests: a service name, the expectedRevision token and
+// the sessionKey token.
+type sessionRequestFields struct {
+	Service  string          `json:"service"`
+	Revision json.RawMessage `json:"expectedRevision"`
+	Session  json.RawMessage `json:"sessionKey"`
+}
+
+// parseSessionRequest decodes and validates the input handling the select and
+// release_session requests share, in the order both have always used: the
+// object shape (reported with the request's own objectDesc), the trimmed
+// service name, the required expectedRevision token, the sessionKey token and
+// finally the revision's integer type. It returns the trimmed service, the
+// revision as int64 — still carrying the submitted value, so the registry can
+// range-check it against the architecture before narrowing to int — and the
+// session key as a *string that is nil only when the token was absent. The
+// sessionKey's presence rules (optional on select, required on
+// release_session) and its blank-after-trim check stay with each request's
+// Validate* method, so a malformed revision is reported in the same order as
+// everywhere else. It reports false after appending the item's invalid result.
+func (p *registerProcessor) parseSessionRequest(raw json.RawMessage, service, objectDesc string) (string, int64, *string, bool) {
+	var req sessionRequestFields
 	if err := json.Unmarshal(raw, &req); err != nil {
-		p.invalidf(service, "select request must be an object with service and expectedRevision: %v", err)
-		return
+		p.invalidf(service, "%s: %v", objectDesc, err)
+		return "", 0, nil, false
 	}
 	service = strings.TrimSpace(req.Service)
 
 	if len(req.Revision) == 0 || strings.TrimSpace(string(req.Revision)) == "null" {
 		p.invalid(service, "expectedRevision is required and must be a non-negative integer")
-		return
+		return "", 0, nil, false
 	}
 
-	// sessionKey is optional: absent means an ordinary rotating selection. An
-	// explicitly provided null, a non-string value or a blank string is
-	// invalid; the registry trims the key and treats keys equal after trimming
-	// as the same session.
-	var sessionKey *string
-	if len(req.Session) > 0 {
-		if strings.TrimSpace(string(req.Session)) == "null" {
-			p.invalid(service, "sessionKey must be a string, not null")
-			return
-		}
-		var key string
-		if err := json.Unmarshal(req.Session, &key); err != nil {
-			p.invalid(service, "sessionKey must be a string")
-			return
-		}
-		sessionKey = &key
+	sessionKey, ok := p.parseSessionKey(service, req.Session)
+	if !ok {
+		return "", 0, nil, false
 	}
 
 	revision, ok := p.parseRevision(service, req.Revision)
+	if !ok {
+		return "", 0, nil, false
+	}
+	return service, revision, sessionKey, true
+}
+
+// parseSessionKey decodes the raw sessionKey token shared by select and
+// release_session. An absent token is nil and left to each request's own
+// presence rule. An explicitly provided null, a non-string value or a blank
+// string is never treated as absent: null and non-string tokens are invalid
+// here with a reason naming the sessionKey problem, while a string token
+// (blank or not) reaches the validator, which trims it — keys equal after
+// trimming name the same session. It reports false after appending the item's
+// invalid result.
+func (p *registerProcessor) parseSessionKey(service string, raw json.RawMessage) (*string, bool) {
+	if len(raw) == 0 {
+		return nil, true
+	}
+	if strings.TrimSpace(string(raw)) == "null" {
+		p.invalid(service, "sessionKey must be a string, not null")
+		return nil, false
+	}
+	var key string
+	if err := json.Unmarshal(raw, &key); err != nil {
+		p.invalid(service, "sessionKey must be a string")
+		return nil, false
+	}
+	return &key, true
+}
+
+// selectRequest processes one select request, appending its outcome.
+// A selection performs no network access and never alters registrations or
+// health records; it only advances the service's healthy-instance rotation
+// and, for requests carrying a sessionKey, maintains that session's binding.
+func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
+	// sessionKey is optional on a select: an absent key means an ordinary
+	// rotating selection, decided by ValidateSelectionWithSession.
+	service, revision, sessionKey, ok := p.parseSessionRequest(raw, service, "select request must be an object with service and expectedRevision")
 	if !ok {
 		return
 	}
@@ -459,46 +497,9 @@ func (p *registerProcessor) selectRequest(raw json.RawMessage, service string) {
 // binding is removed and reported changed; releasing an unbound key still
 // succeeds without changed.
 func (p *registerProcessor) releaseSessionRequest(raw json.RawMessage, service string) {
-	var req struct {
-		Service  string          `json:"service"`
-		Revision json.RawMessage `json:"expectedRevision"`
-		Session  json.RawMessage `json:"sessionKey"`
-	}
-	if err := json.Unmarshal(raw, &req); err != nil {
-		p.invalidf(service, "release_session request must be an object with service, expectedRevision and sessionKey: %v", err)
-		return
-	}
-	service = strings.TrimSpace(req.Service)
-
-	if len(req.Revision) == 0 || strings.TrimSpace(string(req.Revision)) == "null" {
-		p.invalid(service, "expectedRevision is required and must be a non-negative integer")
-		return
-	}
-
-	// sessionKey is required here (unlike on a select). An explicitly null or
-	// non-string value is invalid at the token level, exactly as for select;
-	// an absent key reaches the validator as nil and is rejected there, after
-	// the revision token has been parsed, so a malformed revision is reported
-	// in the same order as everywhere else. The validator trims the key, so
-	// keys equal after trimming name one session and a blank-after-trim key
-	// fails with a reason naming the sessionKey problem.
-	var sessionKey *string
-	if len(req.Session) > 0 {
-		if strings.TrimSpace(string(req.Session)) == "null" {
-			p.invalid(service, "sessionKey must be a string, not null")
-			return
-		}
-		var key string
-		if err := json.Unmarshal(req.Session, &key); err != nil {
-			p.invalid(service, "sessionKey must be a string")
-			return
-		}
-		sessionKey = &key
-	}
-
-	// Parse the raw token (integer type); ValidateSessionRelease then
-	// range-checks the int64 against the architecture before narrowing to int.
-	revision, ok := p.parseRevision(service, req.Revision)
+	// sessionKey is required on a release (unlike on a select): an absent key
+	// reaches ValidateSessionRelease as nil and is rejected there.
+	service, revision, sessionKey, ok := p.parseSessionRequest(raw, service, "release_session request must be an object with service, expectedRevision and sessionKey")
 	if !ok {
 		return
 	}
