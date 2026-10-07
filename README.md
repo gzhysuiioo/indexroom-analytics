@@ -1,10 +1,107 @@
 # 链上索引与交易分析服务
 
-## 用途
+## 快速入门（中文）
 
-区块与交易摄取、事件解码与规范化、可组合查询与聚合、索引重建与一致性校验、分析指标与快照。
+### 这个程序能做什么
+
+`indexroom` 是一个可在本机离线运行的 Go 命令行程序，包含两类能力：
+
+- **服务注册与目标选择（`register` 子命令）**：从标准输入读取一批 JSON 请求，在内存中维护服务实例注册表，支持注册实例（`register` 请求）、离线上报实例健康观察（`health` 请求）和按轮询规则选出一个目标实例地址（`select` 请求）。全部处理只发生在本机内存中：**程序不会连接任何实例、不会主动探测健康、也不转发流量**。示例中的地址（如 `h1:8080`）不要求真实可访问；健康状态与序号完全由调用者提交，输出只反映已被接受的观察。
+- **区块演示（`demo` 子命令）**：内置的链上区块追加与重组演示，运行后打印几行演示文本，不需要任何输入，也与服务注册表无关。
+
+子命令一览：
+
+```bash
+go run ./cmd/indexroom            # 不带任何子命令时等价于 demo：运行区块演示
+go run ./cmd/indexroom demo       # 区块与重组演示
+go run ./cmd/indexroom register   # 从标准输入读取 JSON 请求，维护服务注册表并选择目标
+go run ./cmd/indexroom version    # 打印版本
+go run ./cmd/indexroom help       # 查看命令说明
+```
+
+> **请注意：不带子命令直接运行 `go run ./cmd/indexroom` 执行的是区块演示（`demo`），不是服务注册示例。** 要体验服务注册与目标选择，必须显式写出 `register` 子命令，并把 JSON 通过管道接到标准输入，不要把区块演示的输出误认为注册结果。
+
+### 在本机离线提交请求并取得目标地址
+
+`register` 从标准输入读取一个形如 `{"requests":[ ... ]}` 的 JSON 对象，按数组顺序逐项处理，然后把每项的处理结果和处理结束后的服务列表作为一个 JSON 文档写到标准输出。最常用的提交方式是用 `echo`（或 `cat 文件名`）经管道传入：
+
+```bash
+echo '{"requests":[ ... ]}' | go run ./cmd/indexroom register
+```
+
+**每一次调用 `register` 都从一个空的内存注册表开始，进程退出后状态不保留。** 因此注册、健康上报和选择必须放在同一批 `requests` 中、用同一条命令提交；不能把它们拆成先后几条命令，再假设前一次注册的服务或上报的健康状态会保留下来。
+
+### 入门示例：注册两个实例 → 无健康时选择 → 上报健康 → 连续选择两次
+
+下面这一批请求在同一次调用中完成全部步骤。注意注册时**实例的提交顺序与标识排序不同**（输入里先写 `i2` 再写 `i1`），用来展示选择顺序只由实例标识决定：
+
+```bash
+echo '{"requests":[
+  {"type":"register","service":"svc","expectedRevision":0,"instances":[
+    {"id":"i2","address":"h2:8080"},
+    {"id":"i1","address":"h1:8080"}
+  ]},
+  {"type":"select","service":"svc","expectedRevision":1},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"select","service":"svc","expectedRevision":1},
+  {"type":"select","service":"svc","expectedRevision":1}
+]}' | go run ./cmd/indexroom register
+```
+
+输出（字段与程序实际输出一致；逐项说明见后）：
+
+```json
+{
+  "results": [
+    {"service":"svc","ok":true,"changed":true,"revision":1},
+    {"service":"svc","ok":false,"revision":1,"error":"no_healthy","reason":"service \"svc\" has no healthy instance available"},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i1","address":"h1:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i2","address":"h2:8080"}
+  ],
+  "services": [
+    {"service":"svc","revision":1,"instances":[
+      {"id":"i1","address":"h1:8080","health":"healthy","sequence":1},
+      {"id":"i2","address":"h2:8080","health":"healthy","sequence":1}
+    ]}
+  ]
+}
+```
+
+逐项说明：
+
+1. 注册新服务 `svc`，实例在输入中的排列顺序是 `i2`、`i1`。注册成功，`changed:true`，**注册成功产生修订号 1**；两个实例刚注册时健康状态都是 `unknown`、健康序号为 0，此时没有任何实例可供选择。
+2. 还没有任何健康观察就做一次选择：两个实例都是 `unknown`，不具备被选择资格，返回 `ok:false`、`error:"no_healthy"` 和原因；失败结果中**不出现** `instanceId`、`address`、`sequence`。这次失败既**不会阻止**后面的健康上报和选择，也**不占用轮询位置**。
+3. 为 `i1` 上报 `healthy:true`、序号 1 的离线健康观察，被接受（`changed:true`）。健康序号由调用者提交，程序只是记录这条已接受的观察，不会去连接 `h1:8080` 核实；**健康上报不增加注册修订号**，`revision` 仍是 1。
+4. 为 `i2` 上报同样的健康观察，同样被接受，修订号仍为 1。
+5. 第一次成功的普通选择：在健康实例中**按实例标识升序**轮询，从最小标识开始，选中的是 `i1`——尽管注册输入里 `i2` 写在前面，可见**选择顺序与实例在输入中的排列顺序无关**。成功结果带出所选实例的地址（`h1:8080`）、该实例的最新健康序号（`sequence:1`）和当前注册修订号（`revision:1`）；成功的选择结果没有 `changed`，**选择不增加修订号、不改变任何健康记录**。
+6. 再连续选择第二次：轮询从上一次选中的 `i1` 之后继续，选中 `i2`，返回地址 `h2:8080`、序号 1、修订号 1。
+
+末尾的 `services` 列表是全部请求处理完后的最终快照，实例按标识升序（既有顺序）排列：`i1`、`i2` 均为 `healthy`、序号 1，与第 5、6 项成功选择时使用的记录完全一致。
+
+**退出状态**：这批请求含有失败项（第 2 项），所以即使最后一次选择成功，命令的退出状态仍然是 **1**——不能用“最后一项成功”判断整批成功；只有**全部请求成功且 JSON 结果完整写到标准输出**时退出状态才为 0。判断方式是检查每一项的 `"ok":true`（或直接使用进程退出状态），而不是只看末尾的服务列表。
+
+### 进一步阅读
+
+上面的入门示例只使用了不带任何选项的普通 `select`。本命令的更多能力在后文有完整中文说明与可直接运行的示例：
+
+- [离线健康上报（`health` 请求）中文说明](#离线健康上报health-请求中文说明)：序号规则、`stale`/`conflict`、不健康原因等。
+- [服务注册与实例列表替换（`register` 请求）中文说明](#服务注册与实例列表替换register-请求中文说明)：修订号与并发替换、地址校验、空列表、替换对健康记录的影响。
+- [会话保持（`select` 请求的 `sessionKey`）中文说明](#会话保持select-请求的-sessionkey中文说明)：让同一会话固定使用一个实例。
+- [选择时排除实例（`select` 请求的 `excludeInstanceIds`）中文说明](#选择时排除实例select-请求的-excludeinstanceids中文说明)：当次选择跳过指定实例。
+- [解除单个会话绑定（`release_session` 请求）中文说明](#解除单个会话绑定release_session-请求中文说明)：让会话键重新参与轮询。
+
+紧随其后的英文段落是各请求字段与失败分类的完整参考；本文末尾还列出了运行要求。
+
+## 区块演示（`demo`）与仓库概览
+
+用途：区块与交易摄取、事件解码与规范化、可组合查询与聚合、索引重建与一致性校验、分析指标与快照。
 
 本仓库是可持续演进的自托管 Go 应用。领域核心位于 `indexroom/`，命令入口位于 `cmd/indexroom/`。
+
+不带子命令运行 `go run ./cmd/indexroom` 与显式运行 `demo` 相同，执行的是下面这个区块演示，而不是服务注册：
 
 ```bash
 go run ./cmd/indexroom demo
