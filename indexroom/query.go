@@ -95,9 +95,22 @@ type TxQuery struct {
 	// same window, otherwise QueryTxs returns ErrInvalidArgument.
 	TimeStart *int64
 	TimeEnd   *int64
+	// MinBlocks optionally requires a transaction identifier to appear in at
+	// least this many distinct blocks of the pinned range before any of its
+	// occurrences are kept. Zero (the default) disables the filter; a
+	// negative value is ErrInvalidArgument. Block membership is counted over
+	// the whole pinned height range under the same TxIDs and time-window
+	// conditions as the scan itself: repeated occurrences inside one block
+	// count once, and blocks outside the range, without a timestamp, or
+	// outside the window never help an identifier qualify. Qualification is
+	// decided by the entire pinned range, never by the current page alone;
+	// once an identifier qualifies, every one of its matching occurrences is
+	// kept, with no deduplication. A continuation must repeat the first
+	// page's value, otherwise QueryTxs returns ErrInvalidArgument.
+	MinBlocks int64
 	// Cursor continues an earlier query; empty asks for the first page. On
-	// continuation the height range, TxIDs, Order and time window must equal
-	// the first page's.
+	// continuation the height range, TxIDs, Order, time window and MinBlocks
+	// must equal the first page's.
 	Cursor string
 }
 
@@ -148,6 +161,13 @@ type TxPage struct {
 // matches, and a real zero is judged normally. Time filtering never changes
 // the order, the block positions, or the deduplication of occurrences.
 //
+// MinBlocks optionally keeps only the identifiers appearing in at least
+// that many distinct blocks of the pinned range, counted under the same
+// TxIDs and time-window conditions. Qualification is decided over the whole
+// pinned range before paging, so every page reports the same TotalMatches
+// and MatchedBlocks, and a qualifying identifier keeps all of its matching
+// occurrences in their original order and positions.
+//
 // The first page (empty Cursor) pins the filtered range and returns a
 // continuation cursor while more results remain. Continuations reuse the
 // pinned range — blocks appended above it are invisible to the query — and
@@ -166,6 +186,9 @@ func (index *Index) QueryTxs(query TxQuery) (TxPage, error) {
 	window, err := normalizeTimeWindow(query.TimeStart, query.TimeEnd)
 	if err != nil {
 		return TxPage{}, err
+	}
+	if query.MinBlocks < 0 {
+		return TxPage{}, fmt.Errorf("%w: min blocks must not be negative", ErrInvalidArgument)
 	}
 	if query.Cursor != "" {
 		return index.continueQuery(query, pageSize, window)
@@ -269,8 +292,9 @@ func (index *Index) firstQuery(query TxQuery, pageSize int, window timeWindow) (
 		queryTxsHookLocked(from, to, false)
 	}
 	filter := newTxFilter(query.TxIDs)
-	hits, total, blocks := index.scanPageLocked(from, to, filter, window, query.Order, 0, pageSize)
-	return index.buildPageLocked(query.To, filter, window, from, to, hits, total, blocks, 0, pageSize, query.Order), nil
+	qualified := index.qualifyingIDsLocked(from, to, filter, window, query.MinBlocks)
+	hits, total, blocks := index.scanPageQualifiedLocked(from, to, filter, window, query.Order, 0, pageSize, qualified)
+	return index.buildPageLocked(query.To, filter, window, from, to, hits, total, blocks, 0, pageSize, query.Order, query.MinBlocks), nil
 }
 
 func (index *Index) continueQuery(query TxQuery, pageSize int, window timeWindow) (TxPage, error) {
@@ -306,6 +330,11 @@ func (index *Index) continueQuery(query TxQuery, pageSize int, window timeWindow
 	if window != payload.window() {
 		return TxPage{}, fmt.Errorf("%w: time window differs from the first page", ErrInvalidArgument)
 	}
+	// MinBlocks is pinned like the other conditions: a cursor minted with
+	// one threshold may not be continued with another.
+	if query.MinBlocks != payload.MinBlocks {
+		return TxPage{}, fmt.Errorf("%w: min blocks differs from the first page", ErrInvalidArgument)
+	}
 
 	index.mu.Lock()
 	defer index.mu.Unlock()
@@ -322,11 +351,12 @@ func (index *Index) continueQuery(query TxQuery, pageSize int, window timeWindow
 	}
 	// Re-scan the still-identical pinned range: the cursor records the
 	// absolute offset, but no full match list is kept between pages.
-	hits, total, blocks := index.scanPageLocked(payload.From, payload.To, filter, window, payload.Order, payload.Off, pageSize)
+	qualified := index.qualifyingIDsLocked(payload.From, payload.To, filter, window, payload.MinBlocks)
+	hits, total, blocks := index.scanPageQualifiedLocked(payload.From, payload.To, filter, window, payload.Order, payload.Off, pageSize, qualified)
 	if payload.Off > total {
 		return TxPage{}, fmt.Errorf("%w: cursor offset is beyond the pinned results", ErrQueryChanged)
 	}
-	return index.buildPageLocked(query.To, filter, window, payload.From, payload.To, hits, total, blocks, payload.Off, pageSize, payload.Order), nil
+	return index.buildPageLocked(query.To, filter, window, payload.From, payload.To, hits, total, blocks, payload.Off, pageSize, payload.Order, payload.MinBlocks), nil
 }
 
 // buildPageLocked assembles one page from a page-sized scan and mints the
@@ -334,7 +364,7 @@ func (index *Index) continueQuery(query TxQuery, pageSize int, window timeWindow
 // whole pinned range; hits holds only the window [offset, offset+pageSize)
 // in the scan's order. reqTo is the caller's verbatim To (zero for
 // tip-bound queries). The caller must hold index.mu.
-func (index *Index) buildPageLocked(reqTo int64, filter txFilter, window timeWindow, from, to int64, hits []TxHit, total, blocks, offset int64, pageSize int, order TxOrder) TxPage {
+func (index *Index) buildPageLocked(reqTo int64, filter txFilter, window timeWindow, from, to int64, hits []TxHit, total, blocks, offset int64, pageSize int, order TxOrder, minBlocks int64) TxPage {
 	page := TxPage{
 		Hits:          hits,
 		TotalMatches:  total,
@@ -343,14 +373,15 @@ func (index *Index) buildPageLocked(reqTo int64, filter txFilter, window timeWin
 	}
 	if offset+int64(len(hits)) < total {
 		payload := cursorPayload{
-			V:     1,
-			From:  from,
-			ReqTo: reqTo,
-			To:    to,
-			Set:   filter.hexDigest(),
-			FP:    hex.EncodeToString(index.fingerprintLocked(from, to)),
-			Order: order,
-			Off:   offset + int64(len(hits)),
+			V:         1,
+			From:      from,
+			ReqTo:     reqTo,
+			To:        to,
+			Set:       filter.hexDigest(),
+			FP:        hex.EncodeToString(index.fingerprintLocked(from, to)),
+			Order:     order,
+			Off:       offset + int64(len(hits)),
+			MinBlocks: minBlocks,
 		}
 		if window.enabled {
 			start, end := window.start, window.end
@@ -361,17 +392,67 @@ func (index *Index) buildPageLocked(reqTo int64, filter txFilter, window timeWin
 	return page
 }
 
-// scanPageLocked walks the whole pinned range once in the requested order,
-// counting every matching occurrence and every block holding one, while
-// retaining only the page window [offset, offset+pageSize) in a pre-sized
-// slice: at most pageSize TxHit records, independent of how many matches the
-// whole range holds. OrderAsc walks increasing heights then increasing
-// positions; OrderDesc walks decreasing heights then decreasing positions.
-// total, blocks and the recorded positions are the same in either order.
-// An occurrence survives only when it passes both the identifier filter and
-// the block's timestamp window; the window never participates in ordering.
-// The caller must hold index.mu.
+// qualifyingIDsLocked applies the MinBlocks condition: it counts, for every
+// identifier passing the filter, the distinct blocks of [from, to] that hold
+// it and also survive the timestamp window, then keeps the identifiers
+// reaching minBlocks. Blocks outside the window (or without a timestamp
+// while the window is enabled) contribute nothing. A nil map is returned
+// when minBlocks is zero, meaning every occurrence passes; an empty non-nil
+// map means the filter is active and nothing qualified. The caller must hold
+// index.mu.
+func (index *Index) qualifyingIDsLocked(from, to int64, filter txFilter, window timeWindow, minBlocks int64) map[string]struct{} {
+	if minBlocks <= 0 {
+		return nil
+	}
+	counts := make(map[string]int64)
+	for height := from; height <= to; height++ {
+		block := index.Blocks[height]
+		if !window.contains(block.Time) {
+			continue
+		}
+		// One block contributes at most one to an identifier's count, however
+		// many times the identifier repeats inside it.
+		seen := make(map[string]struct{}, len(block.Txs))
+		for _, tx := range block.Txs {
+			if !filter.matches(tx) {
+				continue
+			}
+			if _, ok := seen[tx]; ok {
+				continue
+			}
+			seen[tx] = struct{}{}
+			counts[tx]++
+		}
+	}
+	qualified := make(map[string]struct{}, len(counts))
+	for id, n := range counts {
+		if n >= minBlocks {
+			qualified[id] = struct{}{}
+		}
+	}
+	return qualified
+}
+
+// scanPageLocked is scanPageQualifiedLocked without a MinBlocks condition:
+// every occurrence passing the identifier filter and the time window counts.
 func (index *Index) scanPageLocked(from, to int64, filter txFilter, window timeWindow, order TxOrder, offset int64, pageSize int) (hits []TxHit, total, blocks int64) {
+	return index.scanPageQualifiedLocked(from, to, filter, window, order, offset, pageSize, nil)
+}
+
+// scanPageQualifiedLocked walks the whole pinned range once in the requested
+// order, counting every matching occurrence and every block holding one,
+// while retaining only the page window [offset, offset+pageSize) in a
+// pre-sized slice: at most pageSize TxHit records, independent of how many
+// matches the whole range holds. OrderAsc walks increasing heights then
+// increasing positions; OrderDesc walks decreasing heights then decreasing
+// positions. total, blocks and the recorded positions are the same in either
+// order. An occurrence survives only when it passes the identifier filter,
+// the block's timestamp window, and — when qualified is non-nil — its
+// identifier belongs to the MinBlocks-qualified set computed over the whole
+// pinned range; qualifying occurrences are kept individually, never
+// deduplicated. The window never participates in ordering. The caller must
+// hold index.mu.
+func (index *Index) scanPageQualifiedLocked(from, to int64, filter txFilter, window timeWindow, order TxOrder, offset int64, pageSize int, qualified map[string]struct{}) (hits []TxHit, total, blocks int64) {
 	hits = make([]TxHit, 0, pageSize)
 	height, step := from, int64(1)
 	if order == OrderDesc {
@@ -394,6 +475,11 @@ func (index *Index) scanPageLocked(from, to int64, filter txFilter, window timeW
 			tx := block.Txs[position]
 			if !filter.matches(tx) {
 				continue
+			}
+			if qualified != nil {
+				if _, ok := qualified[tx]; !ok {
+					continue
+				}
 			}
 			if total >= offset && int64(len(hits)) < int64(pageSize) {
 				hits = append(hits, TxHit{Height: height, BlockHash: block.Hash, TxID: tx, Position: position})
@@ -449,16 +535,19 @@ func (index *Index) fingerprintLocked(from, to int64) []byte {
 // starting at zero still carries an explicit zero pointer, so it can never
 // be confused with the disabled case.
 type cursorPayload struct {
-	V         int     `json:"v"`
-	From      int64   `json:"from"`
-	ReqTo     int64   `json:"reqTo"`
-	To        int64   `json:"to"`
-	Set       string  `json:"set"`
-	FP        string  `json:"fp"`
-	Order     TxOrder `json:"ord"`
-	Off       int64   `json:"off"`
-	TimeStart *int64  `json:"tStart,omitempty"`
-	TimeEnd   *int64  `json:"tEnd,omitempty"`
+	V     int     `json:"v"`
+	From  int64   `json:"from"`
+	ReqTo int64   `json:"reqTo"`
+	To    int64   `json:"to"`
+	Set   string  `json:"set"`
+	FP    string  `json:"fp"`
+	Order TxOrder `json:"ord"`
+	Off   int64   `json:"off"`
+	// MinBlocks carries the first page's threshold; omitted when zero so
+	// cursors minted before the field existed keep validating.
+	MinBlocks int64  `json:"minB,omitempty"`
+	TimeStart *int64 `json:"tStart,omitempty"`
+	TimeEnd   *int64 `json:"tEnd,omitempty"`
 }
 
 // window reconstructs the pinned timestamp window. A signed payload is only
