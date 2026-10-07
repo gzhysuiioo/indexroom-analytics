@@ -91,9 +91,9 @@ type raceRow struct {
 func groupRaceOutcomes(results []appendResult, winner, loser Block) (winners, losers []raceRow) {
 	for _, r := range results {
 		switch {
-		case sameBlock(r.block, winner):
+		case equalBlockContent(r.block, winner):
 			winners = append(winners, raceRow{r.block, r.err})
-		case sameBlock(r.block, loser):
+		case equalBlockContent(r.block, loser):
 			losers = append(losers, raceRow{r.block, r.err})
 		default:
 			return nil, nil // a candidate that matches neither is a test-setup bug
@@ -151,7 +151,7 @@ func assertStoredWinner(t *testing.T, index *Index, parentTip int64, winner Bloc
 	if !ok {
 		t.Fatalf("height %d missing after the race", height)
 	}
-	if !sameBlock(stored, winner) {
+	if !equalBlockContent(stored, winner) {
 		t.Fatalf("stored block at %d = %+v, want winning content %+v", height, stored, winner)
 	}
 	if parentTip > 0 && stored.Parent != index.Blocks[parentTip].Hash {
@@ -307,7 +307,7 @@ func validateRaceFixture(t *testing.T, f raceFixture) {
 	if f.winner.Hash == "" || f.loser.Hash == "" {
 		t.Fatalf("fixture %q: candidate hashes must be non-empty", f.name)
 	}
-	if sameBlock(f.winner, f.loser) {
+	if equalBlockContent(f.winner, f.loser) {
 		t.Fatalf("fixture %q: the two candidates must be different content", f.name)
 	}
 	build := func() *Index {
@@ -424,7 +424,7 @@ func TestConcurrentAppendIdenticalContentAllSucceeds(t *testing.T) {
 				if r.err != nil {
 					t.Fatalf("identical-content call #%d failed: %v", i, r.err)
 				}
-				if !sameBlock(r.block, tc.block) {
+				if !equalBlockContent(r.block, tc.block) {
 					t.Fatalf("call #%d submitted mutated content %+v", i, r.block)
 				}
 			}
@@ -541,9 +541,9 @@ func TestConcurrentAppendConflictingCandidatesOneContentWins(t *testing.T) {
 					stored := index.Blocks[height]
 					var winner, loser Block
 					switch {
-					case sameBlock(stored, fixture.winner):
+					case equalBlockContent(stored, fixture.winner):
 						winner, loser = fixture.winner, fixture.loser
-					case sameBlock(stored, fixture.loser):
+					case equalBlockContent(stored, fixture.loser):
 						winner, loser = fixture.loser, fixture.winner
 					default:
 						t.Fatalf("stored block at %d matches neither candidate: %+v", height, stored)
@@ -655,9 +655,9 @@ func TestConcurrentAppendAtHeightOneCoversFirstBlockRule(t *testing.T) {
 				results := raceAppendAtHeight(t, index, candidates)
 				stored := index.Blocks[1]
 				winner, loser := a, b
-				if sameBlock(stored, b) {
+				if equalBlockContent(stored, b) {
 					winner, loser = b, a
-				} else if !sameBlock(stored, a) {
+				} else if !equalBlockContent(stored, a) {
 					t.Fatalf("stored height-1 block matches neither candidate: %+v", stored)
 				}
 				assertPerCallOutcomes(t, results, winner, loser)

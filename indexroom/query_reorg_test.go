@@ -575,7 +575,7 @@ func TestQueryTxsFirstPageInFlightObservesCompleteOldChain(t *testing.T) {
 	if payload.To != 5 || payload.Off != 3 {
 		t.Fatalf("cursor pins to=%d off=%d, want 5/3", payload.To, payload.Off)
 	}
-	if payload.FP != fmt.Sprintf("%x", oldFingerprint.fingerprintLocked(1, 5)) {
+	if payload.FP != fmt.Sprintf("%x", oldFingerprint.hashRangeBlockContent(1, 5)) {
 		t.Fatal("cursor fingerprint does not match the complete old chain")
 	}
 	page, err := index.QueryTxs(TxQuery{PageSize: 3, Cursor: got.NextCursor})
@@ -647,7 +647,7 @@ func TestQueryTxsFirstPageDuringCommittedReorgObservesCompleteNewChain(t *testin
 	if payload.To != 4 || payload.Off != 3 {
 		t.Fatalf("cursor pins to=%d off=%d, want 4/3", payload.To, payload.Off)
 	}
-	if payload.FP != fmt.Sprintf("%x", newFingerprint.fingerprintLocked(1, 4)) {
+	if payload.FP != fmt.Sprintf("%x", newFingerprint.hashRangeBlockContent(1, 4)) {
 		t.Fatal("cursor fingerprint does not match the complete new chain")
 	}
 

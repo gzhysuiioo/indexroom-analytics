@@ -283,7 +283,7 @@ func TestReorgTimeWindowFixtureKeepsStructureMovesTimesOnly(t *testing.T) {
 		if !ok {
 			t.Fatalf("height %d missing after reorg", want.Height)
 		}
-		if !sameBlock(got, want) {
+		if !equalBlockContent(got, want) {
 			t.Fatalf("height %d stored block=%+v, want %+v", want.Height, got, want)
 		}
 		if index.ByHash[want.Hash] != want.Height {
@@ -680,7 +680,7 @@ func TestQueryTxsTimeWindowFirstPageInFlightObservesCompleteOldTimes(t *testing.
 	if payload.window() != (timeWindow{enabled: true, start: twShiftWindowStart, end: twShiftWindowEnd}) {
 		t.Fatalf("cursor window=%+v, want the pinned [0,110)", payload.window())
 	}
-	if payload.FP != fmt.Sprintf("%x", oldFingerprint.fingerprintLocked(1, 5)) {
+	if payload.FP != fmt.Sprintf("%x", oldFingerprint.hashRangeBlockContent(1, 5)) {
 		t.Fatal("cursor fingerprint does not match the complete OLD timestamp state")
 	}
 
@@ -776,7 +776,7 @@ func TestQueryTxsTimeWindowFirstPageDuringCommittedReorgObservesCompleteNewTimes
 	if payload.To != 5 || payload.Off != 2 {
 		t.Fatalf("cursor pins to=%d off=%d, want 5/2", payload.To, payload.Off)
 	}
-	if payload.FP != fmt.Sprintf("%x", newFingerprint.fingerprintLocked(1, 5)) {
+	if payload.FP != fmt.Sprintf("%x", newFingerprint.hashRangeBlockContent(1, 5)) {
 		t.Fatal("cursor fingerprint does not match the complete NEW timestamp state")
 	}
 

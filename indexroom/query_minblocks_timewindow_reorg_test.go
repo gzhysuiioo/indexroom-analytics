@@ -197,7 +197,7 @@ func TestMinBlocksTimeWindowReorgFixtureMovesTimesOnly(t *testing.T) {
 		if !ok {
 			t.Fatalf("height %d missing after reorg", want.Height)
 		}
-		if !sameBlock(got, want) {
+		if !equalBlockContent(got, want) {
 			t.Fatalf("height %d stored block=%+v, want %+v", want.Height, got, want)
 		}
 	}

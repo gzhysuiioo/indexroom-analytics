@@ -684,7 +684,7 @@ func TestQueryTxsMinBlocksRejectedRestoreKeepsOldChainAndCursor(t *testing.T) {
 	}
 	for _, want := range mbRestoreOldChainBlocks() {
 		got, ok := index.Blocks[want.Height]
-		if !ok || !sameBlock(got, want) {
+		if !ok || !equalBlockContent(got, want) {
 			t.Fatalf("height %d changed after rejected restore: got=%+v want=%+v", want.Height, got, want)
 		}
 	}

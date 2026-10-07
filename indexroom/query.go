@@ -343,7 +343,7 @@ func (index *Index) continueQuery(query TxQuery, pageSize int, window timeWindow
 		return TxPage{}, fmt.Errorf("%w: chain tip %d is below the pinned upper bound %d",
 			ErrQueryChanged, index.Tip, payload.To)
 	}
-	if got := hex.EncodeToString(index.fingerprintLocked(payload.From, payload.To)); got != payload.FP {
+	if got := hex.EncodeToString(index.hashRangeBlockContent(payload.From, payload.To)); got != payload.FP {
 		return TxPage{}, fmt.Errorf("%w: blocks in the pinned range differ from the first page", ErrQueryChanged)
 	}
 	if queryTxsHookLocked != nil {
@@ -378,7 +378,7 @@ func (index *Index) buildPageLocked(reqTo int64, filter txFilter, window timeWin
 			ReqTo:     reqTo,
 			To:        to,
 			Set:       filter.hexDigest(),
-			FP:        hex.EncodeToString(index.fingerprintLocked(from, to)),
+			FP:        hex.EncodeToString(index.hashRangeBlockContent(from, to)),
 			Order:     order,
 			Off:       offset + int64(len(hits)),
 			MinBlocks: minBlocks,
@@ -492,40 +492,6 @@ func (index *Index) scanPageQualifiedLocked(from, to int64, filter txFilter, win
 		}
 	}
 	return hits, total, blocks
-}
-
-// fingerprintLocked hashes the exact content of every block in [from, to]:
-// height, hash, parent, the ordered transaction list, and the timestamp
-// (distinguishing a missing timestamp from zero). The caller must hold
-// index.mu.
-func (index *Index) fingerprintLocked(from, to int64) []byte {
-	h := sha256.New()
-	var lenBuf [8]byte
-	writeString := func(s string) {
-		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(s)))
-		h.Write(lenBuf[:])
-		h.Write([]byte(s))
-	}
-	for height := from; height <= to; height++ {
-		block := index.Blocks[height]
-		binary.BigEndian.PutUint64(lenBuf[:], uint64(block.Height))
-		h.Write(lenBuf[:])
-		writeString(block.Hash)
-		writeString(block.Parent)
-		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(block.Txs)))
-		h.Write(lenBuf[:])
-		for _, tx := range block.Txs {
-			writeString(tx)
-		}
-		if block.Time == nil {
-			h.Write([]byte{0})
-		} else {
-			h.Write([]byte{1})
-			binary.BigEndian.PutUint64(lenBuf[:], uint64(*block.Time))
-			h.Write(lenBuf[:])
-		}
-	}
-	return h.Sum(nil)
 }
 
 // cursorPayload is the signed state carried between pages of one query.

@@ -111,7 +111,7 @@ func TestReorgRelocatedHashesSwapHeights(t *testing.T) {
 	// The retained range is untouched, block for block.
 	for _, retained := range relocatedHashOldChain()[:2] {
 		stored, ok := index.Blocks[retained.Height]
-		if !ok || !sameBlock(stored, retained) {
+		if !ok || !equalBlockContent(stored, retained) {
 			t.Fatalf("retained height %d changed: %+v", retained.Height, stored)
 		}
 		if index.ByHash[retained.Hash] != retained.Height {
@@ -209,7 +209,7 @@ func TestReorgBranchRootedAtRelocatedHash(t *testing.T) {
 	}
 	for _, kept := range relocatedHashNewChain() {
 		stored, ok := index.Blocks[kept.Height]
-		if !ok || !sameBlock(stored, kept) {
+		if !ok || !equalBlockContent(stored, kept) {
 			t.Fatalf("kept height %d lost or altered: %+v", kept.Height, stored)
 		}
 	}

@@ -99,10 +99,10 @@ func (f appendReorgFixture) assertPostInterleavingState(t *testing.T, index *Ind
 		t.Fatalf("block count=%d, want 2 (h1 and r2)", len(index.Blocks))
 	}
 	r2 := f.branch[0]
-	if stored, ok := index.Blocks[1]; !ok || !sameBlock(stored, f.oldChain[0]) {
+	if stored, ok := index.Blocks[1]; !ok || !equalBlockContent(stored, f.oldChain[0]) {
 		t.Fatalf("height 1 = %+v, want retained %+v", stored, f.oldChain[0])
 	}
-	if stored, ok := index.Blocks[2]; !ok || !sameBlock(stored, r2) {
+	if stored, ok := index.Blocks[2]; !ok || !equalBlockContent(stored, r2) {
 		t.Fatalf("height 2 = %+v, want replacement %+v", stored, r2)
 	}
 	if stored := index.Blocks[2]; stored.Parent != index.Blocks[1].Hash {

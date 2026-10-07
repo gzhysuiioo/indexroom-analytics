@@ -103,7 +103,7 @@ func (index *Index) appendLocked(block Block) error {
 		return nil
 	}
 	if old, exists := index.Blocks[block.Height]; exists {
-		if sameBlock(old, block) {
+		if equalBlockContent(old, block) {
 			return nil
 		}
 		return errInvalid("height already indexed with different content")
@@ -187,7 +187,7 @@ func (index *Index) Reorg(blocks []Block) ([]int64, error) {
 			dropped = append(dropped, height)
 			continue
 		}
-		if !sameBlock(index.Blocks[height], blocks[height-blocks[0].Height]) {
+		if !equalBlockContent(index.Blocks[height], blocks[height-blocks[0].Height]) {
 			dropped = append(dropped, height)
 		}
 	}
@@ -242,27 +242,6 @@ func validateBlockEncoding(block Block) error {
 		}
 	}
 	return nil
-}
-
-// sameBlock reports whether two blocks are identical: same height, hash,
-// parent, transactions in order, and timestamp presence and value. An empty
-// tx list equals a missing one, but a missing timestamp never equals zero.
-func sameBlock(a, b Block) bool {
-	if a.Height != b.Height || a.Hash != b.Hash || a.Parent != b.Parent {
-		return false
-	}
-	if len(a.Txs) != len(b.Txs) {
-		return false
-	}
-	for i := range a.Txs {
-		if a.Txs[i] != b.Txs[i] {
-			return false
-		}
-	}
-	if (a.Time == nil) != (b.Time == nil) {
-		return false
-	}
-	return a.Time == nil || *a.Time == *b.Time
 }
 
 type errInvalid string
