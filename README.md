@@ -16,7 +16,7 @@ go test ./...
 
 - `indexroom.Block` 的 `Time *int64` 字段携带非负 Unix 秒数；`nil` 表示未提供时间，与时间为 0 严格区分。
 - `Index.Append` / `Index.Reorg`：摄取区块与重组，负时间整体拒绝且不改变已有链；哈希、父哈希或任一交易标识含非法 UTF-8 字节时同样整体拒绝，错误信息指出区块高度与字段（交易标识另指出从 0 开始的位置），保证快照可无损导出与恢复。`Append` 在链顶前进后仍可再次提交内容完全相同的旧区块（成功且无副作用），完整规则见下方[重复提交区块指南（Append）](#重复提交区块指南append)；`Reorg` 的分支范围、丢弃高度口径、失败原子性与完整用法见下方[重组指南（Reorg）](#重组指南reorg)。
-- `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；默认按高度、再按块内位置升序返回，`Order` 设为 `OrderDesc` 时整体倒序（高度与块内位置均从大到小）；`TimeStart`/`TimeEnd` 可同时给出非负 Unix 秒，叠加 `[Start, End)` 半开时间窗口筛选（含起点、排除终点，与 `QueryTimeStats` 一致；缺失区块时间不命中，真实零秒按窗口判断），两者都不传表示不启用时间筛选；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
+- `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；默认按高度、再按块内位置升序返回，`Order` 设为 `OrderDesc` 时整体倒序（高度与块内位置均从大到小）；`TimeStart`/`TimeEnd` 可同时给出非负 Unix 秒，叠加 `[Start, End)` 半开时间窗口筛选（含起点、排除终点，与 `QueryTimeStats` 一致；缺失区块时间不命中，真实零秒按窗口判断），两者都不传表示不启用时间筛选；`MinBlocks` 为正数时只保留至少出现在该数量个**不同区块**中的交易标识（零值不筛选，按第一页固定的完整范围判定）；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
 - `Index.QueryTimeStats`：按 `[Start, End)` 半开窗口与 `StepSeconds` 分段统计交易出现次数、不同标识数、含匹配交易的区块数，并给出整窗口去重汇总与缺失时间区块数；非法参数返回 `ErrInvalidArgument`。完整用法见下方[按时间窗口统计交易指南](#按时间窗口统计交易指南querytimestats)。
 - `Index.Export` / `Index.Restore`：快照版本 1（区块不含 `timestamp`）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）。`Restore` 保证**数据一致**并把再导出规范化为本功能的固定文本，不保留输入的字段顺序、空白与转义写法；它用一份完整快照整体替换主链，非法输入返回 `ErrInvalidSnapshot` 且不改变现有链；底层读取失败（包括与完整快照字节一起送达的故障）不是 `ErrInvalidSnapshot`，而是包装为 `indexroom: read snapshot: ...` 并保留原始读取错误，同样不改变现有链。完整用法见下方[快照导出与恢复指南（Export/Restore）](#快照导出与恢复指南exportrestore)。
 
@@ -24,14 +24,14 @@ go test ./...
 
 `Index.QueryTxs(query TxQuery) (TxPage, error)` 围绕一个或多个交易标识读取这些标识在主链上的**每一次出现**。默认按"高度、再按块内位置"升序；`Order` 设为 `OrderDesc` 时在整个固定范围内倒序——高度从大到小，同一区块内的位置也从大到小。次序只由高度与原有块内位置决定，区块时间是否缺失、相同或随高度下降都不影响次序。查询只读，可与摄取并发调用，每次调用都看到一个完整的链状态。
 
-- `TxQuery`：`From`/`To` 为闭区间高度，`TxIDs` 为筛选标识集合，`PageSize` 为每页条数（0 取 `DefaultPageSize=100`，最大 `MaxPageSize=1000`），`Order` 为读取方向（零值 `OrderAsc` 升序，`OrderDesc` 倒序），`TimeStart`/`TimeEnd` 为可选时间窗口（两个 `*int64`，同时给出才启用，半开 `[Start, End)`，单位为非负 Unix 秒），`Cursor` 为续查游标。
+- `TxQuery`：`From`/`To` 为闭区间高度，`TxIDs` 为筛选标识集合，`PageSize` 为每页条数（0 取 `DefaultPageSize=100`，最大 `MaxPageSize=1000`），`Order` 为读取方向（零值 `OrderAsc` 升序，`OrderDesc` 倒序），`TimeStart`/`TimeEnd` 为可选时间窗口（两个 `*int64`，同时给出才启用，半开 `[Start, End)`，单位为非负 Unix 秒），`MinBlocks` 为可选的最少区块数门槛（零值不筛选；正数要求标识至少出现在该数量个不同区块，详见下方[最少区块数门槛](#最少区块数门槛minblocks)），`Cursor` 为续查游标。
 - `TxHit`：一次命中，字段为 `Height`、`BlockHash`、`TxID`、`Position`（块内从 0 开始的位置；**倒序不会重新编号**）。
 - `TxPage`：本页 `Hits`，以及对整个固定范围的统计 `TotalMatches`（匹配出现总次数）、`MatchedBlocks`（含匹配交易的区块数）、`ToHeight`（第一页固定下来的实际上界）和 `NextCursor`。统计是整个固定范围的统计，**不随方向或页大小改变**。
 
 ### 如何取得第一页、继续读取、何时结束
 
 1. **第一页**：`Cursor` 传空字符串即首次查询。`From` 为 0 时默认从高度 1 开始；`To` 为 0 时取首次查询看到的链顶。需要先看靠近链顶的记录时，把 `Order` 设为 `OrderDesc`（见下方[倒序读取](#倒序读取orderdesc)）。
-2. **继续读取**：把上一页返回的 `NextCursor` 原样填回 `TxQuery.Cursor` 再次调用。游标是服务返回的**不透明字符串**，不要解析或拼接。续查时高度范围、`TxIDs`、读取方向 `Order` 以及是否启用时间窗口和窗口本身必须与第一页等价或一致；`PageSize` 可以逐页调整。
+2. **继续读取**：把上一页返回的 `NextCursor` 原样填回 `TxQuery.Cursor` 再次调用。游标是服务返回的**不透明字符串**，不要解析或拼接。续查时高度范围、`TxIDs`、读取方向 `Order`、是否启用时间窗口和窗口本身、以及 `MinBlocks` 门槛必须与第一页等价或一致；`PageSize` 可以逐页调整。
 3. **结束**：返回页的 `NextCursor` 为空即最后一页。范围内没有匹配交易时不是错误，而是成功返回一个空页（`Hits` 为空、无游标）。
 
 重复出现的交易**不会合并**：同一标识在不同区块、或同一区块内出现多次，就返回多条 `TxHit`。筛选按字符串精确匹配，`TxIDs` 的**顺序与重复项不影响匹配**（`["a","a"]` 与 `["a"]` 等价）；但大小写与首尾空白仍按原字符串区分（`"A"`、`" a "` 都不会匹配 `"a"`）。
@@ -44,7 +44,7 @@ go test ./...
 ### 游标失效：区分 ErrQueryChanged 与 ErrInvalidArgument
 
 - **`ErrQueryChanged`（链数据变了）**：固定范围内任一区块的内容发生改变——即使区块哈希不变、**只改变了时间**——或链顶退到固定结束高度以下，续查都会返回该错误，且**没有可用的页结果**。此时只能**从空游标重新开始第一页**，绝不能把新结果拼接到旧结果后面。
-- **`ErrInvalidArgument`（请求本身不合法）**：续查更改高度范围或筛选集合、**续查方向与游标不一致**（正序游标配 `OrderDesc`，或倒序游标配 `OrderAsc`/不传 `Order`）、**续查改变时间筛选的启用状态或窗口任一边界**、只给时间窗口一个边界、时间边界为负、起点不小于终点、传入非法 `Order` 值、游标损坏、或把游标交给另一个索引实例（游标带实例签名，跨实例无效）。它与链数据变化无关，用 `errors.Is` 与 `ErrQueryChanged` 区分；请先修正请求再重试。方向或窗口不一致的续查同样**不返回任何可用页结果**。
+- **`ErrInvalidArgument`（请求本身不合法）**：续查更改高度范围或筛选集合、**续查方向与游标不一致**（正序游标配 `OrderDesc`，或倒序游标配 `OrderAsc`/不传 `Order`）、**续查改变时间筛选的启用状态或窗口任一边界**、**续查改变 `MinBlocks` 门槛（含零与正数之间切换）或传入负门槛**、只给时间窗口一个边界、时间边界为负、起点不小于终点、传入非法 `Order` 值、游标损坏、或把游标交给另一个索引实例（游标带实例签名，跨实例无效）。它与链数据变化无关，用 `errors.Is` 与 `ErrQueryChanged` 区分；请先修正请求再重试。方向、窗口或门槛不一致的续查同样**不返回任何可用页结果**。
 
 ### 倒序读取（OrderDesc）
 
@@ -70,7 +70,285 @@ go test ./...
 
 例如高度一至四的时间依次为 105、缺失、100、110，交易依次为 `[a,b,a]`、`[a]`、`[a]`、`[a]`。筛选 `a` 与窗口 `[100,110)`、正序每页两条时：第一页返回**高度一的位置零和位置二**（时间 105 在窗口内；同一区块两次出现都保留），第二页返回**高度三的位置零**（时间 100 在窗口内）；高度二缺失时间不命中、高度四时间 110 正好等于被排除的终点。总出现次数 `TotalMatches=3`、匹配区块数 `MatchedBlocks=2`，高度上界 `ToHeight` 仍为 4。
 
-### 完整示例
+### 最少区块数门槛（MinBlocks）
+
+`TxQuery.MinBlocks` 在标识筛选与时间窗口之上再叠一层"跨区块复现"条件：只保留至少出现在足够多**不同区块**里的交易标识。
+
+- **零值不启用，正数是门槛**：`MinBlocks` 为 0 或不设置时，查询行为与过去完全一致，原有调用与有效游标不受影响。正数 `N` 表示同一标识必须出现在**至少 `N` 个不同区块**中才算达标。
+- **同一区块多次出现只贡献一个区块**：计数按"区块"去重——一个标识在某区块里无论重复多少次，都只让该区块贡献 1；但**一旦达标，该标识的每一次匹配出现都会保留**（包括同一块内的重复出现），不做合并，每条命中的 `Position` 仍是它原来的块内位置（倒序也不重新编号）。
+- **按第一页固定的完整范围判定，不按当前页计数**：是否达标用[第一页固定下来的完整高度范围](#范围在第一页固定)统计，而不是只数当前页或已读过的页；因此无论翻到第几页、`PageSize` 多大、正序还是倒序，每页的 `TotalMatches` 与 `MatchedBlocks` 都相同，描述的是**筛选后的完整范围**。换页大小或正倒序都不会改变这两个统计值。
+- **与标识筛选、时间窗口共同生效**：只有**同时**通过 `TxIDs` 标识筛选、落在高度范围、并通过时间窗口的区块与交易才参与计数。启用时间窗口后，**缺失时间的区块与窗口外的区块都不帮助任何标识达标**（其中的出现也不返回）；**没有启用时间窗口时，缺失时间不会仅因没有时间而被排除**，照常参与计数。
+- **门槛随第一页钉住**：继续翻页必须沿用同一 `MinBlocks`，改变门槛（包括 0 与正数之间切换）返回 `ErrInvalidArgument` 且没有可用页，要改门槛须[从空游标重新查询](#游标失效区分-errquerychanged-与-errinvalidargument)。第一页之后新追加的更高区块对进行中的翻页不可见，**也不会帮助当前查询中的标识达标**；需要它们参与计数就以空游标重新开始。
+- **参数错误与无人达标**：负门槛返回 `ErrInvalidArgument`，没有可用页；合法门槛但没有任何标识达到时**不是错误**，而是成功返回空页（`Hits` 为空、`TotalMatches=0`、`MatchedBlocks=0`、`NextCursor` 为空）。
+
+例如高度一至三的交易依次为 `[m,m,n]`、`[n,p]`、`[m,q]`，门槛为 2：`m` 出现在区块 {一,三}、`n` 出现在 {一,二}，二者达标；`p`、`q` 各只出现在一个区块，不返回。达标后 `m` 的三次出现（高度一位置 0、1 与高度三位置 0）和 `n` 的两次出现（高度一位置 2、高度二位置 0）**全部保留，共五条记录、三个匹配区块**（`TotalMatches=5`、`MatchedBlocks=3`）。若高度范围**只包含前两个区块**，则范围内只有 `n` 跨两个区块出现，**只有 `n` 达标**（两条记录、两个匹配区块），`m` 只剩一个区块不达标。
+
+### MinBlocks 完整示例
+
+下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/minblocks/main.go`](examples/minblocks/main.go)：
+
+```bash
+go run ./examples/minblocks
+```
+
+场景与上文短链一致：高度一至三依次为 `[m,m,n]`、`[n,p]`、`[m,q]`，门槛 2、每页 2 条，分三页返回 `m` 的三次与 `n` 的两次出现，每页都带整范围统计 5/3，最后一页后续游标为空；随后演示倒序与改页大小不改变统计、范围只含前两块时只有 `n` 达标、不设门槛沿用原结果、负门槛与续查改门槛返回 `ErrInvalidArgument`、合法门槛无人达标时返回空页、第一页后追加的高度四不帮助当前查询达标（`p` 仍不返回），以及门槛与 `TxIDs`、时间窗口共同生效时缺失时间区块不参与计数。
+
+```go
+// 最少区块数筛选（Index.QueryTxs 的 TxQuery.MinBlocks）完整示例：
+// 门槛为零或不传时沿用原查询结果；正数要求同一标识至少出现在第一页固定的
+// 完整高度范围内的指定数量个不同区块。同一区块内多次出现只贡献一个区块；
+// 一旦达标，该标识的每一次匹配出现都保留，位置仍是原来的块内位置。是否达标
+// 按完整固定范围判定而非当前页，TotalMatches/MatchedBlocks 描述筛选后的完整
+// 范围，不随页大小或正倒序改变。示例还展示门槛与 TxIDs、时间窗口共同生效、
+// 续查必须沿用同一门槛、第一页后新追加的更高区块不帮助当前查询中的标识达标、
+// 负门槛与续查改变门槛返回 ErrInvalidArgument、合法门槛无人达标时成功返回空页。
+//
+// 运行：go run ./examples/minblocks
+package main
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/gzhysuiioo/indexroom-analytics/indexroom"
+)
+
+func mustAppend(index *indexroom.Index, block indexroom.Block) {
+	if err := index.Append(block); err != nil {
+		panic(err)
+	}
+}
+
+// unix 返回指向给定 Unix 秒的指针，用于设置区块时间或时间窗口边界。
+func unix(sec int64) *int64 { return &sec }
+
+func printPage(title string, page indexroom.TxPage) {
+	fmt.Println(title + "：")
+	for _, hit := range page.Hits {
+		fmt.Printf("  命中 height=%d block=%s tx=%q position=%d\n",
+			hit.Height, hit.BlockHash, hit.TxID, hit.Position)
+	}
+	fmt.Printf("  TotalMatches=%d MatchedBlocks=%d ToHeight=%d 有后续游标=%v\n",
+		page.TotalMatches, page.MatchedBlocks, page.ToHeight, page.NextCursor != "")
+}
+
+func main() {
+	fmt.Println("---- 规格短链：高度 1..3 依次为 [m,m,n]、[n,p]、[m,q]，门槛 2 ----")
+	// m 出现在区块 {1,3}、n 出现在 {1,2}，都达到门槛 2；p、q 各只在一个
+	// 区块出现，不达标、不返回。m 在高度 1 的块内出现两次，达标后两次都保留。
+	index := indexroom.New()
+	mustAppend(index, indexroom.Block{Height: 1, Hash: "h1", Parent: "genesis", Txs: []string{"m", "m", "n"}})
+	mustAppend(index, indexroom.Block{Height: 2, Hash: "h2", Parent: "h1", Txs: []string{"n", "p"}})
+	mustAppend(index, indexroom.Block{Height: 3, Hash: "h3", Parent: "h2", Txs: []string{"m", "q"}})
+
+	// 第一页：MinBlocks=2，每页 2 条，范围显式固定在高度 [1,3]。
+	query := indexroom.TxQuery{From: 1, To: 3, MinBlocks: 2, PageSize: 2}
+	page1, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("门槛 2、每页 2 条：第1页", page1)
+
+	// 继续翻页：游标原样传回，门槛（及其他条件）必须与第一页一致。
+	query.Cursor = page1.NextCursor
+	page2, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("第2页（沿用同一门槛与游标）", page2)
+
+	query.Cursor = page2.NextCursor
+	page3, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("第3页", page3)
+	fmt.Printf("最后一页后续游标为空：%v\n", page3.NextCursor == "")
+	fmt.Println("  三次出现的 m（高度1位置0、1，高度3位置0）与两次出现的 n（高度1位置2、高度2位置0）全部保留，共 5 条、3 个匹配区块")
+	fmt.Println()
+
+	// 整范围判定与页大小、方向无关：一次取完的倒序查询给出同样的 5 条记录与
+	// 5/3 统计；每条 Position 仍是原块内位置，倒序不重新编号。
+	desc, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 3, MinBlocks: 2, Order: indexroom.OrderDesc})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Print("倒序一次取完：")
+	for i, hit := range desc.Hits {
+		if i > 0 {
+			fmt.Print("；")
+		}
+		fmt.Printf("高度%d %q 位置%d", hit.Height, hit.TxID, hit.Position)
+	}
+	fmt.Printf("\n  TotalMatches=%d MatchedBlocks=%d，与正序逐页翻页完全一致\n\n", desc.TotalMatches, desc.MatchedBlocks)
+
+	// 高度范围只包含前两个区块时，m 在范围内只出现在高度 1（一个区块），
+	// 不达标；n 在高度 1、2 各出现一次，是唯一达到门槛的标识。
+	firstTwo, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 2, MinBlocks: 2})
+	if err != nil {
+		panic(err)
+	}
+	printPage("范围只含高度 [1,2]、门槛 2（只有 n 达标）", firstTwo)
+	fmt.Println()
+
+	// MinBlocks 为零或不传时不启用筛选，沿用原查询：7 次出现全部返回。
+	plain, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 3})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("不设门槛（MinBlocks=0）：命中 %d 条，TotalMatches=%d MatchedBlocks=%d\n\n",
+		len(plain.Hits), plain.TotalMatches, plain.MatchedBlocks)
+
+	// 负门槛是非法查询参数，没有可用页结果。
+	bad, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 3, MinBlocks: -1})
+	fmt.Printf("负门槛 -1：ErrInvalidArgument=%v 可用命中数=%d\n",
+		errors.Is(err, indexroom.ErrInvalidArgument), len(bad.Hits))
+
+	// 续查改变门槛同样是 ErrInvalidArgument：门槛在第一页钉住，要改只能
+	// 从空游标重新查询。
+	first, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 3, MinBlocks: 2, PageSize: 2})
+	if err != nil {
+		panic(err)
+	}
+	changed, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 3, MinBlocks: 1, PageSize: 2, Cursor: first.NextCursor})
+	fmt.Printf("续查把门槛从 2 改成 1：ErrInvalidArgument=%v 可用命中数=%d\n",
+		errors.Is(err, indexroom.ErrInvalidArgument), len(changed.Hits))
+
+	// 合法门槛但没有任何标识达到：成功的空页，零统计、空游标。
+	none, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 3, MinBlocks: 4})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("门槛 4（无人达到）：err=%v 命中=%d TotalMatches=%d MatchedBlocks=%d 有后续游标=%v\n\n",
+		err, len(none.Hits), none.TotalMatches, none.MatchedBlocks, none.NextCursor != "")
+
+	// 第一页固定完整高度范围：第一页之后追加的更高区块在本次翻页中既不可见，
+	// 也不会帮助任何标识达标。To 留空表示取首查看到的链顶（此时为 3）。
+	pinned, err := index.QueryTxs(indexroom.TxQuery{MinBlocks: 2, PageSize: 2})
+	if err != nil {
+		panic(err)
+	}
+	mustAppend(index, indexroom.Block{Height: 4, Hash: "h4", Parent: "h3", Txs: []string{"p"}})
+	fmt.Printf("第一页后追加高度 4（含 p；p 原本只在高度 2 出现），当前链顶 tip=%d\n", index.Tip)
+	cont := indexroom.TxQuery{MinBlocks: 2, PageSize: 2, Cursor: pinned.NextCursor}
+	kept := append([]indexroom.TxHit{}, pinned.Hits...)
+	statsHold := true
+	for {
+		page, err := index.QueryTxs(cont)
+		if err != nil {
+			panic(err)
+		}
+		kept = append(kept, page.Hits...)
+		if page.TotalMatches != 5 || page.MatchedBlocks != 3 || page.ToHeight != 3 {
+			statsHold = false
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cont.Cursor = page.NextCursor
+	}
+	fmt.Print("沿用旧游标翻完：命中")
+	for _, hit := range kept {
+		fmt.Printf(" 高度%d/%q@%d", hit.Height, hit.TxID, hit.Position)
+	}
+	fmt.Printf("\n  共 %d 条，全部不超过高度 3，p 未出现；每页统计都是 5/3、ToHeight=3：%v\n", len(kept), statsHold)
+
+	// 需要新区块参与达标判定时，从空游标重新查询：p 现在出现在区块 {2,4}，
+	// 也达到门槛。
+	restart, err := index.QueryTxs(indexroom.TxQuery{MinBlocks: 2})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("空游标重新查询（范围重新固定到链顶 4）：命中 %d 条，TotalMatches=%d MatchedBlocks=%d ToHeight=%d\n\n",
+		len(restart.Hits), restart.TotalMatches, restart.MatchedBlocks, restart.ToHeight)
+
+	fmt.Println("---- 门槛与 TxIDs 筛选、时间窗口共同生效 ----")
+	// 高度 1 时间 100、高度 2 缺失时间、高度 3 时间 105，三个区块都含 k 与 r。
+	win := indexroom.New()
+	mustAppend(win, indexroom.Block{Height: 1, Hash: "w1", Parent: "genesis", Txs: []string{"k", "r"}, Time: unix(100)})
+	mustAppend(win, indexroom.Block{Height: 2, Hash: "w2", Parent: "w1", Txs: []string{"k", "r"}})
+	mustAppend(win, indexroom.Block{Height: 3, Hash: "w3", Parent: "w2", Txs: []string{"k", "r"}, Time: unix(105)})
+
+	// 启用窗口 [100,110)：高度 2 缺失时间，不参与计数、其中的出现也不返回；
+	// k 只靠窗口内的区块 {1,3} 计数，恰好达到门槛 2，保留这两次出现。
+	// r 虽在三个区块都有，但不通过 TxIDs 筛选，根本不参与计数。
+	enabled, err := win.QueryTxs(indexroom.TxQuery{
+		TxIDs: []string{"k"}, TimeStart: unix(100), TimeEnd: unix(110), MinBlocks: 2,
+	})
+	if err != nil {
+		panic(err)
+	}
+	printPage("窗口 [100,110)、筛选 k、门槛 2（缺失时间的高度2不帮忙）", enabled)
+
+	// 窗口收窄为 [100,105)：高度 3 时间正好等于被排除的终点，窗口内只剩
+	// 高度 1，没有人达到门槛——成功的空页、零统计、空游标。
+	narrow, err := win.QueryTxs(indexroom.TxQuery{
+		TxIDs: []string{"k"}, TimeStart: unix(100), TimeEnd: unix(105), MinBlocks: 2,
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("窗口 [100,105)（高度2缺失时间、高度3在被排除的终点）：命中=%d TotalMatches=%d MatchedBlocks=%d 有后续游标=%v\n",
+		len(narrow.Hits), narrow.TotalMatches, narrow.MatchedBlocks, narrow.NextCursor != "")
+
+	// 不启用时间窗口时，缺失时间不会仅因没有时间而被排除：三个区块都参与
+	// 计数，k 达到门槛，三次出现（含高度 2）全部保留。
+	off, err := win.QueryTxs(indexroom.TxQuery{TxIDs: []string{"k"}, MinBlocks: 2})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("不启用窗口、筛选 k、门槛 2：命中=%d TotalMatches=%d MatchedBlocks=%d（缺失时间的高度2也参与）\n",
+		len(off.Hits), off.TotalMatches, off.MatchedBlocks)
+}
+```
+
+对应输出：
+
+```text
+---- 规格短链：高度 1..3 依次为 [m,m,n]、[n,p]、[m,q]，门槛 2 ----
+门槛 2、每页 2 条：第1页：
+  命中 height=1 block=h1 tx="m" position=0
+  命中 height=1 block=h1 tx="m" position=1
+  TotalMatches=5 MatchedBlocks=3 ToHeight=3 有后续游标=true
+第2页（沿用同一门槛与游标）：
+  命中 height=1 block=h1 tx="n" position=2
+  命中 height=2 block=h2 tx="n" position=0
+  TotalMatches=5 MatchedBlocks=3 ToHeight=3 有后续游标=true
+第3页：
+  命中 height=3 block=h3 tx="m" position=0
+  TotalMatches=5 MatchedBlocks=3 ToHeight=3 有后续游标=false
+最后一页后续游标为空：true
+  三次出现的 m（高度1位置0、1，高度3位置0）与两次出现的 n（高度1位置2、高度2位置0）全部保留，共 5 条、3 个匹配区块
+
+倒序一次取完：高度3 "m" 位置0；高度2 "n" 位置0；高度1 "n" 位置2；高度1 "m" 位置1；高度1 "m" 位置0
+  TotalMatches=5 MatchedBlocks=3，与正序逐页翻页完全一致
+
+范围只含高度 [1,2]、门槛 2（只有 n 达标）：
+  命中 height=1 block=h1 tx="n" position=2
+  命中 height=2 block=h2 tx="n" position=0
+  TotalMatches=2 MatchedBlocks=2 ToHeight=2 有后续游标=false
+
+不设门槛（MinBlocks=0）：命中 7 条，TotalMatches=7 MatchedBlocks=3
+
+负门槛 -1：ErrInvalidArgument=true 可用命中数=0
+续查把门槛从 2 改成 1：ErrInvalidArgument=true 可用命中数=0
+门槛 4（无人达到）：err=<nil> 命中=0 TotalMatches=0 MatchedBlocks=0 有后续游标=false
+
+第一页后追加高度 4（含 p；p 原本只在高度 2 出现），当前链顶 tip=4
+沿用旧游标翻完：命中 高度1/"m"@0 高度1/"m"@1 高度1/"n"@2 高度2/"n"@0 高度3/"m"@0
+  共 5 条，全部不超过高度 3，p 未出现；每页统计都是 5/3、ToHeight=3：true
+空游标重新查询（范围重新固定到链顶 4）：命中 7 条，TotalMatches=7 MatchedBlocks=4 ToHeight=4
+
+---- 门槛与 TxIDs 筛选、时间窗口共同生效 ----
+窗口 [100,110)、筛选 k、门槛 2（缺失时间的高度2不帮忙）：
+  命中 height=1 block=w1 tx="k" position=0
+  命中 height=3 block=w3 tx="k" position=0
+  TotalMatches=2 MatchedBlocks=2 ToHeight=3 有后续游标=false
+窗口 [100,105)（高度2缺失时间、高度3在被排除的终点）：命中=0 TotalMatches=0 MatchedBlocks=0 有后续游标=false
+不启用窗口、筛选 k、门槛 2：命中=3 TotalMatches=3 MatchedBlocks=3（缺失时间的高度2也参与）
+```
+
+### QueryTxs 完整示例（第一页、翻页、倒序、时间窗口）
 
 下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/querytxs/main.go`](examples/querytxs/main.go)：
 
