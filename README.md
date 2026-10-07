@@ -2,16 +2,78 @@
 
 ## 用途
 
-区块与交易摄取、事件解码与规范化、可组合查询与聚合、索引重建与一致性校验、分析指标与快照。
+区块与交易摄取、事件解码与规范化、可组合查询与聚合、索引重建与一致性校验、分析指标与快照。除此之外，`register` 子命令在本机内存中维护一个服务实例注册表：接收实例注册、离线健康观察与目标选择请求，帮助调用方按健康状态挑选一个目标实例并取得其地址，全程离线、不访问网络。
 
 本仓库是可持续演进的自托管 Go 应用。领域核心位于 `indexroom/`，命令入口位于 `cmd/indexroom/`。
 
 ```bash
-go run ./cmd/indexroom demo
+go run ./cmd/indexroom demo      # 区块摄取与重组演示；不带子命令时执行的就是这个演示
 go run ./cmd/indexroom version
 go run ./cmd/indexroom help
 go test ./...
 ```
+
+不带任何子命令运行 `go run ./cmd/indexroom` 等同于 `demo`：它只是区块索引演示，与服务注册无关。服务注册、健康上报与目标选择请使用下文介绍的 `register` 子命令。
+
+## 快速入门：在本机离线提交请求并取得目标地址
+
+`register` 子命令从标准输入读取一个 JSON 对象，按输入顺序处理其中的 `requests` 数组，支持三类请求：`register`（注册或整体替换一个服务的实例列表）、`health`（记录一条离线健康观察）、`select`（按健康状态选出一个目标实例并返回其地址）。全部处理在本机内存中离线完成：不连接任何实例、不主动探测、不转发流量；示例中的地址不要求真实可访问，健康序号由调用者随请求提交，输出只反映已经被接受的观察。
+
+**每次调用都从空注册表开始**：注册、健康上报和选择必须留在同一次调用（同一批 `requests`）中，不能拆成几次命令——前一次调用内存中的状态不会被保留。
+
+### 完整示例
+
+下面一批请求依次演示：以与标识排序不同的提交顺序注册两个实例、在没有任何健康观察时选择失败、为两个实例分别上报健康、随后连续两次普通选择按实例标识升序轮询：
+
+```bash
+echo '{"requests":[
+  {"type":"register","service":"svc","expectedRevision":0,"instances":[
+    {"id":"i2","address":"h2:8080"},
+    {"id":"i1","address":"h1:8080"}
+  ]},
+  {"type":"select","service":"svc","expectedRevision":1},
+  {"type":"health","service":"svc","instanceId":"i1","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"health","service":"svc","instanceId":"i2","expectedRevision":1,"sequence":1,"healthy":true},
+  {"type":"select","service":"svc","expectedRevision":1},
+  {"type":"select","service":"svc","expectedRevision":1}
+]}' | go run ./cmd/indexroom register
+```
+
+输出（压缩展示，字段与程序实际输出一致）：
+
+```json
+{
+  "results": [
+    {"service":"svc","ok":true,"changed":true,"revision":1},
+    {"service":"svc","ok":false,"revision":1,"error":"no_healthy","reason":"service \"svc\" has no healthy instance available"},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"changed":true,"revision":1,"sequence":1},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i1","address":"h1:8080"},
+    {"service":"svc","ok":true,"revision":1,"sequence":1,"instanceId":"i2","address":"h2:8080"}
+  ],
+  "services": [
+    {"service":"svc","revision":1,"instances":[
+      {"id":"i1","address":"h1:8080","health":"healthy","sequence":1},
+      {"id":"i2","address":"h2:8080","health":"healthy","sequence":1}
+    ]}
+  ]
+}
+```
+
+逐项说明：
+
+1. 新服务 `svc` 以 `expectedRevision` 0 创建成功，`changed:true`，注册修订号变为 1。实例按 `i2`、`i1` 的顺序提交，与标识升序不同；两个实例刚注册时健康状态都是 `unknown`、序号 0。
+2. 此时没有任何健康观察，两个实例都是 `unknown`，不可被选：返回 `no_healthy`，`revision` 报告当前修订号 1，结果中没有 `instanceId`、`address`、`sequence` 等目标字段。这次失败不会阻止后面的健康上报和选择，也不占用轮询位置。
+3. `i1` 的健康观察（序号 1）被接受，`changed:true`；健康上报不增加注册修订号，`revision` 仍为 1。
+4. `i2` 的健康观察（序号 1）同样被接受，修订号仍为 1。
+5. 第一次成功的选择：按实例标识升序从最小的 `i1` 开始——选择顺序与实例在注册输入中的排列顺序无关。成功结果带出所选实例的 `instanceId`、`address`、最新健康序号 `sequence` 和当前注册修订号 `revision`。
+6. 第二次选择从上次选中的 `i1` 之后继续，选中 `i2`；两个健康实例按标识升序轮询。选择同样不增加修订号，`revision` 仍为 1。
+
+末尾的 `services` 列表按既有顺序（实例标识升序）展示两个实例的最终健康状态和序号：`i1`、`i2` 均为 `healthy`、序号 1，与此前成功选择返回的记录一致。
+
+本批次含有失败项（第 2 项），因此即使最后一次选择成功，命令退出状态仍为 1——不能凭最后一项成功判断整批成功；只有全部请求成功且结果完整写出时退出状态才为 0。
+
+入门示例只使用普通选择。`select` 还支持会话保持（`sessionKey`）与当次排除实例（`excludeInstanceIds`），另有解除会话绑定的 `release_session` 请求，分别见下文《会话保持（`select` 请求的 `sessionKey`）中文说明》《选择时排除实例（`select` 请求的 `excludeInstanceIds`）中文说明》《解除单个会话绑定（`release_session` 请求）中文说明》。
 
 `register` reads service registrations as JSON from standard input and maintains
 an in-memory service instance registry (each invocation starts empty):
