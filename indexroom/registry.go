@@ -397,64 +397,144 @@ func ParseSequence(text string) (int64, error) {
 	)
 }
 
-// revisionFailure describes the common revision-gate result shared by health
-// observations and selections. It carries no operation-specific fields: each
-// operation maps it onto its own result so stale health sequences, missing
-// instances and missing healthy targets never get mixed together.
+// revisionGateVerdict classifies the one registration-revision judgment every
+// request kind shares. Looking a service up and comparing its current revision
+// with the submitted expectedRevision happens only in enterRevisionGate, so
+// the same comparison is never maintained twice (registration used to carry
+// its own lookup and conflict logic apart from health, select and release).
+type revisionGateVerdict int
+
+const (
+	// revisionGateConflict means expectedRevision differs from the service's
+	// current revision. Every request kind reports it as the same conflict —
+	// including a non-zero submission against an unknown service (revision 0) —
+	// carrying the submitted expectedRevision and the actual revision as a
+	// comparable pair. Each side may legitimately be 0, so callers emit both.
+	revisionGateConflict revisionGateVerdict = iota
+	// revisionGateCreate means expectedRevision is 0 and the service is unknown.
+	// Registration turns this into creation (the new service starts at
+	// revision 1); health, select and release turn it into their not_found
+	// result. That registration/non-registration distinction is the only one
+	// the operation keeps; the comparison itself is shared.
+	revisionGateCreate
+)
+
+// revisionGateFailure carries a non-passing registration-revision judgment.
+// It holds no operation-specific fields: each operation maps it onto its own
+// result so a missing instance, a missing healthy target and a
+// same-sequence/different-content health conflict never get mixed together.
 //
-// mismatch is true only for the revision-mismatch conflict, whose expected and
-// actual revisions are both real values (each side may legitimately be 0). It
-// is false for the matching-revision not_found, which reports no comparison.
-type revisionFailure struct {
+// For the conflict verdict the kind is OutcomeConflict, mismatch is true and
+// expected/actual are both real values (each side may legitimately be 0). For
+// the create verdict the kind is OutcomeNotFound with the generic
+// unknown-service reason and no comparison fields — used directly by health,
+// select and release; registration reads the verdict instead and creates.
+//
+// unknown records that the lookup missed the service, so registration can
+// keep its own wording for the non-zero-submission-against-an-unknown-service
+// conflict while every other operation reports the shared wording.
+type revisionGateFailure struct {
+	verdict  revisionGateVerdict
+	unknown  bool
 	kind     OutcomeKind
 	reason   string
-	revision int // current revision (0 for an unknown service)
+	revision int // current revision at the time this item is handled (0 when unknown)
 	expected int
 	actual   int
 	mismatch bool
 }
 
-// checkServiceRevision applies the gate the health and select operations share.
-// Content validation has already happened by the time it runs, so an invalid
-// field never reaches it. It first looks the service up (an unknown service is
-// at revision 0) and compares revisions: a mismatch is a conflict carrying the
-// request's expectedRevision and the actual revision, even when the service or
-// the targeted instance is missing — both values are flagged so callers emit
-// them even when one side is 0. With matching revisions an unknown service is
-// not_found and carries no comparison; a registered service with an empty
-// instance list is still returned, so it compares by its real revision rather
-// than being treated as absent. Returning nil means the gate passed and the
-// caller owns the rest.
-func (r *Registry) checkServiceRevision(service string, expected int) (*serviceState, *revisionFailure) {
+// registerUnknownConflictReason is registration's own conflict wording for a
+// non-zero expectedRevision submitted against an unknown service; the
+// comparison that produces that conflict is the shared gate's.
+func registerUnknownConflictReason(service string, expected int) string {
+	return fmt.Sprintf("service %q does not exist yet; expected revision must be 0, got %d", service, expected)
+}
+
+// gateRevisionConflict assembles the shared mismatch conflict. revision is the
+// service's current revision when the item is handled — 0 for an unknown
+// service — and is never replaced by a revision a later batch request
+// produces.
+func gateRevisionConflict(service string, expected, revision int, unknown bool) *revisionGateFailure {
+	return &revisionGateFailure{
+		verdict:  revisionGateConflict,
+		unknown:  unknown,
+		kind:     OutcomeConflict,
+		reason:   fmt.Sprintf("service %q is at revision %d, not %d", service, revision, expected),
+		revision: revision,
+		expected: expected,
+		actual:   revision,
+		mismatch: true,
+	}
+}
+
+// gateUnknownService assembles the matching-revision verdict for an unknown
+// service: registration reads revisionGateCreate and creates the service,
+// while every other operation maps it straight onto its not_found result,
+// which carries no revision comparison.
+func gateUnknownService(service string) *revisionGateFailure {
+	return &revisionGateFailure{
+		verdict:  revisionGateCreate,
+		unknown:  true,
+		kind:     OutcomeNotFound,
+		reason:   fmt.Sprintf("service %q does not exist", service),
+		revision: 0,
+	}
+}
+
+// enterRevisionGate performs the single registration-revision lookup and
+// comparison every request kind shares. Content validation has already
+// happened by the time it runs, so an invalid field never reaches it. The
+// service is looked up once: an unknown service is at revision 0.
+//
+// A mismatch (expectedRevision differs from the current revision) returns a
+// conflict verdict carrying both revisions even when the service or the
+// targeted instance is missing — both values are flagged so callers emit them
+// even when one side is 0. A matching request for an unknown service (only
+// possible with expectedRevision 0) returns the create verdict. A registered
+// service with matching revision is handed back to the caller, including one
+// whose instance list is empty: the emptied service still exists and compares
+// by its real revision rather than being treated as absent.
+func (r *Registry) enterRevisionGate(service string, expected int) (*serviceState, *revisionGateFailure) {
 	st, exists := r.services[service]
-	actual := 0
-	if exists {
-		actual = st.revision
-	}
-	if expected != actual {
-		return nil, &revisionFailure{
-			kind:     OutcomeConflict,
-			reason:   fmt.Sprintf("service %q is at revision %d, not %d", service, actual, expected),
-			revision: actual,
-			expected: expected,
-			actual:   actual,
-			mismatch: true,
-		}
-	}
 	if !exists {
-		return nil, &revisionFailure{
-			kind:     OutcomeNotFound,
-			reason:   fmt.Sprintf("service %q does not exist", service),
-			revision: 0,
+		if expected != 0 {
+			return nil, gateRevisionConflict(service, expected, 0, true)
 		}
+		return nil, gateUnknownService(service)
+	}
+	if expected != st.revision {
+		return nil, gateRevisionConflict(service, expected, st.revision, false)
 	}
 	return st, nil
+}
+
+// asRegister maps a gate conflict onto a registration result. Registration is
+// the only operation whose conflict wording distinguishes an unknown service
+// (whose expectedRevision must be 0) from an existing one; every other field
+// is exactly the shared conflict's. Registration never maps the create
+// verdict through this method — it creates the service instead.
+func (f *revisionGateFailure) asRegister(service string) Outcome {
+	reason := f.reason
+	if f.unknown {
+		reason = registerUnknownConflictReason(service, f.expected)
+	}
+	return Outcome{
+		Service:          service,
+		OK:               false,
+		Kind:             OutcomeConflict,
+		Reason:           reason,
+		Expected:         f.expected,
+		Actual:           f.actual,
+		Revision:         f.revision,
+		RevisionMismatch: true,
+	}
 }
 
 // asHealth maps the shared revision gate failure onto a health result. The
 // operation-specific fields (instance id and the current sequence) stay zero so
 // they remain omitted exactly as health's own revision failures always have.
-func (f *revisionFailure) asHealth(service string) HealthOutcome {
+func (f *revisionGateFailure) asHealth(service string) HealthOutcome {
 	return HealthOutcome{
 		Service:          service,
 		OK:               false,
@@ -469,7 +549,7 @@ func (f *revisionFailure) asHealth(service string) HealthOutcome {
 
 // asSelect maps the shared revision gate failure onto a selection result, which
 // never fabricates an instance id, address or sequence on rejection.
-func (f *revisionFailure) asSelect(service string) SelectOutcome {
+func (f *revisionGateFailure) asSelect(service string) SelectOutcome {
 	return SelectOutcome{
 		Service:          service,
 		OK:               false,
@@ -484,7 +564,7 @@ func (f *revisionFailure) asSelect(service string) SelectOutcome {
 
 // asRelease maps the shared revision gate failure onto a session-release
 // result. It carries no target fields: a release never selects an instance.
-func (f *revisionFailure) asRelease(service string) ReleaseOutcome {
+func (f *revisionGateFailure) asRelease(service string) ReleaseOutcome {
 	return ReleaseOutcome{
 		Service:          service,
 		OK:               false,
@@ -528,8 +608,17 @@ func (r *Registry) ValidateRegistration(service string, revision int64, instance
 	return Registration{Service: name, Revision: int(revision), Instances: valid}, nil
 }
 
-// Apply checks the revision and, on match, replaces the service's instance list.
-// A new service is created at revision 1 only when expectedRevision is 0.
+// Apply replaces the service's instance list once the shared revision gate
+// (enterRevisionGate, the same judgment ApplyHealth, Select and ReleaseSession
+// use) has passed.
+//
+// Registration is the only operation allowed to turn the gate's
+// unknown-service/expectedRevision-0 verdict into creation: the new service
+// starts at revision 1, even when the submitted list is empty. A non-zero
+// expectedRevision against an unknown service is the shared mismatch conflict
+// (with registration's own wording), as is a submission against an existing
+// service whose revision differs from the current revision.
+//
 // A matching registration with identical content succeeds without bumping revision.
 //
 // A matching registration whose normalized content differs is refused when the
@@ -542,38 +631,20 @@ func (r *Registry) ValidateRegistration(service string, revision int64, instance
 // Submitting the same normalized list — a pure reorder or whitespace-only
 // difference included — still succeeds without a revision bump.
 func (r *Registry) Apply(reg Registration) Outcome {
-	st, exists := r.services[reg.Service]
-	if !exists {
-		if reg.Revision != 0 {
-			return Outcome{
-				Service:          reg.Service,
-				OK:               false,
-				Kind:             OutcomeConflict,
-				Reason:           fmt.Sprintf("service %q does not exist yet; expected revision must be 0, got %d", reg.Service, reg.Revision),
-				Expected:         reg.Revision,
-				Actual:           0,
-				Revision:         0,
-				RevisionMismatch: true,
+	st, fail := r.enterRevisionGate(reg.Service, reg.Revision)
+	if fail != nil {
+		if fail.verdict == revisionGateCreate {
+			// Registration alone turns the matching unknown-service verdict into
+			// creation; every other operation maps it to not_found. The new
+			// service exists from revision 1 on, including with an empty list.
+			st = &serviceState{revision: 1, instances: make(map[string]*instanceState, len(reg.Instances))}
+			r.services[reg.Service] = st
+			for _, inst := range reg.Instances {
+				st.instances[inst.ID] = newInstanceState(inst.Address)
 			}
+			return Outcome{Service: reg.Service, OK: true, Changed: true, Revision: 1}
 		}
-		st = &serviceState{revision: 1, instances: make(map[string]*instanceState, len(reg.Instances))}
-		r.services[reg.Service] = st
-		for _, inst := range reg.Instances {
-			st.instances[inst.ID] = newInstanceState(inst.Address)
-		}
-		return Outcome{Service: reg.Service, OK: true, Changed: true, Revision: 1}
-	}
-	if reg.Revision != st.revision {
-		return Outcome{
-			Service:          reg.Service,
-			OK:               false,
-			Kind:             OutcomeConflict,
-			Reason:           fmt.Sprintf("service %q is at revision %d, not %d", reg.Service, st.revision, reg.Revision),
-			Expected:         reg.Revision,
-			Actual:           st.revision,
-			Revision:         st.revision,
-			RevisionMismatch: true,
-		}
+		return fail.asRegister(reg.Service)
 	}
 	changed := !sameInstances(st.instances, reg.Instances)
 	if changed {
@@ -648,7 +719,7 @@ func (r *Registry) ValidateHealth(service, instanceID string, revision int64, se
 // ApplyHealth records an offline observation once the shared revision gate has
 // passed.
 //
-// The gate is shared with Select (see checkServiceRevision): a revision
+// The gate is shared with Select (see enterRevisionGate): a revision
 // mismatch is a conflict carrying the request and current revisions even when
 // the service or the targeted instance is missing, and a matching request for
 // an unknown service is not_found. Only after it does health apply its own
@@ -660,7 +731,7 @@ func (r *Registry) ValidateHealth(service, instanceID string, revision int64, se
 //   - the same sequence with different content is a conflict;
 //   - a newer sequence writes the status and reason.
 func (r *Registry) ApplyHealth(upd HealthUpdate) HealthOutcome {
-	st, fail := r.checkServiceRevision(upd.Service, upd.Revision)
+	st, fail := r.enterRevisionGate(upd.Service, upd.Revision)
 	if fail != nil {
 		return fail.asHealth(upd.Service)
 	}
@@ -854,7 +925,7 @@ func (r *Registry) ValidateSessionRelease(service string, revision int64, sessio
 // Select chooses one healthy instance for the service once the shared revision
 // gate has passed.
 //
-// The gate is shared with ApplyHealth (see checkServiceRevision): a mismatch is
+// The gate is shared with ApplyHealth (see enterRevisionGate): a mismatch is
 // a conflict carrying the request and current revisions (an unknown service is
 // at revision 0), and a matching request for an unknown service is not_found.
 // Only after it does select apply its own rule: an existing service with no
@@ -896,7 +967,7 @@ func (r *Registry) ValidateSessionRelease(service string, revision int64, sessio
 // healthy instance at all, the reason is the ordinary one. Either failure
 // fabricates no target and moves nothing.
 func (r *Registry) Select(sel Selection) SelectOutcome {
-	st, fail := r.checkServiceRevision(sel.Service, sel.Revision)
+	st, fail := r.enterRevisionGate(sel.Service, sel.Revision)
 	if fail != nil {
 		return fail.asSelect(sel.Service)
 	}
@@ -1075,7 +1146,7 @@ func selectSuccess(service string, revision int, id string, cur *instanceState) 
 // passed.
 //
 // The gate is the same one health and select use (see
-// checkServiceRevision): a revision mismatch is a conflict carrying the
+// enterRevisionGate): a revision mismatch is a conflict carrying the
 // request and current revisions (an unknown service is at revision 0), and a
 // matching request for an unknown service is not_found — including when
 // expectedRevision is 0. Only after it does release do its own work.
@@ -1095,7 +1166,7 @@ func selectSuccess(service string, revision int, id string, cur *instanceState) 
 // released key follows the first-binding rule: it rotates from just after the
 // last actually rotated position and records a fresh binding only on success.
 func (r *Registry) ReleaseSession(rel SessionRelease) ReleaseOutcome {
-	st, fail := r.checkServiceRevision(rel.Service, rel.Revision)
+	st, fail := r.enterRevisionGate(rel.Service, rel.Revision)
 	if fail != nil {
 		return fail.asRelease(rel.Service)
 	}
