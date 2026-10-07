@@ -266,6 +266,19 @@ func expectedRevisionRangeReason(raw string) string {
 	return fmt.Sprintf("expectedRevision must be an integer between 0 and %d, got %s", maxRevision, raw)
 }
 
+// revisionLimitReachedReason is the invalid reason for a content-changing
+// replacement against a service whose revision already equals maxRevision:
+// bumping once more would overflow int into a negative revision, and every
+// later request submitting the real (max) revision would then fail the
+// revision comparison, leaving the replaced service operable by no legitimate
+// request. The limit is architecture-specific (2147483647 on a 32-bit build,
+// 9223372036854775807 on a 64-bit build) and is named in the message. A
+// submission whose normalized content is unchanged succeeds without bumping
+// and never reaches this reason.
+func revisionLimitReachedReason(limit int) string {
+	return fmt.Sprintf("registration revision has reached its limit %d and cannot save the list change", limit)
+}
+
 // validateExpectedRevision is the revision field shared by every request. It
 // judges the raw submitted value before it is narrowed to int: an int64 still
 // holds values outside int's range on a 32-bit build, and converting
@@ -518,6 +531,16 @@ func (r *Registry) ValidateRegistration(service string, revision int64, instance
 // Apply checks the revision and, on match, replaces the service's instance list.
 // A new service is created at revision 1 only when expectedRevision is 0.
 // A matching registration with identical content succeeds without bumping revision.
+//
+// A matching registration whose normalized content differs is refused when the
+// service is already at maxRevision: recording the change would increment the
+// revision past the architecture's integer range, overflowing to a negative
+// value that no valid expectedRevision could ever match again. Such a request
+// is invalid (not a revision conflict, so it carries neither
+// expectedRevision nor actualRevision), keeps the revision at the limit, and
+// changes no instance, health record, rotation position or session binding.
+// Submitting the same normalized list — a pure reorder or whitespace-only
+// difference included — still succeeds without a revision bump.
 func (r *Registry) Apply(reg Registration) Outcome {
 	st, exists := r.services[reg.Service]
 	if !exists {
@@ -554,6 +577,21 @@ func (r *Registry) Apply(reg Registration) Outcome {
 	}
 	changed := !sameInstances(st.instances, reg.Instances)
 	if changed {
+		// The revision is already at the architecture's maximum: recording this
+		// change would require incrementing it, which overflows int into a
+		// negative value that no legal expectedRevision can match. Refuse the
+		// whole replacement as invalid before rebuilding the map, so the list,
+		// health records, rotation position and session bindings stay as they
+		// were.
+		if st.revision >= maxRevision {
+			return Outcome{
+				Service:  reg.Service,
+				OK:       false,
+				Kind:     OutcomeInvalid,
+				Reason:   revisionLimitReachedReason(maxRevision),
+				Revision: st.revision,
+			}
+		}
 		// A replacement fully rebuilds the list, but an instance that keeps both
 		// its id and its address retains its health observation. Anything new,
 		// address-changed, or removed-then-readded starts from unknown at sequence 0.

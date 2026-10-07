@@ -92,6 +92,29 @@ results omit them, and so does health's other conflict — reusing an already
 accepted sequence with different health content — which reports the current
 sequence and a reason instead and must not be read as a registration mismatch.
 
+A `register` replacement that would genuinely change the normalized instance
+list is refused once the service's revision already equals the build's integer
+maximum (2147483647 on a 32-bit build, 9223372036854775807 on a 64-bit build):
+another increment would overflow the revision into a negative value that no
+legal expectedRevision could ever match. The item returns `ok:false` with
+`error:"invalid"` and a reason stating the registration revision has reached
+its limit and naming the limit; `revision` stays at the maximum, `changed` is
+omitted, and neither `expectedRevision` nor `actualRevision` appears. Nothing
+the list proposed takes effect — additions, removals, address changes and
+clearing a non-empty list are all refused together — and the instances,
+health records, rotation cursor and session bindings are left exactly as they
+were. Submitting a complete list whose normalized content is unchanged still
+succeeds at the limit with no `changed`: a pure reorder, the existing
+field-whitespace trimming, and an already-empty list resubmitted as `[]` all
+count as unchanged. A genuine replacement submitted at revision
+maximum-minus-one still increments normally to the maximum, preserving or
+resetting health records by the usual rules. The established precedence
+survives: invalid content is still the field-level `invalid`, and a valid list
+with a mismatched expectedRevision is still a `conflict` carrying the revision
+pair — neither is replaced by the limit error. After a refusal, health
+reports, target selections and session releases keep working at the limiting
+revision.
+
 A `select` request may carry an optional `sessionKey` string to pin the
 request to a per-service session. The key's first successful selection rotates
 normally and remembers the chosen instance; later requests with the same key
@@ -223,6 +246,10 @@ echo '{"requests":[
 ### 修订号、变更判定与空列表
 
 - 只有实例列表**内容改变**（整理后的标识集合不同，或任一标识对应的地址不同）才把修订号加 1；仅调整实例的提交顺序不产生变更。
+- 修订号达到本程序整数上限（32 位程序 `2147483647`、64 位程序 `9223372036854775807`）后，**内容确实改变**的替换必须失败：再递增会溢出为负数，此后没有任何合法的 expectedRevision 能再匹配该服务。结果为 `ok:false`、`error:"invalid"`，原因说明注册修订号已达到上限、无法保存列表变更并给出该上限；`revision` 保留在上限值，结果省略 `changed`，也不输出只属于修订号不匹配的 `expectedRevision`、`actualRevision`。新增、删除、改地址和清空非空列表此时都不能生效，实例列表、健康状态、序号、原因、轮询位置和会话绑定全部保持原样。
+- 达到上限仍可提交**没有实际变化**的完整列表：expectedRevision 匹配且整理后内容相同时成功，修订号不变，没有 `changed`；仅调换实例顺序、按现有规则去除字段首尾空白，以及已经为空的列表再提交 `[]`，都按内容未变处理。
+- 修订号为上限减一时，真实替换仍可正常递增到上限；标识和地址都未变的实例照常保留健康记录，地址变化、移除后重加或新加入的实例照常重置为 `unknown`、序号 0、无原因。
+- 错误优先次序不变：字段不合法仍先报 `invalid`；字段合法但 expectedRevision 与当前修订号不同仍报 `conflict` 并携带原有的 `expectedRevision`、`actualRevision`，不会被上限错误覆盖。被上限拒绝之后，健康上报、目标选择和解除会话仍按原有规则在该上限修订号下继续工作。
 - 重复提交整理后标识和地址都相同的列表会成功，但结果中**不出现 `changed`**，修订号保持原值。
 - `instances: []` 是合法的空数组，可以清空实例列表；服务仍然存在（修订号匹配的查询仍能找到它），修订号照常按内容是否改变计算。`instances: null` 不能当成空数组，返回原因为 `instances must be an array` 的 `invalid`。
 - 每个失败项都带有失败原因（`reason`）和处理该项时的当前修订号（`revision`），失败不会覆盖原有列表；批次中的后续请求仍按输入顺序继续处理，因此一次失败后改用正确修订号提交即可成功更新。批次中只要含失败项，进程退出状态即为 1；全部成功才为 0。
