@@ -909,60 +909,22 @@ func (r *Registry) Select(sel Selection) SelectOutcome {
 	// A bound session reuses its instance while it is registered, healthy and
 	// not excluded by this request; the reuse reflects the instance's current
 	// address and sequence and does not advance the rotation.
-	if sel.SessionKey != "" {
-		if id, bound := st.sessions[sel.SessionKey]; bound {
-			if cur, ok := st.instances[id]; ok && cur.health == HealthHealthy && !excluded[id] {
-				return SelectOutcome{
-					Service:    sel.Service,
-					OK:         true,
-					Revision:   st.revision,
-					InstanceID: id,
-					Address:    cur.address,
-					Sequence:   cur.sequence,
-				}
-			}
-		}
+	if id, cur, ok := st.reusableBinding(sel.SessionKey, excluded); ok {
+		return selectSuccess(sel.Service, st.revision, id, cur)
 	}
 
-	healthy := make([]string, 0, len(st.instances))
-	for id, cur := range st.instances {
-		if cur.health == HealthHealthy {
-			healthy = append(healthy, id)
-		}
-	}
-	sort.Strings(healthy)
-
-	candidates := healthy[:0]
-	for _, id := range healthy {
-		if !excluded[id] {
-			candidates = append(candidates, id)
-		}
-	}
+	healthy, candidates := st.selectableInstances(excluded)
 	if len(candidates) == 0 {
-		reason := fmt.Sprintf("service %q has no healthy instance available", sel.Service)
-		if len(healthy) > 0 {
-			reason = fmt.Sprintf("service %q has no healthy instance available: all healthy instances are excluded by excludeInstanceIds", sel.Service)
-		}
 		return SelectOutcome{
 			Service:  sel.Service,
 			OK:       false,
 			Kind:     OutcomeNoHealthy,
-			Reason:   reason,
+			Reason:   noHealthyReason(sel.Service, len(healthy) > 0),
 			Revision: st.revision,
 		}
 	}
 
-	chosen := candidates[0]
-	if st.cursorSet {
-		chosen = candidates[0]
-		for _, id := range candidates {
-			if id > st.cursor {
-				chosen = id
-				break
-			}
-		}
-	}
-	cur := st.instances[chosen]
+	chosen := nextRotation(candidates, st.cursor, st.cursorSet)
 	st.cursor = chosen
 	st.cursorSet = true
 	if sel.SessionKey != "" {
@@ -971,11 +933,90 @@ func (r *Registry) Select(sel Selection) SelectOutcome {
 		}
 		st.sessions[sel.SessionKey] = chosen
 	}
+	return selectSuccess(sel.Service, st.revision, chosen, st.instances[chosen])
+}
+
+// reusableBinding returns the session key's bound instance when the request
+// carries a key whose binding is still usable: the bound instance is still
+// registered, currently healthy and not excluded by this request. An empty
+// key, an unknown key or a binding that fails any of those checks reports
+// false, and the caller falls back to the normal rotation.
+func (st *serviceState) reusableBinding(sessionKey string, excluded map[string]bool) (string, *instanceState, bool) {
+	if sessionKey == "" {
+		return "", nil, false
+	}
+	id, bound := st.sessions[sessionKey]
+	if !bound || excluded[id] {
+		return "", nil, false
+	}
+	cur, ok := st.instances[id]
+	if !ok || cur.health != HealthHealthy {
+		return "", nil, false
+	}
+	return id, cur, true
+}
+
+// selectableInstances splits the service's instances into the healthy ids
+// (ascending) and the rotation candidates: the healthy ids minus this
+// request's exclusions. The healthy count is returned alongside so the caller
+// can tell "no healthy instance at all" from "every healthy instance was
+// excluded" — the two no_healthy reasons.
+func (st *serviceState) selectableInstances(excluded map[string]bool) (healthy, candidates []string) {
+	healthy = make([]string, 0, len(st.instances))
+	for id, cur := range st.instances {
+		if cur.health == HealthHealthy {
+			healthy = append(healthy, id)
+		}
+	}
+	sort.Strings(healthy)
+
+	candidates = make([]string, 0, len(healthy))
+	for _, id := range healthy {
+		if !excluded[id] {
+			candidates = append(candidates, id)
+		}
+	}
+	return healthy, candidates
+}
+
+// nextRotation picks the rotation target from the ascending candidate list:
+// the smallest candidate before any successful selection, otherwise the
+// smallest candidate strictly after the last actually rotated id, wrapping to
+// the smallest candidate when none follows. The cursor id itself need not be
+// a candidate — it may have been removed, become unhealthy or be excluded —
+// the position it left behind still decides where the rotation continues.
+func nextRotation(candidates []string, cursor string, cursorSet bool) string {
+	if cursorSet {
+		for _, id := range candidates {
+			if id > cursor {
+				return id
+			}
+		}
+	}
+	return candidates[0]
+}
+
+// noHealthyReason is the no_healthy reason for one rejected selection. When
+// the service has healthy instances but the request's exclusions removed
+// every candidate, the reason says so; with no healthy instance at all it is
+// the ordinary reason.
+func noHealthyReason(service string, allExcluded bool) string {
+	if allExcluded {
+		return fmt.Sprintf("service %q has no healthy instance available: all healthy instances are excluded by excludeInstanceIds", service)
+	}
+	return fmt.Sprintf("service %q has no healthy instance available", service)
+}
+
+// selectSuccess is the single success result of a selection, whether the
+// target came from a reused session binding or from the rotation: the chosen
+// instance's id, its current address and its latest accepted health sequence,
+// stamped with the service's current revision.
+func selectSuccess(service string, revision int, id string, cur *instanceState) SelectOutcome {
 	return SelectOutcome{
-		Service:    sel.Service,
+		Service:    service,
 		OK:         true,
-		Revision:   st.revision,
-		InstanceID: chosen,
+		Revision:   revision,
+		InstanceID: id,
 		Address:    cur.address,
 		Sequence:   cur.sequence,
 	}
