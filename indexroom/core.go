@@ -4,6 +4,8 @@
 package indexroom
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"unicode/utf8"
@@ -244,25 +246,50 @@ func validateBlockEncoding(block Block) error {
 	return nil
 }
 
+// encodeBlockContent appends the canonical encoding of the block's content
+// to buf: the height, hash, parent, the ordered transaction identifiers, and
+// the timestamp's presence and value. This encoding is the single definition
+// of what makes two blocks "the same content" — sameBlock compares it for
+// equality, and fingerprintLocked chains it over a height range — so the
+// resubmit, reorg, and query-continuation checks can never drift apart on
+// which fields count. Strings are length-prefixed, so distinct contents
+// never share an encoding (["ab","c"] and ["a","bc"] differ). An empty tx
+// list encodes like a missing one (a zero count), while a missing timestamp
+// carries a different presence byte than a real zero. The layout is fixed:
+// query cursors minted by earlier versions embed fingerprints over exactly
+// these bytes and must keep validating.
+func encodeBlockContent(buf []byte, block Block) []byte {
+	var lenBuf [8]byte
+	appendString := func(buf []byte, s string) []byte {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(s)))
+		buf = append(buf, lenBuf[:]...)
+		return append(buf, s...)
+	}
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(block.Height))
+	buf = append(buf, lenBuf[:]...)
+	buf = appendString(buf, block.Hash)
+	buf = appendString(buf, block.Parent)
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(block.Txs)))
+	buf = append(buf, lenBuf[:]...)
+	for _, tx := range block.Txs {
+		buf = appendString(buf, tx)
+	}
+	if block.Time == nil {
+		return append(buf, 0)
+	}
+	buf = append(buf, 1)
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(*block.Time))
+	return append(buf, lenBuf[:]...)
+}
+
 // sameBlock reports whether two blocks are identical: same height, hash,
 // parent, transactions in order, and timestamp presence and value. An empty
 // tx list equals a missing one, but a missing timestamp never equals zero.
+// The comparison runs over the canonical content encoding, so it is exact
+// (length prefixes make the encoding injective) while sharing the one
+// content definition with the query fingerprint.
 func sameBlock(a, b Block) bool {
-	if a.Height != b.Height || a.Hash != b.Hash || a.Parent != b.Parent {
-		return false
-	}
-	if len(a.Txs) != len(b.Txs) {
-		return false
-	}
-	for i := range a.Txs {
-		if a.Txs[i] != b.Txs[i] {
-			return false
-		}
-	}
-	if (a.Time == nil) != (b.Time == nil) {
-		return false
-	}
-	return a.Time == nil || *a.Time == *b.Time
+	return bytes.Equal(encodeBlockContent(nil, a), encodeBlockContent(nil, b))
 }
 
 type errInvalid string

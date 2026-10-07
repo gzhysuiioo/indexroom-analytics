@@ -494,36 +494,17 @@ func (index *Index) scanPageQualifiedLocked(from, to int64, filter txFilter, win
 	return hits, total, blocks
 }
 
-// fingerprintLocked hashes the exact content of every block in [from, to]:
-// height, hash, parent, the ordered transaction list, and the timestamp
-// (distinguishing a missing timestamp from zero). The caller must hold
-// index.mu.
+// fingerprintLocked hashes the exact content of every block in [from, to] by
+// feeding each block's canonical content encoding (see encodeBlockContent,
+// the one definition of block content shared with sameBlock) into a single
+// digest: height, hash, parent, the ordered transaction list, and the
+// timestamp — distinguishing a missing timestamp from zero — all take part.
+// The caller must hold index.mu.
 func (index *Index) fingerprintLocked(from, to int64) []byte {
 	h := sha256.New()
-	var lenBuf [8]byte
-	writeString := func(s string) {
-		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(s)))
-		h.Write(lenBuf[:])
-		h.Write([]byte(s))
-	}
+	var buf []byte
 	for height := from; height <= to; height++ {
-		block := index.Blocks[height]
-		binary.BigEndian.PutUint64(lenBuf[:], uint64(block.Height))
-		h.Write(lenBuf[:])
-		writeString(block.Hash)
-		writeString(block.Parent)
-		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(block.Txs)))
-		h.Write(lenBuf[:])
-		for _, tx := range block.Txs {
-			writeString(tx)
-		}
-		if block.Time == nil {
-			h.Write([]byte{0})
-		} else {
-			h.Write([]byte{1})
-			binary.BigEndian.PutUint64(lenBuf[:], uint64(*block.Time))
-			h.Write(lenBuf[:])
-		}
+		h.Write(encodeBlockContent(buf[:0], index.Blocks[height]))
 	}
 	return h.Sum(nil)
 }
