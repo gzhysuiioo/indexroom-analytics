@@ -196,52 +196,6 @@ func (index *Index) QueryTxs(query TxQuery) (TxPage, error) {
 	return index.firstQuery(query, pageSize, window)
 }
 
-// timeWindow is the canonical form of TxQuery's optional timestamp window.
-// enabled is false only when both bounds are absent, so an unused window
-// stays distinct from [0, end); when enabled, start and end hold non-negative
-// Unix seconds with start < end.
-type timeWindow struct {
-	enabled bool
-	start   int64
-	end     int64
-}
-
-// normalizeTimeWindow validates the optional half-open window: both bounds
-// must be absent together, neither may be negative, and the start must be
-// below the end. Exactly one bound, a negative bound, or a non-empty window
-// of zero or negative width is ErrInvalidArgument.
-func normalizeTimeWindow(startPtr, endPtr *int64) (timeWindow, error) {
-	if (startPtr == nil) != (endPtr == nil) {
-		return timeWindow{}, fmt.Errorf("%w: time window needs both start and end or neither", ErrInvalidArgument)
-	}
-	if startPtr == nil {
-		return timeWindow{}, nil
-	}
-	if *startPtr < 0 {
-		return timeWindow{}, fmt.Errorf("%w: time window start must not be negative", ErrInvalidArgument)
-	}
-	if *endPtr < 0 {
-		return timeWindow{}, fmt.Errorf("%w: time window end must not be negative", ErrInvalidArgument)
-	}
-	if *startPtr >= *endPtr {
-		return timeWindow{}, fmt.Errorf("%w: time window start must be below end", ErrInvalidArgument)
-	}
-	return timeWindow{enabled: true, start: *startPtr, end: *endPtr}, nil
-}
-
-// contains reports whether a block timestamp survives the window: an
-// enabled window rejects missing timestamps, while start is included and end
-// excluded. A disabled window matches regardless of the timestamp.
-func (w timeWindow) contains(when *int64) bool {
-	if !w.enabled {
-		return true
-	}
-	if when == nil {
-		return false
-	}
-	return *when >= w.start && *when < w.end
-}
-
 func normalizePageSize(size int) (int, error) {
 	if size == 0 {
 		return DefaultPageSize, nil

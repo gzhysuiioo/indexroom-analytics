@@ -88,14 +88,12 @@ func (index *Index) QueryTimeStats(query TimeStatsQuery) (TimeStats, error) {
 	if err != nil {
 		return TimeStats{}, err
 	}
-	if query.Start < 0 {
-		return TimeStats{}, fmt.Errorf("%w: start time must not be negative", ErrInvalidArgument)
-	}
-	if query.End < 0 {
-		return TimeStats{}, fmt.Errorf("%w: end time must not be negative", ErrInvalidArgument)
-	}
-	if query.Start >= query.End {
-		return TimeStats{}, fmt.Errorf("%w: start time must be below end time", ErrInvalidArgument)
+	// The window is always required for statistics and follows the same
+	// legality rule as QueryTxs' optional one; only the reason wording is
+	// entry-specific.
+	window, err := normalizeStatsTimeWindow(query.Start, query.End)
+	if err != nil {
+		return TimeStats{}, err
 	}
 	if query.StepSeconds <= 0 {
 		return TimeStats{}, fmt.Errorf("%w: step seconds must be positive", ErrInvalidArgument)
@@ -151,11 +149,14 @@ func (index *Index) QueryTimeStats(query TimeStatsQuery) (TimeStats, error) {
 	for height := from; height <= to; height++ {
 		block := index.Blocks[height]
 		if block.Time == nil {
+			// A missing timestamp never hits the window, yet it is still
+			// reported over the resolved height range regardless of the
+			// transaction filter.
 			stats.MissingTimeBlocks++
 			continue
 		}
 		t := *block.Time
-		if t < query.Start || t >= query.End {
+		if !window.contains(block.Time) {
 			continue
 		}
 		bucket := (t - query.Start) / query.StepSeconds
