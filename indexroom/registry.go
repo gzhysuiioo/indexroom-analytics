@@ -901,30 +901,82 @@ func (r *Registry) Select(sel Selection) SelectOutcome {
 		return fail.asSelect(sel.Service)
 	}
 
-	excluded := make(map[string]bool, len(sel.ExcludeIDs))
-	for _, id := range sel.ExcludeIDs {
-		excluded[id] = true
-	}
+	excluded := excludedSet(sel.ExcludeIDs)
 
-	// A bound session reuses its instance while it is registered, healthy and
-	// not excluded by this request; the reuse reflects the instance's current
-	// address and sequence and does not advance the rotation.
+	// Stage 1: a bound session reuses its instance while it is registered,
+	// healthy and not excluded by this request. Reuse reflects the instance's
+	// current address and latest accepted health sequence and neither advances
+	// the rotation nor rewrites any binding.
 	if sel.SessionKey != "" {
-		if id, bound := st.sessions[sel.SessionKey]; bound {
-			if cur, ok := st.instances[id]; ok && cur.health == HealthHealthy && !excluded[id] {
-				return SelectOutcome{
-					Service:    sel.Service,
-					OK:         true,
-					Revision:   st.revision,
-					InstanceID: id,
-					Address:    cur.address,
-					Sequence:   cur.sequence,
-				}
-			}
+		if id, cur, reusable := st.reusableBinding(sel.SessionKey, excluded); reusable {
+			return selectSuccess(sel.Service, st.revision, id, cur)
 		}
 	}
 
-	healthy := make([]string, 0, len(st.instances))
+	// Stage 2: build the request-scoped candidate set — every currently
+	// healthy instance in ascending id order, minus this request's exclusions.
+	// healthy answers only the distinction between "no healthy instance at all"
+	// and "all healthy instances excluded"; building either list mutates
+	// nothing.
+	healthy, candidates := st.healthyCandidates(excluded)
+	if len(candidates) == 0 {
+		return noHealthyOutcome(sel.Service, st.revision, len(healthy) > 0)
+	}
+
+	// Stage 3: ordinary rotation purely from the position the last real
+	// rotation left, independent of sessions and of this request's exclusions.
+	chosen := st.rotate(candidates)
+
+	// Stage 4: the successful rotation commits its new position and, for a
+	// keyed request, updates only this service's binding for this key. Both
+	// reuse and rotation report success through the same result shape.
+	cur := st.commitRotation(chosen, sel.SessionKey)
+	return selectSuccess(sel.Service, st.revision, chosen, cur)
+}
+
+// excludedSet converts one request's normalized excludeInstanceIds list into a
+// lookup set. An empty list yields nil so the common exclusion-free request
+// allocates nothing.
+func excludedSet(ids []string) map[string]bool {
+	if len(ids) == 0 {
+		return nil
+	}
+	excluded := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		excluded[id] = true
+	}
+	return excluded
+}
+
+// reusableBinding reports whether the key's existing binding may serve this
+// request: the key must be bound and its id must currently name a registered,
+// healthy instance that the request does not exclude. On reuse it returns the
+// instance's live state, so the answer carries the instance's current address
+// and latest accepted health sequence rather than anything remembered when the
+// binding was first recorded. A binding pointing at a removed, unknown,
+// unhealthy or excluded instance reports false, leaving the caller to fall
+// back to the ordinary rotation without touching the binding here.
+func (st *serviceState) reusableBinding(key string, excluded map[string]bool) (string, *instanceState, bool) {
+	id, bound := st.sessions[key]
+	if !bound {
+		return "", nil, false
+	}
+	cur, ok := st.instances[id]
+	if !ok || cur.health != HealthHealthy || excluded[id] {
+		return "", nil, false
+	}
+	return id, cur, true
+}
+
+// healthyCandidates returns the service's healthy ids in ascending id order
+// and, separately, the request-scoped subset the rotation may choose — healthy
+// ids not named by this request's exclusions. The full list exists only to let
+// the caller distinguish a service with no healthy instance at all from one
+// whose healthy instances are all excluded this request. The lists are
+// request-scoped snapshots: constructing them alters no registration, health
+// record, rotation position or session binding.
+func (st *serviceState) healthyCandidates(excluded map[string]bool) (healthy, candidates []string) {
+	healthy = make([]string, 0, len(st.instances))
 	for id, cur := range st.instances {
 		if cur.health == HealthHealthy {
 			healthy = append(healthy, id)
@@ -932,50 +984,88 @@ func (r *Registry) Select(sel Selection) SelectOutcome {
 	}
 	sort.Strings(healthy)
 
-	candidates := healthy[:0]
+	candidates = make([]string, 0, len(healthy))
 	for _, id := range healthy {
 		if !excluded[id] {
 			candidates = append(candidates, id)
 		}
 	}
-	if len(candidates) == 0 {
-		reason := fmt.Sprintf("service %q has no healthy instance available", sel.Service)
-		if len(healthy) > 0 {
-			reason = fmt.Sprintf("service %q has no healthy instance available: all healthy instances are excluded by excludeInstanceIds", sel.Service)
-		}
-		return SelectOutcome{
-			Service:  sel.Service,
-			OK:       false,
-			Kind:     OutcomeNoHealthy,
-			Reason:   reason,
-			Revision: st.revision,
-		}
-	}
+	return healthy, candidates
+}
 
-	chosen := candidates[0]
-	if st.cursorSet {
-		chosen = candidates[0]
-		for _, id := range candidates {
-			if id > st.cursor {
-				chosen = id
-				break
-			}
+// noHealthyOutcome assembles the no_healthy failure shared by both empty
+// candidate cases: it reports the current revision, fabricates no instance id,
+// address or health sequence, and leaves the caller to move no cursor and
+// rewrite no binding. allExcluded selects the reason: true means the service
+// has healthy instances but this request's excludeInstanceIds removed every
+// one of them, while false means the service has no healthy instance at all,
+// which keeps the ordinary reason.
+func noHealthyOutcome(service string, revision int, allExcluded bool) SelectOutcome {
+	reason := fmt.Sprintf("service %q has no healthy instance available", service)
+	if allExcluded {
+		reason = fmt.Sprintf("service %q has no healthy instance available: all healthy instances are excluded by excludeInstanceIds", service)
+	}
+	return SelectOutcome{
+		Service:  service,
+		OK:       false,
+		Kind:     OutcomeNoHealthy,
+		Reason:   reason,
+		Revision: revision,
+	}
+}
+
+// rotate chooses one id from the sorted, already filtered candidate list using
+// only the position left by the last actual rotation: with no position
+// established, the smallest candidate wins; otherwise the first candidate id
+// strictly greater than the last rotated id wins, and when no larger candidate
+// remains the rotation wraps to the smallest candidate. The position may name
+// an instance that has since been removed, turned unhealthy or been excluded by
+// this request — candidates are located purely by id comparison in the current
+// set, so registration replacements, health changes and exclusions never reset
+// the position. rotate only reads the position; commitRotation records the
+// chosen one.
+func (st *serviceState) rotate(candidates []string) string {
+	if !st.cursorSet {
+		return candidates[0]
+	}
+	for _, id := range candidates {
+		if id > st.cursor {
+			return id
 		}
 	}
-	cur := st.instances[chosen]
+	return candidates[0]
+}
+
+// commitRotation records one successful ordinary rotation: the chosen id
+// becomes the position the next rotation continues after, and a request
+// carrying a session key updates only this service's binding for that one key
+// — every other session's binding is left alone. A keyless request touches no
+// binding. It returns the chosen instance's live state for assembling the
+// result; a selection never alters registrations or health records, so the
+// state is exactly the target's current address and latest accepted sequence.
+func (st *serviceState) commitRotation(chosen, key string) *instanceState {
 	st.cursor = chosen
 	st.cursorSet = true
-	if sel.SessionKey != "" {
+	if key != "" {
 		if st.sessions == nil {
 			st.sessions = make(map[string]string)
 		}
-		st.sessions[sel.SessionKey] = chosen
+		st.sessions[key] = chosen
 	}
+	return st.instances[chosen]
+}
+
+// selectSuccess assembles the success result shared by session reuse and
+// ordinary rotation: the chosen id, the instance's current address and latest
+// accepted health sequence, and the service's current registration revision.
+// Routing both success paths through one constructor keeps them returning
+// exactly the same field set — neither path may omit a field the other reports.
+func selectSuccess(service string, revision int, id string, cur *instanceState) SelectOutcome {
 	return SelectOutcome{
-		Service:    sel.Service,
+		Service:    service,
 		OK:         true,
-		Revision:   st.revision,
-		InstanceID: chosen,
+		Revision:   revision,
+		InstanceID: id,
 		Address:    cur.address,
 		Sequence:   cur.sequence,
 	}
