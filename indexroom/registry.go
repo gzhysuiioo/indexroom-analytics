@@ -518,6 +518,13 @@ func (r *Registry) ValidateRegistration(service string, revision int64, instance
 // Apply checks the revision and, on match, replaces the service's instance list.
 // A new service is created at revision 1 only when expectedRevision is 0.
 // A matching registration with identical content succeeds without bumping revision.
+//
+// When the current revision already equals maxRevision, a matching registration
+// that carries a real list change cannot be saved: the next revision would
+// overflow int into a negative value that no range-checked request could ever
+// match. Such a request is rejected as invalid with the revision kept at the
+// limit and no state changed; a registration whose normalized content matches
+// still succeeds without changing the revision.
 func (r *Registry) Apply(reg Registration) Outcome {
 	st, exists := r.services[reg.Service]
 	if !exists {
@@ -553,6 +560,25 @@ func (r *Registry) Apply(reg Registration) Outcome {
 		}
 	}
 	changed := !sameInstances(st.instances, reg.Instances)
+	if changed && st.revision >= maxRevision {
+		// The revision already sits at the architecture's largest int. The
+		// replacement carries a real list change, but saving it would require
+		// revision+1, which overflows into a negative number and would leave
+		// the service at a revision no valid request (expectedRevision is
+		// range-checked to 0..maxRevision) could ever match. Refuse the change
+		// as invalid rather than committing an unreachable revision: the list,
+		// health records, cursor and sessions all stay as they were, and a
+		// request with unchanged content still succeeds below. This is content
+		// rejection, not a revision mismatch, so it reports neither
+		// expectedRevision nor actualRevision.
+		return Outcome{
+			Service:  reg.Service,
+			OK:       false,
+			Kind:     OutcomeInvalid,
+			Reason:   fmt.Sprintf("registration revision has reached the limit %d; cannot save instance list changes", maxRevision),
+			Revision: st.revision,
+		}
+	}
 	if changed {
 		// A replacement fully rebuilds the list, but an instance that keeps both
 		// its id and its address retains its health observation. Anything new,
