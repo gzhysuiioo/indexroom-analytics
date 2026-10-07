@@ -206,10 +206,39 @@ type timeWindow struct {
 	end     int64
 }
 
+// windowBoundError identifies which shared window rule a pair of bounds
+// violates, so each query entry keeps its own error wording and reporting
+// order while the rules themselves live in exactly one place.
+type windowBoundError int
+
+const (
+	windowBoundOK windowBoundError = iota
+	windowBoundNegativeStart
+	windowBoundNegativeEnd
+	windowBoundStartNotBelowEnd
+)
+
+// checkWindowBounds applies the window legality rules shared by QueryTxs
+// and QueryTimeStats: both bounds must be non-negative Unix seconds and the
+// included start must be below the excluded end. Violations are reported in
+// a fixed order — negative start, then negative end, then empty window — so
+// every caller keeps reporting the same first problem as before.
+func checkWindowBounds(start, end int64) windowBoundError {
+	switch {
+	case start < 0:
+		return windowBoundNegativeStart
+	case end < 0:
+		return windowBoundNegativeEnd
+	case start >= end:
+		return windowBoundStartNotBelowEnd
+	}
+	return windowBoundOK
+}
+
 // normalizeTimeWindow validates the optional half-open window: both bounds
-// must be absent together, neither may be negative, and the start must be
-// below the end. Exactly one bound, a negative bound, or a non-empty window
-// of zero or negative width is ErrInvalidArgument.
+// must be absent together, and present bounds must satisfy the shared rules
+// of checkWindowBounds. Exactly one bound is ErrInvalidArgument, as is any
+// bound violation.
 func normalizeTimeWindow(startPtr, endPtr *int64) (timeWindow, error) {
 	if (startPtr == nil) != (endPtr == nil) {
 		return timeWindow{}, fmt.Errorf("%w: time window needs both start and end or neither", ErrInvalidArgument)
@@ -217,21 +246,21 @@ func normalizeTimeWindow(startPtr, endPtr *int64) (timeWindow, error) {
 	if startPtr == nil {
 		return timeWindow{}, nil
 	}
-	if *startPtr < 0 {
+	switch checkWindowBounds(*startPtr, *endPtr) {
+	case windowBoundNegativeStart:
 		return timeWindow{}, fmt.Errorf("%w: time window start must not be negative", ErrInvalidArgument)
-	}
-	if *endPtr < 0 {
+	case windowBoundNegativeEnd:
 		return timeWindow{}, fmt.Errorf("%w: time window end must not be negative", ErrInvalidArgument)
-	}
-	if *startPtr >= *endPtr {
+	case windowBoundStartNotBelowEnd:
 		return timeWindow{}, fmt.Errorf("%w: time window start must be below end", ErrInvalidArgument)
 	}
 	return timeWindow{enabled: true, start: *startPtr, end: *endPtr}, nil
 }
 
-// contains reports whether a block timestamp survives the window: an
-// enabled window rejects missing timestamps, while start is included and end
-// excluded. A disabled window matches regardless of the timestamp.
+// contains is the single block-hit rule shared by QueryTxs and
+// QueryTimeStats: an enabled window rejects missing timestamps, while start
+// is included and end excluded. A disabled window matches regardless of the
+// timestamp.
 func (w timeWindow) contains(when *int64) bool {
 	if !w.enabled {
 		return true

@@ -88,14 +88,11 @@ func (index *Index) QueryTimeStats(query TimeStatsQuery) (TimeStats, error) {
 	if err != nil {
 		return TimeStats{}, err
 	}
-	if query.Start < 0 {
-		return TimeStats{}, fmt.Errorf("%w: start time must not be negative", ErrInvalidArgument)
-	}
-	if query.End < 0 {
-		return TimeStats{}, fmt.Errorf("%w: end time must not be negative", ErrInvalidArgument)
-	}
-	if query.Start >= query.End {
-		return TimeStats{}, fmt.Errorf("%w: start time must be below end time", ErrInvalidArgument)
+	// The statistics window is mandatory, unlike TxQuery's optional one, but
+	// it obeys the same shared legality rules.
+	window, err := requiredTimeWindow(query.Start, query.End)
+	if err != nil {
+		return TimeStats{}, err
 	}
 	if query.StepSeconds <= 0 {
 		return TimeStats{}, fmt.Errorf("%w: step seconds must be positive", ErrInvalidArgument)
@@ -154,10 +151,10 @@ func (index *Index) QueryTimeStats(query TimeStatsQuery) (TimeStats, error) {
 			stats.MissingTimeBlocks++
 			continue
 		}
-		t := *block.Time
-		if t < query.Start || t >= query.End {
+		if !window.contains(block.Time) {
 			continue
 		}
+		t := *block.Time
 		bucket := (t - query.Start) / query.StepSeconds
 		matched := false
 		for _, tx := range block.Txs {
@@ -183,6 +180,21 @@ func (index *Index) QueryTimeStats(query TimeStatsQuery) (TimeStats, error) {
 	}
 	stats.Totals.DistinctTxIDs = int64(len(windowDistinct))
 	return stats, nil
+}
+
+// requiredTimeWindow validates the mandatory statistics window with the
+// shared rules of checkWindowBounds, keeping QueryTimeStats' own error
+// wording. The returned window is always enabled.
+func requiredTimeWindow(start, end int64) (timeWindow, error) {
+	switch checkWindowBounds(start, end) {
+	case windowBoundNegativeStart:
+		return timeWindow{}, fmt.Errorf("%w: start time must not be negative", ErrInvalidArgument)
+	case windowBoundNegativeEnd:
+		return timeWindow{}, fmt.Errorf("%w: end time must not be negative", ErrInvalidArgument)
+	case windowBoundStartNotBelowEnd:
+		return timeWindow{}, fmt.Errorf("%w: start time must be below end time", ErrInvalidArgument)
+	}
+	return timeWindow{enabled: true, start: start, end: end}, nil
 }
 
 // bucketBoundary returns Start + step*index, saturated at MaxInt64 instead
