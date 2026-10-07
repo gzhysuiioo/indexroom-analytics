@@ -1,6 +1,6 @@
 // 分页交易查询（Index.QueryTxs）完整示例：第一页、继续翻页、范围固定、
-// 筛选语义、空页、倒序读取、时间窗口筛选、ErrInvalidArgument 与
-// ErrQueryChanged 的处理。
+// 筛选语义、空页、倒序读取、时间窗口筛选、区块数下限筛选、
+// ErrInvalidArgument 与 ErrQueryChanged 的处理。
 //
 // 运行：go run ./examples/querytxs
 package main
@@ -185,6 +185,70 @@ func main() {
 
 	demonstrateDescending()
 	demonstrateTimeWindow()
+	demonstrateMinBlocks()
+}
+
+// demonstrateMinBlocks 在独立索引上展示区块数下限筛选：MinBlocks 要求标识在
+// 固定范围内至少出现于这么多个不同区块，才保留它的出现；同一区块内的重复只
+// 算一个区块；达标标识保留全部出现且不合并；统计是筛选后的全范围口径；续查
+// 必须沿用同一下限，改变下限或负下限都是 ErrInvalidArgument。
+func demonstrateMinBlocks() {
+	fmt.Println("---- 区块数下限筛选（MinBlocks）----")
+	// 规格示例：高度 1 至 3 的交易依次是 [a,a,b]、[b,c]、[a,d]。
+	index := indexroom.New()
+	mustAppend(index, indexroom.Block{Height: 1, Hash: "m1", Parent: "genesis", Txs: []string{"a", "a", "b"}})
+	mustAppend(index, indexroom.Block{Height: 2, Hash: "m2", Parent: "m1", Txs: []string{"b", "c"}})
+	mustAppend(index, indexroom.Block{Height: 3, Hash: "m3", Parent: "m2", Txs: []string{"a", "d"}})
+
+	// 下限 2：a 出现在区块 1、3，b 出现在区块 1、2，都达标并保留全部出现
+	// （a 在区块 1 的两次出现都保留，不合并）；c、d 各只出现在一个区块，
+	// 被整体排除。资格由整个固定范围决定，与当前页或读取方向无关。
+	query := indexroom.TxQuery{MinBlocks: 2, PageSize: 2}
+	page1, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("下限 2、每页 2 条：第1页", page1)
+	query.Cursor = page1.NextCursor
+	page2, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("第2页", page2)
+	query.Cursor = page2.NextCursor
+	page3, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("第3页", page3)
+	fmt.Println("  每页 TotalMatches 都是 5、MatchedBlocks 都是 3：统计是筛选后的全范围口径")
+	fmt.Println()
+
+	// 高度范围只取前两个区块时，a 只剩区块 1 不达标，只剩 b 的两次出现。
+	restricted, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 2, MinBlocks: 2})
+	if err != nil {
+		panic(err)
+	}
+	printPage("只查高度 1..2、下限 2", restricted)
+
+	// 续查必须沿用第一页的下限；改变下限（含改为 0 关闭筛选）是
+	// ErrInvalidArgument，且没有可用页结果；要改下限须从空游标重新查询。
+	changed, err := index.QueryTxs(indexroom.TxQuery{MinBlocks: 1, PageSize: 2, Cursor: page1.NextCursor})
+	fmt.Printf("续查改下限：ErrInvalidArgument=%v 可用命中数=%d\n",
+		errors.Is(err, indexroom.ErrInvalidArgument), len(changed.Hits))
+
+	// 负下限同样是 ErrInvalidArgument。
+	negative, err := index.QueryTxs(indexroom.TxQuery{MinBlocks: -1})
+	fmt.Printf("负下限：ErrInvalidArgument=%v 可用命中数=%d\n",
+		errors.Is(err, indexroom.ErrInvalidArgument), len(negative.Hits))
+
+	// 没有标识达到合法下限时成功返回空页、零统计与空后续游标。
+	none, err := index.QueryTxs(indexroom.TxQuery{MinBlocks: 4})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("下限 4 无人达标：err=%v 命中=%d TotalMatches=%d 有后续游标=%v\n",
+		err, len(none.Hits), none.TotalMatches, none.NextCursor != "")
 }
 
 // demonstrateTimeWindow 在独立索引上展示可选区块时间窗口：时间筛选与高度范围、

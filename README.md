@@ -16,7 +16,7 @@ go test ./...
 
 - `indexroom.Block` 的 `Time *int64` 字段携带非负 Unix 秒数；`nil` 表示未提供时间，与时间为 0 严格区分。
 - `Index.Append` / `Index.Reorg`：摄取区块与重组，负时间整体拒绝且不改变已有链；哈希、父哈希或任一交易标识含非法 UTF-8 字节时同样整体拒绝，错误信息指出区块高度与字段（交易标识另指出从 0 开始的位置），保证快照可无损导出与恢复。`Append` 在链顶前进后仍可再次提交内容完全相同的旧区块（成功且无副作用），完整规则见下方[重复提交区块指南（Append）](#重复提交区块指南append)；`Reorg` 的分支范围、丢弃高度口径、失败原子性与完整用法见下方[重组指南（Reorg）](#重组指南reorg)。
-- `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；默认按高度、再按块内位置升序返回，`Order` 设为 `OrderDesc` 时整体倒序（高度与块内位置均从大到小）；`TimeStart`/`TimeEnd` 可同时给出非负 Unix 秒，叠加 `[Start, End)` 半开时间窗口筛选（含起点、排除终点，与 `QueryTimeStats` 一致；缺失区块时间不命中，真实零秒按窗口判断），两者都不传表示不启用时间筛选；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
+- `Index.QueryTxs`：既有分页交易查询，围绕一个或多个交易标识读取主链上的每次出现；默认按高度、再按块内位置升序返回，`Order` 设为 `OrderDesc` 时整体倒序（高度与块内位置均从大到小）；`TimeStart`/`TimeEnd` 可同时给出非负 Unix 秒，叠加 `[Start, End)` 半开时间窗口筛选（含起点、排除终点，与 `QueryTimeStats` 一致；缺失区块时间不命中，真实零秒按窗口判断），两者都不传表示不启用时间筛选；`MinBlocks` 可要求标识至少在固定范围内这么多个不同区块出现才保留（零表示不启用）；固定高度范围内的区块时间变化会使旧游标返回 `ErrQueryChanged`。完整翻页用法见下方[分页交易查询指南](#分页交易查询指南querytxs)。
 - `Index.QueryTimeStats`：按 `[Start, End)` 半开窗口与 `StepSeconds` 分段统计交易出现次数、不同标识数、含匹配交易的区块数，并给出整窗口去重汇总与缺失时间区块数；非法参数返回 `ErrInvalidArgument`。完整用法见下方[按时间窗口统计交易指南](#按时间窗口统计交易指南querytimestats)。
 - `Index.Export` / `Index.Restore`：快照版本 1（区块不含 `timestamp`）与版本 2（任一块有时间时为每块输出必填 `timestamp`，缺失为 `null`）。`Restore` 保证**数据一致**并把再导出规范化为本功能的固定文本，不保留输入的字段顺序、空白与转义写法；它用一份完整快照整体替换主链，非法输入返回 `ErrInvalidSnapshot` 且不改变现有链；底层读取失败（包括与完整快照字节一起送达的故障）不是 `ErrInvalidSnapshot`，而是包装为 `indexroom: read snapshot: ...` 并保留原始读取错误，同样不改变现有链。完整用法见下方[快照导出与恢复指南（Export/Restore）](#快照导出与恢复指南exportrestore)。
 
@@ -24,14 +24,14 @@ go test ./...
 
 `Index.QueryTxs(query TxQuery) (TxPage, error)` 围绕一个或多个交易标识读取这些标识在主链上的**每一次出现**。默认按"高度、再按块内位置"升序；`Order` 设为 `OrderDesc` 时在整个固定范围内倒序——高度从大到小，同一区块内的位置也从大到小。次序只由高度与原有块内位置决定，区块时间是否缺失、相同或随高度下降都不影响次序。查询只读，可与摄取并发调用，每次调用都看到一个完整的链状态。
 
-- `TxQuery`：`From`/`To` 为闭区间高度，`TxIDs` 为筛选标识集合，`PageSize` 为每页条数（0 取 `DefaultPageSize=100`，最大 `MaxPageSize=1000`），`Order` 为读取方向（零值 `OrderAsc` 升序，`OrderDesc` 倒序），`TimeStart`/`TimeEnd` 为可选时间窗口（两个 `*int64`，同时给出才启用，半开 `[Start, End)`，单位为非负 Unix 秒），`Cursor` 为续查游标。
+- `TxQuery`：`From`/`To` 为闭区间高度，`TxIDs` 为筛选标识集合，`PageSize` 为每页条数（0 取 `DefaultPageSize=100`，最大 `MaxPageSize=1000`），`Order` 为读取方向（零值 `OrderAsc` 升序，`OrderDesc` 倒序），`TimeStart`/`TimeEnd` 为可选时间窗口（两个 `*int64`，同时给出才启用，半开 `[Start, End)`，单位为非负 Unix 秒），`MinBlocks` 为可选区块数下限（零值不启用），`Cursor` 为续查游标。
 - `TxHit`：一次命中，字段为 `Height`、`BlockHash`、`TxID`、`Position`（块内从 0 开始的位置；**倒序不会重新编号**）。
 - `TxPage`：本页 `Hits`，以及对整个固定范围的统计 `TotalMatches`（匹配出现总次数）、`MatchedBlocks`（含匹配交易的区块数）、`ToHeight`（第一页固定下来的实际上界）和 `NextCursor`。统计是整个固定范围的统计，**不随方向或页大小改变**。
 
 ### 如何取得第一页、继续读取、何时结束
 
 1. **第一页**：`Cursor` 传空字符串即首次查询。`From` 为 0 时默认从高度 1 开始；`To` 为 0 时取首次查询看到的链顶。需要先看靠近链顶的记录时，把 `Order` 设为 `OrderDesc`（见下方[倒序读取](#倒序读取orderdesc)）。
-2. **继续读取**：把上一页返回的 `NextCursor` 原样填回 `TxQuery.Cursor` 再次调用。游标是服务返回的**不透明字符串**，不要解析或拼接。续查时高度范围、`TxIDs`、读取方向 `Order` 以及是否启用时间窗口和窗口本身必须与第一页等价或一致；`PageSize` 可以逐页调整。
+2. **继续读取**：把上一页返回的 `NextCursor` 原样填回 `TxQuery.Cursor` 再次调用。游标是服务返回的**不透明字符串**，不要解析或拼接。续查时高度范围、`TxIDs`、读取方向 `Order`、是否启用时间窗口和窗口本身、以及 `MinBlocks` 下限必须与第一页等价或一致；`PageSize` 可以逐页调整。
 3. **结束**：返回页的 `NextCursor` 为空即最后一页。范围内没有匹配交易时不是错误，而是成功返回一个空页（`Hits` 为空、无游标）。
 
 重复出现的交易**不会合并**：同一标识在不同区块、或同一区块内出现多次，就返回多条 `TxHit`。筛选按字符串精确匹配，`TxIDs` 的**顺序与重复项不影响匹配**（`["a","a"]` 与 `["a"]` 等价）；但大小写与首尾空白仍按原字符串区分（`"A"`、`" a "` 都不会匹配 `"a"`）。
@@ -44,7 +44,7 @@ go test ./...
 ### 游标失效：区分 ErrQueryChanged 与 ErrInvalidArgument
 
 - **`ErrQueryChanged`（链数据变了）**：固定范围内任一区块的内容发生改变——即使区块哈希不变、**只改变了时间**——或链顶退到固定结束高度以下，续查都会返回该错误，且**没有可用的页结果**。此时只能**从空游标重新开始第一页**，绝不能把新结果拼接到旧结果后面。
-- **`ErrInvalidArgument`（请求本身不合法）**：续查更改高度范围或筛选集合、**续查方向与游标不一致**（正序游标配 `OrderDesc`，或倒序游标配 `OrderAsc`/不传 `Order`）、**续查改变时间筛选的启用状态或窗口任一边界**、只给时间窗口一个边界、时间边界为负、起点不小于终点、传入非法 `Order` 值、游标损坏、或把游标交给另一个索引实例（游标带实例签名，跨实例无效）。它与链数据变化无关，用 `errors.Is` 与 `ErrQueryChanged` 区分；请先修正请求再重试。方向或窗口不一致的续查同样**不返回任何可用页结果**。
+- **`ErrInvalidArgument`（请求本身不合法）**：续查更改高度范围或筛选集合、**续查方向与游标不一致**（正序游标配 `OrderDesc`，或倒序游标配 `OrderAsc`/不传 `Order`）、**续查改变时间筛选的启用状态或窗口任一边界**、**续查改变 `MinBlocks` 下限**（含改为 0 关闭筛选）、`MinBlocks` 为负、只给时间窗口一个边界、时间边界为负、起点不小于终点、传入非法 `Order` 值、游标损坏、或把游标交给另一个索引实例（游标带实例签名，跨实例无效）。它与链数据变化无关，用 `errors.Is` 与 `ErrQueryChanged` 区分；请先修正请求再重试。方向或窗口不一致的续查同样**不返回任何可用页结果**。
 
 ### 倒序读取（OrderDesc）
 
@@ -70,6 +70,16 @@ go test ./...
 
 例如高度一至四的时间依次为 105、缺失、100、110，交易依次为 `[a,b,a]`、`[a]`、`[a]`、`[a]`。筛选 `a` 与窗口 `[100,110)`、正序每页两条时：第一页返回**高度一的位置零和位置二**（时间 105 在窗口内；同一区块两次出现都保留），第二页返回**高度三的位置零**（时间 100 在窗口内）；高度二缺失时间不命中、高度四时间 110 正好等于被排除的终点。总出现次数 `TotalMatches=3`、匹配区块数 `MatchedBlocks=2`，高度上界 `ToHeight` 仍为 4。
 
+### 区块数下限筛选（MinBlocks）
+
+- **启用方式**：`TxQuery.MinBlocks` 传正数，即要求一个交易标识至少在固定范围内**这么多个不同区块**中出现过，它的出现才会被保留；零值（默认）表示**不启用**，行为与过去完全一致，原有调用与有效游标不受影响。负下限是 `ErrInvalidArgument` 且不提供可用页。
+- **按整个固定范围计数**：是否达标由第一页固定下来的整个高度范围决定，不能只看当前页或已读记录；第一页之后追加的更高区块既不能帮助标识达标，也不会进入本次翻页。计数同时应用已有的标识筛选与时间窗口条件：范围外的区块、启用时间筛选后缺失时间或不在窗口内的区块，都不能帮助标识达到下限。
+- **同一区块只算一个**：一个标识在同一区块出现多次，只贡献一个区块数；达到下限后，该标识在范围内的**所有**匹配出现都保留，**不合并重复项**，`Position` 仍是块内从 0 开始的真实位置，读取次序（正序或倒序）不变。
+- **统计口径**：`TotalMatches` 统计最终保留的出现次数，`MatchedBlocks` 统计至少含一条保留记录的区块数，每页都给出同一组全范围统计，与页大小、读取方向无关；`ToHeight` 含义不变。没有标识达到合法下限时不是错误：成功返回空页、零统计与空后续游标。
+- **继续翻页沿用同一下限**：续查必须沿用第一页的 `MinBlocks`，改变下限（含改为 0 关闭筛选）返回 `ErrInvalidArgument` 且没有可用页，调用方需**从空游标重新查询**；`PageSize` 仍可逐页调整。固定范围内任一区块内容变化仍按既有规则返回 `ErrQueryChanged`。
+
+例如高度一至三的交易依次为 `[a,a,b]`、`[b,c]`、`[a,d]`，查询全部三个高度且下限为 2 时：`a` 出现在区块 1、3，`b` 出现在区块 1、2，都达标并保留全部出现（`a` 三次、`b` 两次）；`c`、`d` 各只出现在一个区块，被整体排除。`TotalMatches=5`、`MatchedBlocks=3`。若高度范围只选前两个区块，`a` 只剩一个区块不达标，只能保留 `b` 的两次出现。
+
 ### 完整示例
 
 下面的程序只使用现有公开功能，在本机离线即可运行，源码位于 [`examples/querytxs/main.go`](examples/querytxs/main.go)：
@@ -82,8 +92,8 @@ go run ./examples/querytxs
 
 ```go
 // 分页交易查询（Index.QueryTxs）完整示例：第一页、继续翻页、范围固定、
-// 筛选语义、空页、倒序读取、时间窗口筛选、ErrInvalidArgument 与
-// ErrQueryChanged 的处理。
+// 筛选语义、空页、倒序读取、时间窗口筛选、区块数下限筛选、
+// ErrInvalidArgument 与 ErrQueryChanged 的处理。
 //
 // 运行：go run ./examples/querytxs
 package main
@@ -107,10 +117,12 @@ func unix(sec int64) *int64 { return &sec }
 func printPage(title string, page indexroom.TxPage) {
 	fmt.Println(title + "：")
 	for _, hit := range page.Hits {
-		fmt.Printf("  命中 height=%d block=%s tx=%q position=%d\n",
+		fmt.Printf("  命中 height=%d block=%s tx=%q position=%d
+",
 			hit.Height, hit.BlockHash, hit.TxID, hit.Position)
 	}
-	fmt.Printf("  TotalMatches=%d MatchedBlocks=%d ToHeight=%d 有后续游标=%v\n",
+	fmt.Printf("  TotalMatches=%d MatchedBlocks=%d ToHeight=%d 有后续游标=%v
+",
 		page.TotalMatches, page.MatchedBlocks, page.ToHeight, page.NextCursor != "")
 }
 
@@ -120,7 +132,9 @@ func main() {
 	mustAppend(index, indexroom.Block{Height: 1, Hash: "h1", Parent: "genesis", Txs: []string{"a", "b", "a"}})
 	mustAppend(index, indexroom.Block{Height: 2, Hash: "h2", Parent: "h1", Txs: []string{"a"}})
 	mustAppend(index, indexroom.Block{Height: 3, Hash: "h3", Parent: "h2", Txs: []string{"b"}})
-	fmt.Printf("链顶高度 tip=%d\n\n", index.Tip)
+	fmt.Printf("链顶高度 tip=%d
+
+", index.Tip)
 
 	// 取得第一页：Cursor 留空表示首次查询，From 留空默认从高度 1 开始。
 	// 显式 To=10 高于当前链顶 3，第一页把查询范围固定到实际链顶 3。
@@ -148,7 +162,9 @@ func main() {
 
 	// 第一页之后链上又追加一个含 a 的高度 4 区块。
 	mustAppend(index, indexroom.Block{Height: 4, Hash: "h4", Parent: "h3", Txs: []string{"a"}})
-	fmt.Printf("已追加高度 4，当前链顶 tip=%d\n\n", index.Tip)
+	fmt.Printf("已追加高度 4，当前链顶 tip=%d
+
+", index.Tip)
 
 	// 继续读取：沿用服务返回的不透明游标，To 仍传最初请求的 10，
 	// 不能用第一页返回的 ToHeight=3 替换，否则属于另一次查询。
@@ -158,7 +174,9 @@ func main() {
 		panic(err)
 	}
 	printPage("第2页（追加高度 4 之后继续翻页）", page2)
-	fmt.Printf("最后一页没有后续游标：%v\n\n", page2.NextCursor == "")
+	fmt.Printf("最后一页没有后续游标：%v
+
+", page2.NextCursor == "")
 
 	// 重复出现的交易不会合并；筛选标识的顺序与重复项不影响匹配；
 	// 大小写与首尾空白仍按原字符串做精确区分。
@@ -174,7 +192,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("筛选 [a,a] 命中 %d 条；[a,b] 命中 %d 条，乱序且重复的 [b,a,b] 同样命中 %d 条\n",
+	fmt.Printf("筛选 [a,a] 命中 %d 条；[a,b] 命中 %d 条，乱序且重复的 [b,a,b] 同样命中 %d 条
+",
 		dupA.TotalMatches, setAB1.TotalMatches, setAB2.TotalMatches)
 	upper, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 3, TxIDs: []string{"A"}})
 	if err != nil {
@@ -184,7 +203,9 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("筛选 %q 命中 %d 条，筛选 %q 命中 %d 条（都是成功的空页）\n\n",
+	fmt.Printf("筛选 %q 命中 %d 条，筛选 %q 命中 %d 条（都是成功的空页）
+
+",
 		"A", len(upper.Hits), " a ", len(spaced.Hits))
 
 	// To=0 表示取首次查询看到的链顶；范围内没有匹配交易时成功返回空页。
@@ -192,13 +213,16 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("To=0 固定到首次查询看到的链顶：ToHeight=%d（当前 tip=%d）\n",
+	fmt.Printf("To=0 固定到首次查询看到的链顶：ToHeight=%d（当前 tip=%d）
+",
 		tipBound.ToHeight, index.Tip)
 	empty, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 3, TxIDs: []string{"zzz"}})
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("无匹配交易：err=%v 命中 %d 条 有后续游标=%v\n\n",
+	fmt.Printf("无匹配交易：err=%v 命中 %d 条 有后续游标=%v
+
+",
 		err, len(empty.Hits), empty.NextCursor != "")
 
 	// 参数类错误（ErrInvalidArgument）：与链数据变化无关。
@@ -211,17 +235,23 @@ func main() {
 		_, err := index.QueryTxs(indexroom.TxQuery{From: from, To: to, TxIDs: txIDs, PageSize: 2, Cursor: cursor})
 		return err
 	}
-	fmt.Printf("续查更改结束高度：ErrInvalidArgument=%v\n",
+	fmt.Printf("续查更改结束高度：ErrInvalidArgument=%v
+",
 		errors.Is(continueWith(10, 0, []string{"a"}, goodCursor), indexroom.ErrInvalidArgument))
-	fmt.Printf("续查更改起始高度：ErrInvalidArgument=%v\n",
+	fmt.Printf("续查更改起始高度：ErrInvalidArgument=%v
+",
 		errors.Is(continueWith(3, 2, []string{"a"}, goodCursor), indexroom.ErrInvalidArgument))
-	fmt.Printf("续查更改筛选集合：ErrInvalidArgument=%v\n",
+	fmt.Printf("续查更改筛选集合：ErrInvalidArgument=%v
+",
 		errors.Is(continueWith(3, 0, []string{"b"}, goodCursor), indexroom.ErrInvalidArgument))
-	fmt.Printf("游标损坏：ErrInvalidArgument=%v\n",
+	fmt.Printf("游标损坏：ErrInvalidArgument=%v
+",
 		errors.Is(continueWith(3, 0, []string{"a"}, "q1.damaged"), indexroom.ErrInvalidArgument))
 	other := indexroom.New()
 	_, err = other.QueryTxs(indexroom.TxQuery{To: 3, TxIDs: []string{"a"}, PageSize: 2, Cursor: goodCursor})
-	fmt.Printf("游标交给另一个索引实例：ErrInvalidArgument=%v\n\n",
+	fmt.Printf("游标交给另一个索引实例：ErrInvalidArgument=%v
+
+",
 		errors.Is(err, indexroom.ErrInvalidArgument))
 
 	// 固定范围内任一区块内容改变（即使只改时间）：续查返回 ErrQueryChanged，
@@ -235,9 +265,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("只改高度 2 的时间，重组替换高度 %v，当前 tip=%d\n", dropped, index.Tip)
+	fmt.Printf("只改高度 2 的时间，重组替换高度 %v，当前 tip=%d
+", dropped, index.Tip)
 	changedPage, err := index.QueryTxs(indexroom.TxQuery{To: 3, TxIDs: []string{"a"}, PageSize: 2, Cursor: goodCursor})
-	fmt.Printf("续查：ErrQueryChanged=%v ErrInvalidArgument=%v 可用命中数=%d\n",
+	fmt.Printf("续查：ErrQueryChanged=%v ErrInvalidArgument=%v 可用命中数=%d
+",
 		errors.Is(err, indexroom.ErrQueryChanged),
 		errors.Is(err, indexroom.ErrInvalidArgument), len(changedPage.Hits))
 	// 正确做法：从空游标重新开始，不能把新结果接到旧结果后面。
@@ -256,9 +288,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("链顶回退，重组丢弃高度 %v，当前 tip=%d\n", dropped, index.Tip)
+	fmt.Printf("链顶回退，重组丢弃高度 %v，当前 tip=%d
+", dropped, index.Tip)
 	_, err = index.QueryTxs(indexroom.TxQuery{To: 10, TxIDs: []string{"a"}, PageSize: 2, Cursor: pinned.NextCursor})
-	fmt.Printf("续查：ErrQueryChanged=%v（固定结束高度为 %d）\n",
+	fmt.Printf("续查：ErrQueryChanged=%v（固定结束高度为 %d）
+",
 		errors.Is(err, indexroom.ErrQueryChanged), pinned.ToHeight)
 	restartTip, err := index.QueryTxs(indexroom.TxQuery{To: 10, TxIDs: []string{"a"}, PageSize: 10})
 	if err != nil {
@@ -268,6 +302,73 @@ func main() {
 
 	demonstrateDescending()
 	demonstrateTimeWindow()
+	demonstrateMinBlocks()
+}
+
+// demonstrateMinBlocks 在独立索引上展示区块数下限筛选：MinBlocks 要求标识在
+// 固定范围内至少出现于这么多个不同区块，才保留它的出现；同一区块内的重复只
+// 算一个区块；达标标识保留全部出现且不合并；统计是筛选后的全范围口径；续查
+// 必须沿用同一下限，改变下限或负下限都是 ErrInvalidArgument。
+func demonstrateMinBlocks() {
+	fmt.Println("---- 区块数下限筛选（MinBlocks）----")
+	// 规格示例：高度 1 至 3 的交易依次是 [a,a,b]、[b,c]、[a,d]。
+	index := indexroom.New()
+	mustAppend(index, indexroom.Block{Height: 1, Hash: "m1", Parent: "genesis", Txs: []string{"a", "a", "b"}})
+	mustAppend(index, indexroom.Block{Height: 2, Hash: "m2", Parent: "m1", Txs: []string{"b", "c"}})
+	mustAppend(index, indexroom.Block{Height: 3, Hash: "m3", Parent: "m2", Txs: []string{"a", "d"}})
+
+	// 下限 2：a 出现在区块 1、3，b 出现在区块 1、2，都达标并保留全部出现
+	// （a 在区块 1 的两次出现都保留，不合并）；c、d 各只出现在一个区块，
+	// 被整体排除。资格由整个固定范围决定，与当前页或读取方向无关。
+	query := indexroom.TxQuery{MinBlocks: 2, PageSize: 2}
+	page1, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("下限 2、每页 2 条：第1页", page1)
+	query.Cursor = page1.NextCursor
+	page2, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("第2页", page2)
+	query.Cursor = page2.NextCursor
+	page3, err := index.QueryTxs(query)
+	if err != nil {
+		panic(err)
+	}
+	printPage("第3页", page3)
+	fmt.Println("  每页 TotalMatches 都是 5、MatchedBlocks 都是 3：统计是筛选后的全范围口径")
+	fmt.Println()
+
+	// 高度范围只取前两个区块时，a 只剩区块 1 不达标，只剩 b 的两次出现。
+	restricted, err := index.QueryTxs(indexroom.TxQuery{From: 1, To: 2, MinBlocks: 2})
+	if err != nil {
+		panic(err)
+	}
+	printPage("只查高度 1..2、下限 2", restricted)
+
+	// 续查必须沿用第一页的下限；改变下限（含改为 0 关闭筛选）是
+	// ErrInvalidArgument，且没有可用页结果；要改下限须从空游标重新查询。
+	changed, err := index.QueryTxs(indexroom.TxQuery{MinBlocks: 1, PageSize: 2, Cursor: page1.NextCursor})
+	fmt.Printf("续查改下限：ErrInvalidArgument=%v 可用命中数=%d
+",
+		errors.Is(err, indexroom.ErrInvalidArgument), len(changed.Hits))
+
+	// 负下限同样是 ErrInvalidArgument。
+	negative, err := index.QueryTxs(indexroom.TxQuery{MinBlocks: -1})
+	fmt.Printf("负下限：ErrInvalidArgument=%v 可用命中数=%d
+",
+		errors.Is(err, indexroom.ErrInvalidArgument), len(negative.Hits))
+
+	// 没有标识达到合法下限时成功返回空页、零统计与空后续游标。
+	none, err := index.QueryTxs(indexroom.TxQuery{MinBlocks: 4})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("下限 4 无人达标：err=%v 命中=%d TotalMatches=%d 有后续游标=%v
+",
+		err, len(none.Hits), none.TotalMatches, none.NextCursor != "")
 }
 
 // demonstrateTimeWindow 在独立索引上展示可选区块时间窗口：时间筛选与高度范围、
@@ -322,14 +423,17 @@ func demonstrateTimeWindow() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("不启用窗口命中 %d 条（缺失时间也保留）\n", disabled.TotalMatches)
+	fmt.Printf("不启用窗口命中 %d 条（缺失时间也保留）
+", disabled.TotalMatches)
 
 	// 合法窗口没有命中时仍是成功的空页，没有后续游标。
 	empty, err := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, TimeStart: unix(1000), TimeEnd: unix(2000)})
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("窗口 [1000,2000) 无命中：err=%v 命中=%d 有后续游标=%v\n\n",
+	fmt.Printf("窗口 [1000,2000) 无命中：err=%v 命中=%d 有后续游标=%v
+
+",
 		err, len(empty.Hits), empty.NextCursor != "")
 
 	// 非法窗口：只给一个边界、边界为负、起点不小于终点，都是
@@ -346,7 +450,8 @@ func demonstrateTimeWindow() {
 	}
 	for _, tc := range invalid {
 		page, err := index.QueryTxs(tc.query)
-		fmt.Printf("%s：ErrInvalidArgument=%v 可用命中数=%d\n",
+		fmt.Printf("%s：ErrInvalidArgument=%v 可用命中数=%d
+",
 			tc.name, errors.Is(err, indexroom.ErrInvalidArgument), len(page.Hits))
 	}
 	fmt.Println()
@@ -363,12 +468,14 @@ func demonstrateTimeWindow() {
 		TxIDs: []string{"a"}, TimeStart: unix(100), TimeEnd: unix(111),
 		PageSize: 1, Cursor: first.NextCursor,
 	})
-	fmt.Printf("续查改终点：ErrInvalidArgument=%v 可用命中数=%d\n",
+	fmt.Printf("续查改终点：ErrInvalidArgument=%v 可用命中数=%d
+",
 		errors.Is(err, indexroom.ErrInvalidArgument), len(changedEnd.Hits))
 	disabledCont, err := index.QueryTxs(indexroom.TxQuery{
 		TxIDs: []string{"a"}, PageSize: 1, Cursor: first.NextCursor,
 	})
-	fmt.Printf("续查去掉窗口：ErrInvalidArgument=%v 可用命中数=%d\n",
+	fmt.Printf("续查去掉窗口：ErrInvalidArgument=%v 可用命中数=%d
+",
 		errors.Is(err, indexroom.ErrInvalidArgument), len(disabledCont.Hits))
 
 	// 固定范围内任一区块内容变化，包括原本因时间而未命中的区块（这里给
@@ -384,7 +491,8 @@ func demonstrateTimeWindow() {
 		TxIDs: []string{"a"}, TimeStart: unix(100), TimeEnd: unix(110),
 		PageSize: 1, Cursor: first.NextCursor,
 	})
-	fmt.Printf("原本未命中的高度2内容变化：ErrQueryChanged=%v 可用命中数=%d\n",
+	fmt.Printf("原本未命中的高度2内容变化：ErrQueryChanged=%v 可用命中数=%d
+",
 		errors.Is(err, indexroom.ErrQueryChanged), len(changedPage.Hits))
 }
 
@@ -416,13 +524,16 @@ func demonstrateDescending() {
 
 	// 第一页固定实际上界：之后追加的更高区块不能插进正在进行的倒序翻页。
 	mustAppend(index, indexroom.Block{Height: 4, Hash: "g4", Parent: "g3", Txs: []string{"a"}})
-	fmt.Printf("已追加高度 4，当前链顶 tip=%d\n", index.Tip)
+	fmt.Printf("已追加高度 4，当前链顶 tip=%d
+", index.Tip)
 	query.Cursor = page1.NextCursor
 	replayed, err := index.QueryTxs(query)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("倒序续查仍只看固定范围 1..3：本页 %d 条、ToHeight=%d、TotalMatches=%d\n\n",
+	fmt.Printf("倒序续查仍只看固定范围 1..3：本页 %d 条、ToHeight=%d、TotalMatches=%d
+
+",
 		len(replayed.Hits), replayed.ToHeight, replayed.TotalMatches)
 
 	// 要读取新记录，以空游标重新查询；想换方向也一样，必须重新发起第一页。
@@ -444,9 +555,12 @@ func demonstrateDescending() {
 	}
 	wrong1, err1 := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2, Order: indexroom.OrderDesc, Cursor: asc.NextCursor})
 	wrong2, err2 := index.QueryTxs(indexroom.TxQuery{TxIDs: []string{"a"}, PageSize: 2, Cursor: desc.NextCursor})
-	fmt.Printf("正序游标配倒序请求：ErrInvalidArgument=%v 可用命中数=%d\n",
+	fmt.Printf("正序游标配倒序请求：ErrInvalidArgument=%v 可用命中数=%d
+",
 		errors.Is(err1, indexroom.ErrInvalidArgument), len(wrong1.Hits))
-	fmt.Printf("倒序游标配正序请求：ErrInvalidArgument=%v 可用命中数=%d\n\n",
+	fmt.Printf("倒序游标配正序请求：ErrInvalidArgument=%v 可用命中数=%d
+
+",
 		errors.Is(err2, indexroom.ErrInvalidArgument), len(wrong2.Hits))
 
 	// 空链、起始高度超过链顶、筛选无命中：倒序同样成功返回空页与空游标。
@@ -459,7 +573,8 @@ func demonstrateDescending() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("空链倒序：err=%v 命中=%d 游标为空=%v；筛选无命中倒序：命中=%d TotalMatches=%d\n",
+	fmt.Printf("空链倒序：err=%v 命中=%d 游标为空=%v；筛选无命中倒序：命中=%d TotalMatches=%d
+",
 		err, len(emptyPage.Hits), emptyPage.NextCursor == "", len(noHit.Hits), noHit.TotalMatches)
 }
 ```
@@ -555,6 +670,27 @@ To=0 固定到首次查询看到的链顶：ToHeight=4（当前 tip=4）
 续查改终点：ErrInvalidArgument=true 可用命中数=0
 续查去掉窗口：ErrInvalidArgument=true 可用命中数=0
 原本未命中的高度2内容变化：ErrQueryChanged=true 可用命中数=0
+---- 区块数下限筛选（MinBlocks）----
+下限 2、每页 2 条：第1页：
+  命中 height=1 block=m1 tx="a" position=0
+  命中 height=1 block=m1 tx="a" position=1
+  TotalMatches=5 MatchedBlocks=3 ToHeight=3 有后续游标=true
+第2页：
+  命中 height=1 block=m1 tx="b" position=2
+  命中 height=2 block=m2 tx="b" position=0
+  TotalMatches=5 MatchedBlocks=3 ToHeight=3 有后续游标=true
+第3页：
+  命中 height=3 block=m3 tx="a" position=0
+  TotalMatches=5 MatchedBlocks=3 ToHeight=3 有后续游标=false
+  每页 TotalMatches 都是 5、MatchedBlocks 都是 3：统计是筛选后的全范围口径
+
+只查高度 1..2、下限 2：
+  命中 height=1 block=m1 tx="b" position=2
+  命中 height=2 block=m2 tx="b" position=0
+  TotalMatches=2 MatchedBlocks=2 ToHeight=2 有后续游标=false
+续查改下限：ErrInvalidArgument=true 可用命中数=0
+负下限：ErrInvalidArgument=true 可用命中数=0
+下限 4 无人达标：err=<nil> 命中=0 TotalMatches=0 有后续游标=false
 ```
 
 ## 按时间窗口统计交易指南（QueryTimeStats）
